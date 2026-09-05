@@ -8,8 +8,8 @@ Not a port of [piri](https://github.com/jinwon-int/piri), [earendil-works/pi](ht
 
 ## Build and run
 
-The first v0 implementation is a Linux headless loop with an Anthropic Messages
-API path, default bubblewrap isolation, durable sessions, and bounded context.
+The first v0 implementation is a Linux headless loop with Anthropic Messages, OpenAI Responses and Z.AI GLM
+Chat Completions adapters, default bubblewrap isolation, durable sessions, and bounded context.
 
 ```sh
 cargo build --release --locked
@@ -27,6 +27,10 @@ linear conversation. An uncertain interrupted tool requires manual recovery.
 See [the v0 contract](docs/v0.md) for trust/discovery subsets, exit codes,
 budgets, recovery behavior, fixture provenance and offline test commands.
 The model adapter is mock-tested; live provider acceptance remains pending.
+See [the opt-in live acceptance workflow](docs/live-acceptance.md) for the
+scenario, offline verification and authorized execution command.
+Choose GPT or GLM with `--provider openai` / `--provider glm`; see
+[provider configuration and examples](docs/providers.md).
 
 ## Extending Danso
 

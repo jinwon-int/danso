@@ -14,6 +14,8 @@ flowchart TD
     Loop --> Store[SessionStore]
     Loop --> Sink[EventSink]
     Provider --> Anthropic[Anthropic HTTP adapter]
+    Provider --> OpenAI[OpenAI Responses adapter]
+    Provider --> GLM[Z.AI Chat Completions adapter]
     Executor --> Runner[Runner: sandbox and resource limits]
     Runner --> Registry[Worker registry: builtin tools]
     Store --> Session[Pi v3 JSONL journal]
@@ -50,7 +52,8 @@ interfaces are a source-level contract, not a frozen external library ABI.
    and return a validated, terminal Pi-compatible assistant message in `complete`.
 3. Enforce request/response/time limits, protect credentials, and mark
    `Usage.attempted` only after local validation, immediately before dispatch.
-   Add normalized `TokenUsage` using your provider/model name.
+   Add normalized `TokenUsage` using your provider/model name and propagate
+   `Usage::add` errors (`?`) so untrusted counters cannot overflow telemetry.
 4. Select the adapter in `app.rs` and add CLI/config selection if needed. Keep
    provider branching out of `runtime.rs`.
 5. Add wire-format tests with a local fake server. A live canary is a separate
@@ -117,7 +120,10 @@ Run the full existing gates after changing a contract:
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+cargo build --locked
 python3 scripts/test_e2e.py
+python3 scripts/test_providers.py
+python3 scripts/test_live_acceptance.py
 ```
 
 The real-bubblewrap E2E suite continues to cover CLI behavior and the actual

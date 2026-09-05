@@ -2,7 +2,7 @@
 use crate::{
     context,
     contracts::EventSink,
-    provider::anthropic::Anthropic,
+    provider::{Selected, anthropic::Anthropic, glm::Glm, openai::OpenAi},
     runtime::{self, RunInput},
     session::Session,
     tools::Runner,
@@ -16,6 +16,8 @@ pub struct RunConfig {
     pub cwd: PathBuf,
     pub session: PathBuf,
     pub model: String,
+    pub provider: String,
+    pub reasoning_effort: Option<String>,
     pub trust_project: bool,
     pub unsafe_no_sandbox: bool,
     pub max_turns: u32,
@@ -67,10 +69,55 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     );
     let ctx = context::discover(&cwd, &home, args.trust_project)?;
     let session = Session::open(&session_path, &cwd)?;
-    let key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY is required")?;
-    let base = std::env::var("DANSO_ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|_| "https://api.anthropic.com".into());
-    let mut provider = Anthropic::new(args.model.clone(), key, &base)?;
+    ensure!(!args.model.trim().is_empty(), "model must not be empty");
+    if let Some(effort) = &args.reasoning_effort {
+        ensure!(
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort.as_str()),
+            "invalid reasoning effort"
+        );
+    }
+    let (key_name, base_name, default_base) = match args.provider.as_str() {
+        "anthropic" => (
+            "ANTHROPIC_API_KEY",
+            "DANSO_ANTHROPIC_BASE_URL",
+            "https://api.anthropic.com",
+        ),
+        "openai" => (
+            "OPENAI_API_KEY",
+            "DANSO_OPENAI_BASE_URL",
+            "https://api.openai.com/v1",
+        ),
+        "glm" => (
+            "ZAI_API_KEY",
+            "DANSO_GLM_BASE_URL",
+            "https://api.z.ai/api/paas/v4",
+        ),
+        _ => anyhow::bail!("unsupported provider"),
+    };
+    let key = std::env::var(key_name).with_context(|| format!("{key_name} is required"))?;
+    let base = std::env::var(base_name).unwrap_or_else(|_| default_base.into());
+    let mut provider = match args.provider.as_str() {
+        "anthropic" => {
+            ensure!(
+                args.reasoning_effort.is_none(),
+                "reasoning-effort is unsupported by the Anthropic adapter"
+            );
+            Selected::Anthropic(Anthropic::new(args.model.clone(), key, &base)?)
+        }
+        "openai" => Selected::OpenAi(OpenAi::new(
+            args.model.clone(),
+            key,
+            &base,
+            args.reasoning_effort.clone(),
+        )?),
+        "glm" => Selected::Glm(Glm::new(
+            args.model.clone(),
+            key,
+            &base,
+            args.reasoning_effort.clone(),
+        )?),
+        _ => unreachable!(),
+    };
     let runner = Runner {
         cwd,
         readable: ctx.readable,
