@@ -246,6 +246,28 @@ class Providers(Fixture):
             self.assertIn('unresolved tool operation', p.stderr)
             self.assertEqual(len(self.requests), count)
 
+    def test_aggregate_usage_overflow_is_normal_failure(self):
+        for provider in ('openai', 'glm'):
+            for extra in (1, 2):
+                with self.subTest(provider=provider, extra=extra):
+                    self.session = self.root / f'overflow-{provider}-{extra}.jsonl'
+                    first = response(provider, [('read', {'path': 'hello'})])
+                    second = response(provider)
+                    key_in, key_out, details = (('input_tokens', 'output_tokens', 'input_tokens_details')
+                                               if provider == 'openai' else
+                                               ('prompt_tokens', 'completion_tokens', 'prompt_tokens_details'))
+                    first['usage'] = {key_in: 2**64 - 2, key_out: 1, details: {'cached_tokens': 0}}
+                    second['usage'] = {key_in: extra, key_out: 0, details: {'cached_tokens': 0}}
+                    (self.repo / 'hello').write_text('hello')
+                    self.responses.extend([(200, first), (200, second)])
+                    p = self.run_cli(provider)
+                    self.assertEqual(p.returncode, 3, p.stderr)
+                    self.assertIn('usage overflow', p.stderr)
+                    self.assertNotIn('panicked', p.stderr)
+                    usage = self.usage(p)
+                    self.assertEqual(usage['requests'], 1)
+                    self.assertEqual(usage['totalTokens'], 2**64 - 1)
+
     def test_glm_accepts_documented_object_arguments(self):
         r = response('glm', [('write', {'path': 'object-args', 'content': 'ok'})])
         r['choices'][0]['message']['tool_calls'][0]['function']['arguments'] = {'path': 'object-args', 'content': 'ok'}

@@ -52,7 +52,8 @@ interfaces are a source-level contract, not a frozen external library ABI.
    and return a validated, terminal Pi-compatible assistant message in `complete`.
 3. Enforce request/response/time limits, protect credentials, and mark
    `Usage.attempted` only after local validation, immediately before dispatch.
-   Add normalized `TokenUsage` using your provider/model name.
+   Add normalized `TokenUsage` using your provider/model name and propagate
+   `Usage::add` errors (`?`) so untrusted counters cannot overflow telemetry.
 4. Select the adapter in `app.rs` and add CLI/config selection if needed. Keep
    provider branching out of `runtime.rs`.
 5. Add wire-format tests with a local fake server. A live canary is a separate

@@ -53,7 +53,7 @@ impl Provider for OpenAi {
                 cache_read: t.cache_read,
                 cache_write: 0,
             },
-        );
+        )?;
         ensure!(
             response["status"] == "completed" && response["error"].is_null(),
             "OpenAI response did not complete"

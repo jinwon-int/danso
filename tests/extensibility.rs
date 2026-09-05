@@ -42,7 +42,7 @@ impl Provider for ScriptedProvider {
                 output: 2,
                 ..Default::default()
             },
-        );
+        )?;
         Ok(self.replies.pop_front().expect("unexpected request"))
     }
 }

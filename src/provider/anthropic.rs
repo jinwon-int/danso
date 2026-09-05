@@ -93,7 +93,7 @@ impl Provider for Anthropic {
                 cache_read: u["cache_read_input_tokens"].as_u64().unwrap_or(0),
                 cache_write: u["cache_creation_input_tokens"].as_u64().unwrap_or(0),
             },
-        );
+        )?;
         assistant(&response, response_model)
     }
 }

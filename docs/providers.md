@@ -66,7 +66,8 @@ target/debug/danso --provider glm --model YOUR_GLM_MODEL \
   reasoning interchange compatibility.
 - Input usage includes cached tokens in the upstream APIs. Danso subtracts the
   cache portion from normalized `inputTokens`, counts it in `cacheReadTokens`,
-  and keeps `totalTokens` free of double counting. Cost remains unknown (zero
+  and keeps `totalTokens` free of double counting. Per-response and cumulative
+  arithmetic are checked; overflow fails without changing the last valid summary. Cost remains unknown (zero
   solely for Piri schema compatibility).
 - Requests are capped at 512 KiB, responses at 1 MiB, and HTTP transport at 60s.
   The CLI run/turn/tool limits still apply. Large reasoning histories can reach

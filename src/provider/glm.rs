@@ -55,7 +55,7 @@ impl Provider for Glm {
                 cache_read: t.cache_read,
                 cache_write: 0,
             },
-        );
+        )?;
         let choices = response["choices"]
             .as_array()
             .context("missing GLM choices")?;
