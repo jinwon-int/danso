@@ -90,6 +90,9 @@ class Compaction(fixture.Fixture):
                 for body in state['action_requests'][1:]:
                     rendered = json.dumps(body)
                     self.assertIn('Historical checkpoint', rendered)
+                    self.assertIn('Recent settled tool results', rendered)
+                    self.assertIn('outputExcerpt', rendered)
+                    self.assertIn('success', rendered)
                     self.assertIn('ORIGINAL_GOAL', rendered)
                     self.assertNotIn('opaque-fixture', rendered)
                     self.assertNotIn('fixture-reasoning', rendered)
