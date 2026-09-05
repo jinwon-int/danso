@@ -20,9 +20,10 @@ class Workflow(unittest.TestCase):
     final = e2e.Acceptance.final
     def test_workflow(self):
         actions = [call('read', {'path': 'add.sh'}, 'r'),
+                   call('read', {'path': 'test.sh'}, 'r2'),
                    call('edit', {'path': 'add.sh', 'oldText': '$1 - $2', 'newText': '$1 + $2'}, 'e'),
                    call('bash', {'command': 'bash test.sh'}, 'b'),
-                   call('write', {'path': 'report.md', 'content': 'Addition fixed; tests pass.'}, 'w')]
+                   call('write', {'path': 'report.md', 'content': live.REPORT}, 'w')]
         self.responses.append((200, reply(actions, 'tool_use')))
         self.final()
         token = 'abc123'
@@ -68,6 +69,24 @@ class Safety(unittest.TestCase):
                                 capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'})
         self.assertEqual(result.returncode, 2)
         self.assertIn('--live is required', result.stderr)
+
+    def test_rejects_report_and_temporary_test_replacement(self):
+        calls = [
+            {'name': 'read', 'arguments': {'path': 'add.sh'}},
+            {'name': 'read', 'arguments': {'path': 'test.sh'}},
+            {'name': 'edit', 'arguments': {'path': 'add.sh', 'oldText': '$1 - $2', 'newText': '$1 + $2'}},
+            {'name': 'bash', 'arguments': {'command': 'bash test.sh'}},
+            {'name': 'write', 'arguments': {'path': 'report.md', 'content': live.REPORT}},
+        ]
+        live.validate_calls(calls)
+        calls[-1]['arguments']['content'] = 'x'
+        with self.assertRaisesRegex(ValueError, 'unexpected edit, test command, or report'):
+            live.validate_calls(calls)
+        calls[-1]['arguments']['content'] = live.REPORT
+        tamper = {'name': 'write', 'arguments': {'path': 'test.sh', 'content': 'echo ACCEPTANCE_TESTS_PASS'}}
+        restore = {'name': 'write', 'arguments': {'path': 'test.sh', 'content': live.TEST}}
+        with self.assertRaisesRegex(ValueError, 'unexpected tool sequence'):
+            live.validate_calls(calls[:3] + [tamper, calls[3], restore, calls[4]])
 
     def test_usage_must_agree(self):
         with self.assertRaises(ValueError):

@@ -11,6 +11,7 @@ import tempfile
 
 BROKEN = '#!/bin/bash\nprintf "%s\\n" "$(($1 - $2))"\n'
 FIXED = BROKEN.replace('$1 - $2', '$1 + $2')
+REPORT = 'Fixed subtraction to addition; bash test.sh passed.\n'
 TEST = '''#!/bin/bash
 set -eu
 test "$(bash add.sh 2 3)" = 5
@@ -55,6 +56,21 @@ def usage(stderr):
     return result
 
 
+def validate_calls(calls):
+    require([c.get('name') for c in calls] == ['read', 'read', 'edit', 'bash', 'write'],
+            'unexpected tool sequence')
+    require(sorted(c.get('arguments', {}).get('path', '') for c in calls[:2])
+            == ['add.sh', 'test.sh'], 'expected both source and test reads')
+    require(all(set(c['arguments']) == {'path'} for c in calls[:2]), 'unexpected read arguments')
+    expected = [
+        {'path': 'add.sh', 'oldText': '$1 - $2', 'newText': '$1 + $2'},
+        {'command': 'bash test.sh'},
+        {'path': 'report.md', 'content': REPORT},
+    ]
+    require([c.get('arguments') for c in calls[2:]] == expected,
+            'unexpected edit, test command, or report')
+
+
 def run(binary, model, provider_env):
     root = Path(tempfile.mkdtemp(prefix='danso-acceptance-'))
     print(f'Artifacts retained: {root}', flush=True)
@@ -67,10 +83,12 @@ def run(binary, model, provider_env):
     save(repo / 'test.sh', TEST)
     token = secrets.token_hex(12)
     prompts = [
-        'Read add.sh and test.sh with read. Fix add.sh using edit by changing only '
-        'the subtraction operator to addition. Do not change test.sh. Run exactly '
-        '`bash test.sh` with bash. Use write to create report.md describing the fix '
-        'and test result. Finish with a short explanation. Remember this conversation '
+        'Make exactly five tool calls in this order: read add.sh, read test.sh, edit, bash, write. '
+        'For each read supply only path. Fix add.sh using edit by changing only '
+        'oldText `$1 - $2` to newText `$1 + $2`. Do not change test.sh. Run exactly '
+        '`bash test.sh` with bash. Use write with path report.md and exactly this content: '
+        f'{REPORT!r} (including the trailing newline). Finish with a short explanation. '
+        'Remember this conversation '
         f'token for my next request: {token}',
         'Without calling any tools, return only the conversation token I gave you '
         'in my previous request.'
@@ -96,12 +114,13 @@ def run(binary, model, provider_env):
             if index == 1:
                 require(read_regular(repo / 'add.sh') == FIXED, 'incorrect source change')
                 require(read_regular(repo / 'test.sh') == TEST, 'test file changed')
-                require(bool(read_regular(repo / 'report.md').strip()), 'missing report')
+                require(read_regular(repo / 'report.md') == REPORT, 'incorrect report')
                 require(all(not r.get('isError', True) for r in results), 'tool failure')
                 require({r.get('toolName') for r in results} == {'read', 'edit', 'bash', 'write'},
                         'four-tool round trip missing')
                 calls = [c for e in entries for c in e.get('message', {}).get('content', [])
                          if isinstance(c, dict) and c.get('type') == 'toolCall']
+                validate_calls(calls)
                 test_ids = {c['id'] for c in calls if c.get('name') == 'bash'
                             and c.get('arguments') == {'command': 'bash test.sh'}}
                 require(any(r.get('toolCallId') in test_ids and

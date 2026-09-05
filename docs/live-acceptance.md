@@ -41,8 +41,11 @@ an unknown-cost compatibility placeholder, not a free-call guarantee.
 
 1. Read a deliberately broken shell addition function, change only subtraction
    to addition with `edit`, run exactly `bash test.sh`, and write `report.md`.
-2. Check the exact corrected source, unchanged test script, nonempty report,
+2. Check the exact corrected source, unchanged test script, exact report,
    successful results for all four tools and sandbox test success evidence.
+   Enforce exactly two reads, one exact edit, one exact test command and one
+   report write, in that order. The report must contain the prescribed fix and
+   test-result sentence. Extra calls, including temporary test replacement, fail.
    Generated code is never executed by the verifier outside the sandbox.
 3. Both usage prefixes agree and token totals are internally consistent.
 4. Resume the same session and recall a random token supplied only in the first
