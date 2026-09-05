@@ -21,6 +21,28 @@ pub struct Session {
     pub entries: Vec<Value>,
 }
 
+impl crate::contracts::SessionStore for Session {
+    fn header(&self) -> &Value {
+        &self.entries[0]
+    }
+    fn messages(&self) -> Result<Vec<Value>> {
+        Session::messages(self)
+    }
+    fn check_recovery(&self) -> Result<()> {
+        Session::check_recovery(self)
+    }
+    fn append_message(&mut self, message: Value) -> Result<Value> {
+        self.message(message)
+    }
+    fn record_operation(
+        &mut self,
+        id: &str,
+        state: crate::contracts::OperationState,
+    ) -> Result<()> {
+        self.operation(id, state.as_str())
+    }
+}
+
 impl Session {
     pub fn open(path: &Path, cwd: &Path) -> Result<Self> {
         let mut options = OpenOptions::new();

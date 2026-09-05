@@ -1,7 +1,8 @@
+use super::OUTPUT_LIMIT;
+use crate::contracts::{ToolCall, ToolDefinition, ToolExecutor, ToolOutcome};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
-    fs,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -10,101 +11,6 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
 };
-
-pub const OUTPUT_LIMIT: usize = 64 * 1024;
-
-pub fn definitions() -> Value {
-    json!([
-        {"name":"read", "description":"Read a UTF-8 file (256 KiB maximum)", "input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}},
-        {"name":"bash", "description":"Run a shell command in the workspace; network is disabled in the sandbox", "input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}},
-        {"name":"edit", "description":"Replace exactly one occurrence of oldText in a UTF-8 file", "input_schema":{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["path","oldText","newText"],"additionalProperties":false}},
-        {"name":"write", "description":"Write UTF-8 content to a file, creating parent directories", "input_schema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}}
-    ])
-}
-
-fn string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
-    args[key]
-        .as_str()
-        .with_context(|| format!("missing string {key}"))
-}
-
-/// Called only in a short-lived worker process. The parent supplies the OS
-/// sandbox; these checks give useful errors but are not the security boundary.
-pub fn worker(call: Value) -> Result<()> {
-    let args = &call["arguments"];
-    match call["name"].as_str() {
-        Some("read") => print!(
-            "{}",
-            crate::context::read_bounded(
-                Path::new(string(args, "path")?),
-                crate::context::FILE_LIMIT
-            )?
-        ),
-        Some("write" | "edit") => {
-            let path = PathBuf::from(string(args, "path")?);
-            let cwd = std::env::current_dir()?;
-            let path = if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            };
-            // A dangling symlink may point into the sandbox's private /tmp.
-            // Reject it as well: success there would falsely claim a workspace
-            // edit even though the host target remained unchanged.
-            if fs::symlink_metadata(&path).is_ok() {
-                ensure!(
-                    path.canonicalize()?.starts_with(&cwd),
-                    "writes must stay inside the workspace"
-                );
-            }
-            // Resolve the closest existing ancestor before creating anything.
-            let existing = path
-                .ancestors()
-                .find(|p| p.exists())
-                .context("no parent")?
-                .canonicalize()?;
-            ensure!(
-                existing.starts_with(&cwd),
-                "writes must stay inside the workspace"
-            );
-            ensure!(
-                !path
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir)),
-                "parent traversal is not allowed"
-            );
-            let content = if call["name"] == "edit" {
-                let old = string(args, "oldText")?;
-                ensure!(!old.is_empty(), "oldText must not be empty");
-                let current = crate::context::read_bounded(&path, crate::context::FILE_LIMIT)?;
-                ensure!(
-                    current.matches(old).count() == 1,
-                    "oldText must match exactly once"
-                );
-                current.replacen(old, string(args, "newText")?, 1)
-            } else {
-                string(args, "content")?.to_string()
-            };
-            ensure!(
-                content.len() <= crate::context::FILE_LIMIT as usize,
-                "write exceeds byte budget"
-            );
-            fs::create_dir_all(path.parent().context("missing parent")?)?;
-            fs::write(path, content)?;
-            println!("ok");
-        }
-        Some("bash") => {
-            use std::os::unix::process::CommandExt;
-            let error = std::process::Command::new("/bin/bash")
-                .args(["--noprofile", "--norc", "-c", string(args, "command")?])
-                .exec();
-            return Err(error.into());
-        }
-        _ => bail!("unknown tool"),
-    }
-    Ok(())
-}
-
 pub struct Runner {
     pub cwd: PathBuf,
     pub readable: Vec<PathBuf>,
@@ -241,5 +147,25 @@ async fn bounded_output(mut reader: impl tokio::io::AsyncRead + Unpin) -> Result
         }
         ensure!(out.len() + n <= OUTPUT_LIMIT, "tool output exceeds 64 KiB");
         out.extend_from_slice(&buf[..n]);
+    }
+}
+
+impl ToolExecutor for Runner {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        super::builtins().definitions()
+    }
+    async fn preflight(&self) -> Result<()> {
+        let (_, failed) = self
+            .run(&json!({"name":"bash","arguments":{"command":"true"}}))
+            .await?;
+        ensure!(
+            !failed,
+            "sandbox preflight failed; no provider request sent"
+        );
+        Ok(())
+    }
+    async fn execute(&self, call: &ToolCall) -> Result<ToolOutcome> {
+        let (output, is_error) = self.run(&serde_json::to_value(call)?).await?;
+        Ok(ToolOutcome { output, is_error })
     }
 }
