@@ -1,6 +1,6 @@
 # Context compaction and resume
 
-Enable automatic model checkpoints for a long task:
+Experimental, opt-in model checkpoints for a long task:
 
 ```sh
 danso-glm --cwd /path/to/repo --session /path/to/sessions/task.jsonl \
@@ -122,3 +122,12 @@ invocation (two invocations, at most 48 requests overall), including summaries.
 It checks all five prescribed tool calls, source/test/report content, at least two
 checkpoints, and same-session recall without replay. The standard non-stress
 acceptance budgets remain eight requests and 180 seconds per invocation.
+
+Live GLM stress evidence (2026-09-06): the 16 KiB run stopped after one
+checkpoint with an unclassified transport failure. One retry with
+`--reasoning-effort low` saved five checkpoints but repeated reads under new
+call IDs and exhausted the shared turn budget (23 completed requests); it did
+not finish the edit/test/report workflow or reach resumed-session validation.
+Offline multi-compaction/resume tests pass, but real long-task completion is
+not yet validated. Global ID checks prevent replay of existing calls; they do
+not prevent a model from requesting the same operation with a new ID.

@@ -52,11 +52,15 @@ impl Http {
             .build()
             .map_err(|_| anyhow::anyhow!("could not construct provider request"))?;
         usage.attempted = true;
-        let mut response = self
-            .client
-            .execute(request)
-            .await
-            .map_err(|_| anyhow::anyhow!("provider request failed"))?;
+        let mut response = self.client.execute(request).await.map_err(|e| {
+            anyhow::anyhow!(if e.is_timeout() {
+                "provider request timed out"
+            } else if e.is_connect() {
+                "provider connection failed"
+            } else {
+                "provider request failed"
+            })
+        })?;
         ensure!(
             response.status().is_success(),
             "provider request failed: HTTP {}",
