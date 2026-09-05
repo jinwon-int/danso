@@ -12,6 +12,7 @@ pub struct RunInput<'a> {
     pub prompt: &'a str,
     pub context: &'a str,
     pub max_turns: u32,
+    pub compact_at_bytes: Option<usize>,
 }
 
 pub async fn run(
@@ -34,7 +35,18 @@ pub async fn run(
         input.context.len() <= crate::context::CONTEXT_LIMIT,
         "bootstrap/skills context exceeds 65536 bytes"
     );
+    if let Some(limit) = input.compact_at_bytes {
+        ensure!(
+            (crate::compaction::MIN_THRESHOLD..=crate::compaction::MAX_THRESHOLD).contains(&limit),
+            "compact-at-bytes must be 8192..393216"
+        );
+        ensure!(
+            session.supports_compaction(),
+            "session store does not support compaction"
+        );
+    }
     session.check_recovery()?;
+    let mut ids = session.tool_call_ids()?;
     let mut messages = session.messages()?;
     provider.validate_history(&messages)?;
     executor.preflight().await?;
@@ -52,7 +64,54 @@ pub async fn run(
     let user = json!({"role":"user","content":input.prompt,"timestamp":millis()});
     sink.emit(Event::Message(&session.append_message(user.clone())?))?;
     messages.push(user);
-    for _ in 0..input.max_turns {
+    let mut remaining = input.max_turns;
+    while remaining > 0 {
+        if let Some(limit) = input.compact_at_bytes {
+            let before = provider.request_bytes(&ModelRequest {
+                system: &system,
+                messages: &messages,
+                tools: &definitions,
+            })?;
+            if before > limit {
+                // The current request and static instructions cannot be summarized
+                // away. Reject impossible budgets before spending summary calls.
+                let latest = crate::compaction::latest_user(&messages)?;
+                let bare = provider.request_bytes(&ModelRequest {
+                    system: &system,
+                    messages: std::slice::from_ref(&latest),
+                    tools: &definitions,
+                })?;
+                let summary_budget = (limit / 8).min(crate::compaction::MAX_SUMMARY_BYTES);
+                ensure!(
+                    bare + 2 * summary_budget + 512 <= limit,
+                    "current request and instructions leave no compaction budget"
+                );
+                session.check_recovery()?;
+                let summary =
+                    crate::compaction::summarize(provider, &messages, limit, &mut remaining, usage)
+                        .await?;
+                let compacted = vec![crate::compaction::context_message(&summary), latest];
+                let after = provider.request_bytes(&ModelRequest {
+                    system: &system,
+                    messages: &compacted,
+                    tools: &definitions,
+                })?;
+                ensure!(
+                    after <= limit && after < before,
+                    "compaction did not reduce request below threshold"
+                );
+                let entry = session.record_compaction(summary)?;
+                // Durable checkpoint before the next request; renderer failure
+                // also stops continuation, leaving a resumable journal.
+                sink.emit(Event::Compaction(&entry))?;
+                messages = session.messages()?;
+                ensure!(
+                    messages == compacted,
+                    "session store returned inconsistent compacted context"
+                );
+            }
+        }
+        remaining -= 1;
         let message = provider
             .complete(
                 ModelRequest {
@@ -79,13 +138,8 @@ pub async fn run(
             "invalid tool response"
         );
         // All adapters must pass this gate before any new side effect.
-        let mut ids = std::collections::HashSet::new();
-        for m in messages.iter().chain(std::iter::once(&message)) {
-            if m["role"] == "assistant" {
-                for call in tool_calls(m)? {
-                    ensure!(ids.insert(call.id), "duplicate tool call id");
-                }
-            }
+        for call in &calls {
+            ensure!(ids.insert(call.id.clone()), "duplicate tool call id");
         }
         sink.emit(Event::Message(&session.append_message(message.clone())?))?;
         messages.push(message.clone());
@@ -115,7 +169,7 @@ pub async fn run(
     bail!("turn budget exhausted")
 }
 
-fn tool_calls(message: &Value) -> Result<Vec<ToolCall>> {
+pub(crate) fn tool_calls(message: &Value) -> Result<Vec<ToolCall>> {
     message["content"]
         .as_array()
         .context("invalid assistant content")?

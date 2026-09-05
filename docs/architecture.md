@@ -29,6 +29,7 @@ flowchart TD
 | `main.rs`, `cli.rs` | CLI parsing, signal cancellation, run wall timeout, process exits | Agent policy or provider requests |
 | `app.rs` | Validating configuration, resolving paths/env, choosing real adapters | Model response conversion or tool dispatch |
 | `contracts.rs` | Tool definitions/calls/results, operation states, storage/executor/output interfaces | HTTP formats, clap, subprocesses |
+| `compaction.rs` | Bounded text-only checkpoint summarization and schema validation | Journal writes or tool execution |
 | `runtime.rs` | History, turn budget, duplicate-call gate, durable operation order | Environment lookup, HTTP, shell spawning, output formatting |
 | `provider/` | Provider validation, request/response translation, bounded transport | Tool execution or session mutations |
 | `tools/mod.rs` | One registry for definitions and worker dispatch | Agent-loop policy |
@@ -50,7 +51,8 @@ interfaces are a source-level contract, not a frozen external library ABI.
 1. Add `src/provider/<name>.rs` and implement `Provider`.
 2. Validate supported history in `validate_history`; translate `ModelRequest`
    and return a validated, terminal Pi-compatible assistant message in `complete`.
-3. Enforce request/response/time limits, protect credentials, and mark
+3. Implement `request_bytes` using the exact body builder also used by `complete`.
+   Enforce request/response/time limits, protect credentials, and mark
    `Usage.attempted` only after local validation, immediately before dispatch.
    Add normalized `TokenUsage` using your provider/model name and propagate
    `Usage::add` errors (`?`) so untrusted counters cannot overflow telemetry.
@@ -86,7 +88,9 @@ registry without enabling extra production tools.
   process exit handling in the outer application.
 - Implement `SessionStore` to change persistence. Preserve Pi interchange and
   the recovery contract: durable append before returning, exclusive writer,
-  strict unresolved-operation detection, and no automatic replay.
+  strict unresolved-operation detection, and no automatic replay. Stores enabling
+  compaction must implement `supports_compaction`, `record_compaction` and
+  `tool_call_ids` from the entire original journal, not just active context.
 - Implement `ToolExecutor` to add another isolation backend. Preflight must
   fail before provider dispatch when isolation is unavailable. Cancellation
   must contain descendants, and execution must retain resource limits.
@@ -122,6 +126,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked
 python3 scripts/test_e2e.py
+python3 scripts/test_compaction.py
 python3 scripts/test_providers.py
 python3 scripts/test_live_acceptance.py
 ```

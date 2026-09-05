@@ -62,6 +62,8 @@ class Fixture(unittest.TestCase):
                 owner.headers.append(dict(self.headers))
                 owner.paths.append(self.path)
                 status, body = owner.responses.pop(0) if owner.responses else (500, {})
+                if callable(body):
+                    body = body(owner.requests[-1])
                 data = body if isinstance(body, bytes) else json.dumps(body).encode()
                 self.send_response(status)
                 if status == 302:

@@ -21,6 +21,7 @@ pub struct RunConfig {
     pub trust_project: bool,
     pub unsafe_no_sandbox: bool,
     pub max_turns: u32,
+    pub compact_at_bytes: Option<usize>,
     pub timeout_seconds: u64,
     pub tool_timeout_seconds: u64,
 }
@@ -130,6 +131,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
             prompt: &args.prompt,
             context: &ctx.prompt,
             max_turns: args.max_turns,
+            compact_at_bytes: args.compact_at_bytes,
         },
         &mut provider,
         &runner,

@@ -18,7 +18,7 @@ module boundary; `app.rs` is the composition root and `runtime.rs` is agent poli
   gates. Keep the Pi fixture and real-sandbox E2E tests passing.
 - Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`,
   `cargo test --locked`, `cargo build --locked`, `python3 scripts/test_e2e.py`,
-  `python3 scripts/test_providers.py`, and `python3 scripts/test_live_acceptance.py`
+  `python3 scripts/test_compaction.py`, `python3 scripts/test_providers.py`, and `python3 scripts/test_live_acceptance.py`
   before a PR.
 - Tests use synthetic credentials and local providers. Do not turn tests into
   real model calls or fleet changes.

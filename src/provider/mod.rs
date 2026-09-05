@@ -21,6 +21,11 @@ pub struct ModelRequest<'a> {
 #[allow(async_fn_in_trait)]
 pub trait Provider {
     fn validate_history(&self, messages: &[Value]) -> Result<()>;
+    /// Exact serialized request size for production adapters. The default is
+    /// suitable only for non-wire scripted providers.
+    fn request_bytes(&self, request: &ModelRequest<'_>) -> Result<usize> {
+        Ok(serde_json::to_vec(&serde_json::json!({"system":request.system,"messages":request.messages,"tools":request.tools}))?.len())
+    }
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value>;
 }
 
@@ -36,6 +41,13 @@ impl Provider for Selected {
             Self::Anthropic(p) => p.validate_history(messages),
             Self::OpenAi(p) => p.validate_history(messages),
             Self::Glm(p) => p.validate_history(messages),
+        }
+    }
+    fn request_bytes(&self, request: &ModelRequest<'_>) -> Result<usize> {
+        match self {
+            Self::Anthropic(p) => p.request_bytes(request),
+            Self::OpenAi(p) => p.request_bytes(request),
+            Self::Glm(p) => p.request_bytes(request),
         }
     }
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {

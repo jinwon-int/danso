@@ -71,7 +71,8 @@ target/debug/danso --provider glm --model YOUR_GLM_MODEL \
   solely for Piri schema compatibility).
 - Requests are capped at 512 KiB, responses at 1 MiB, and HTTP transport at 60s.
   The CLI run/turn/tool limits still apply. Large reasoning histories can reach
-  the byte cap; automatic compaction is not part of this change.
+  the byte cap; opt-in [context compaction](compaction.md) can summarize portable evidence
+  and start a fresh provider reasoning context while preserving the journal.
 
 ## Offline verification
 

@@ -14,7 +14,10 @@ pub struct PrintSink(pub Mode);
 impl EventSink for PrintSink {
     fn emit(&mut self, event: Event<'_>) -> Result<()> {
         match (self.0, event) {
-            (Mode::Json, Event::Session(entry) | Event::Message(entry)) => println!("{entry}"),
+            (
+                Mode::Json,
+                Event::Session(entry) | Event::Message(entry) | Event::Compaction(entry),
+            ) => println!("{entry}"),
             (Mode::Text, Event::FinalAnswer(message)) => {
                 if let Some(blocks) = message["content"].as_array() {
                     for block in blocks {

@@ -43,6 +43,14 @@ pub trait SessionStore {
     fn header(&self) -> &Value;
     fn messages(&self) -> Result<Vec<Value>>;
     fn check_recovery(&self) -> Result<()>;
+    /// All call IDs from the original journal, including compacted-away messages.
+    fn tool_call_ids(&self) -> Result<std::collections::HashSet<String>>;
+    fn supports_compaction(&self) -> bool {
+        false
+    }
+    fn record_compaction(&mut self, _summary: Value) -> Result<Value> {
+        anyhow::bail!("session store does not support compaction")
+    }
     fn append_message(&mut self, message: Value) -> Result<Value>;
     fn record_operation(&mut self, id: &str, state: OperationState) -> Result<()>;
 }
@@ -58,6 +66,7 @@ pub trait ToolExecutor {
 pub enum Event<'a> {
     Session(&'a Value),
     Message(&'a Value),
+    Compaction(&'a Value),
     FinalAnswer(&'a Value),
 }
 

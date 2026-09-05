@@ -40,18 +40,25 @@ impl Anthropic {
             model,
         })
     }
-}
-impl Provider for Anthropic {
-    fn validate_history(&self, messages: &[Value]) -> Result<()> {
-        provider_messages(messages).map(|_| ())
-    }
-    async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
+    fn body(&self, request: &ModelRequest<'_>) -> Result<Value> {
         let definitions: Vec<Value> = request
             .tools
             .iter()
             .map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.parameters}))
             .collect();
         let body = json!({"model":self.model,"max_tokens":4096,"system":request.system,"messages":provider_messages(request.messages)?,"tools":definitions});
+        Ok(body)
+    }
+}
+impl Provider for Anthropic {
+    fn validate_history(&self, messages: &[Value]) -> Result<()> {
+        provider_messages(messages).map(|_| ())
+    }
+    fn request_bytes(&self, request: &ModelRequest<'_>) -> Result<usize> {
+        Ok(serde_json::to_vec(&self.body(request)?)?.len())
+    }
+    async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
+        let body = self.body(&request)?;
         ensure!(
             serde_json::to_vec(&body)?.len() <= 512 * 1024,
             "request context exceeds 512 KiB; start a new session"

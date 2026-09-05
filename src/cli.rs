@@ -37,6 +37,9 @@ pub struct Args {
     pub unsafe_no_sandbox: bool,
     #[arg(long, default_value_t = 16)]
     pub max_turns: u32,
+    /// Opt in to checkpoint compaction above this serialized request size (8192..393216).
+    #[arg(long)]
+    pub compact_at_bytes: Option<usize>,
     #[arg(long, default_value_t = 300)]
     pub timeout_seconds: u64,
     #[arg(long, default_value_t = 30)]
@@ -55,6 +58,7 @@ impl Args {
             trust_project: self.trust_project,
             unsafe_no_sandbox: self.unsafe_no_sandbox,
             max_turns: self.max_turns,
+            compact_at_bytes: self.compact_at_bytes,
             timeout_seconds: self.timeout_seconds,
             tool_timeout_seconds: self.tool_timeout_seconds,
         }

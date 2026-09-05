@@ -120,6 +120,7 @@ fn input() -> RunInput<'static> {
         prompt: "use the probe",
         context: "",
         max_turns: 3,
+        compact_at_bytes: None,
     }
 }
 
@@ -226,6 +227,9 @@ impl SessionStore for FailingJournal {
     }
     fn check_recovery(&self) -> Result<()> {
         self.0.check_recovery()
+    }
+    fn tool_call_ids(&self) -> Result<std::collections::HashSet<String>> {
+        self.0.tool_call_ids()
     }
     fn append_message(&mut self, message: Value) -> Result<Value> {
         self.0.message(message)
