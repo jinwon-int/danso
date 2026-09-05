@@ -78,7 +78,9 @@ def validate_calls(calls):
             'unexpected edit, test command, or report')
 
 
-def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None):
+def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None, compact_at_bytes=None):
+    require(compact_at_bytes is None or 8192 <= compact_at_bytes <= 24576,
+            'acceptance compaction threshold must be 8192..24576')
     key_name, base_name = PROVIDERS[provider]
     require(reasoning_effort is None or (provider != 'anthropic' and reasoning_effort in EFFORTS),
             'unsupported reasoning effort')
@@ -89,8 +91,13 @@ def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None
     home = root / 'home'
     home.mkdir(mode=0o700)
     session = root / 'session.jsonl'
-    save(repo / 'add.sh', BROKEN)
-    save(repo / 'test.sh', TEST)
+    source = BROKEN
+    test_file = TEST
+    if compact_at_bytes is not None:
+        source += '#' + 'x' * (compact_at_bytes * 2) + '\n'
+        test_file += f"printf '%0{compact_at_bytes * 2}d\\n' 0\n"
+    save(repo / 'add.sh', source)
+    save(repo / 'test.sh', test_file)
     token = secrets.token_hex(12)
     prompts = [
         'Make exactly five tool calls in this order: read add.sh, read test.sh, edit, bash, write. '
@@ -103,6 +110,8 @@ def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None
         'Without calling any tools, return only the conversation token I gave you '
         'in my previous request.'
     ]
+    if compact_at_bytes is not None:
+        prompts[0] += ' Make one tool call per response and wait for its result before choosing the next call.'
     env = {'PATH': '/usr/bin:/bin', 'HOME': str(home)}
     env.update({k: provider_env[k] for k in (key_name, base_name) if k in provider_env})
     summaries = []
@@ -110,12 +119,15 @@ def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None
         first_bytes = None
         for index, prompt in enumerate(prompts, 1):
             command = [str(binary), '--cwd', str(repo), '--session', str(session),
-                       '--provider', provider, '--model', model, '--max-turns', '8', '--timeout-seconds', '180',
+                       '--provider', provider, '--model', model, '--max-turns', '24' if compact_at_bytes else '8',
+                       '--timeout-seconds', '300' if compact_at_bytes else '180',
                        '--tool-timeout-seconds', '10', '-p', '--', prompt]
+            if compact_at_bytes is not None:
+                command[1:1] = ['--compact-at-bytes', str(compact_at_bytes)]
             if reasoning_effort is not None:
                 command[1:1] = ['--reasoning-effort', reasoning_effort]
             # Danso supervises its workers; allow its own timeout to finish first.
-            result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=195)
+            result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=315 if compact_at_bytes else 195)
             save(root / f'run-{index}.stdout', result.stdout)
             save(root / f'run-{index}.stderr', result.stderr)
             require(result.returncode == 0, f'run {index} failed (exit {result.returncode})')
@@ -125,8 +137,8 @@ def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None
             entries = [json.loads(line) for line in transcript.splitlines()]
             results = [e['message'] for e in entries if e.get('message', {}).get('role') == 'toolResult']
             if index == 1:
-                require(read_regular(repo / 'add.sh') == FIXED, 'incorrect source change')
-                require(read_regular(repo / 'test.sh') == TEST, 'test file changed')
+                require(read_regular(repo / 'add.sh') == source.replace('$1 - $2', '$1 + $2'), 'incorrect source change')
+                require(read_regular(repo / 'test.sh') == test_file, 'test file changed')
                 require(read_regular(repo / 'report.md') == REPORT, 'incorrect report')
                 require(all(not r.get('isError', True) for r in results), 'tool failure')
                 require({r.get('toolName') for r in results} == {'read', 'edit', 'bash', 'write'},
@@ -149,8 +161,11 @@ def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None
                 require(summaries[-1]['requests'] == 1, 'resume usage includes extra responses')
                 require(all(read_regular(repo / name) == body for name, body in snapshot.items()),
                         'resume changed workspace')
+        compactions = sum(e.get('customType') == 'danso.compaction.v1' for e in entries)
+        if compact_at_bytes is not None:
+            require(compactions >= 2, 'expected multiple compactions')
         save(root / 'result.json', json.dumps({'status': 'passed', 'provider': provider, 'model': model,
-             'reasoning_effort': reasoning_effort,
+             'reasoning_effort': reasoning_effort, 'compact_at_bytes': compact_at_bytes, 'compactions': compactions,
              'runs': summaries, 'cost': 'unknown; costUsd=0 is a compatibility placeholder'}, indent=2) + '\n')
         return root
     except Exception:
@@ -165,6 +180,7 @@ def main():
     parser.add_argument('--provider', choices=PROVIDERS, default='anthropic')
     parser.add_argument('--base-url', help='explicitly trusted API base; receives the selected provider key')
     parser.add_argument('--reasoning-effort', choices=EFFORTS)
+    parser.add_argument('--compact-at-bytes', type=int, help='stress compaction with large read/test output (8192..24576)')
     parser.add_argument('--binary', type=Path, default=Path('target/debug/danso'))
     args = parser.parse_args()
     if not args.live:
@@ -181,7 +197,7 @@ def main():
     if args.base_url:
         env[base_name] = args.base_url
     try:
-        run(args.binary.resolve(strict=True), args.model, env, args.provider, args.reasoning_effort)
+        run(args.binary.resolve(strict=True), args.model, env, args.provider, args.reasoning_effort, args.compact_at_bytes)
     except Exception:
         # Raw exceptions/provider output may contain confidential material.
         print('FAIL: inspect the retained private artifacts; no automatic retry.')

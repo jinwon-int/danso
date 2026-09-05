@@ -75,3 +75,6 @@ fails acceptance even if an alternative implementation could be correct.
 
 This is a narrow happy-path provider canary. Rate-limit, cancellation and
 interruption recovery remain covered by offline E2E tests, not induced live.
+
+For forced repeated compaction, add `--compact-at-bytes 16384`; see
+[the stress workflow and its larger budgets](compaction.md#validation).

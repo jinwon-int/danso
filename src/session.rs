@@ -31,6 +31,29 @@ impl crate::contracts::SessionStore for Session {
     fn check_recovery(&self) -> Result<()> {
         Session::check_recovery(self)
     }
+    fn tool_call_ids(&self) -> Result<HashSet<String>> {
+        Ok(self.scan()?.1.calls.keys().cloned().collect())
+    }
+    fn supports_compaction(&self) -> bool {
+        true
+    }
+    fn record_compaction(&mut self, summary: Value) -> Result<Value> {
+        self.check_recovery()?;
+        self.messages()?;
+        crate::compaction::validate_summary(&summary, crate::compaction::MAX_SUMMARY_BYTES)?;
+        let user_id = self
+            .entries
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "message" && e["message"]["role"] == "user")
+            .context("compaction requires a user request")?["id"]
+            .clone();
+        let through = self.entries.last().context("missing journal head")?["id"].clone();
+        self.append(
+            json!({"type":"custom","customType":"danso.compaction.v1","data":{
+            "version":1,"throughId":through,"userEntryId":user_id,"summary":summary}}),
+        )
+    }
     fn append_message(&mut self, message: Value) -> Result<Value> {
         self.message(message)
     }
@@ -56,6 +79,11 @@ impl Session {
         file.try_lock_exclusive()
             .context("session is already in use")?;
         ensure!(file.metadata()?.is_file(), "session must be a regular file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         ensure!(
             file.metadata()?.len() <= 16 * 1024 * 1024,
             "session exceeds 16 MiB import budget"
@@ -119,6 +147,10 @@ impl Session {
     fn persist(&mut self, entry: Value) -> Result<Value> {
         let mut bytes = serde_json::to_vec(&entry)?;
         bytes.push(b'\n');
+        ensure!(
+            self.file.metadata()?.len() + bytes.len() as u64 <= 16 * 1024 * 1024,
+            "session reached 16 MiB journal budget; original records retained"
+        );
         self.file.write_all(&bytes)?;
         self.file.sync_all()?;
         self.entries.push(entry.clone());
@@ -152,60 +184,141 @@ impl Session {
     }
 
     pub fn messages(&self) -> Result<Vec<Value>> {
-        // v0 supports linear transcripts only; preserve other Pi entries but do
-        // not silently flatten a branch/compaction into incorrect model context.
+        let (messages, recovery) = self.scan()?;
+        recovery.complete()?;
+        Ok(messages)
+    }
+
+    pub fn check_recovery(&self) -> Result<()> {
+        self.scan()?.1.complete()
+    }
+
+    fn scan(&self) -> Result<(Vec<Value>, Recovery)> {
         let mut prev = Value::Null;
         let mut messages = vec![];
+        let mut latest_user: Option<(&Value, &Value)> = None;
+        let mut recovery = Recovery::default();
         for e in &self.entries[1..] {
             ensure!(
                 e["parentId"] == prev,
                 "branched Pi session is import-only in v0"
             );
-            prev = e["id"].clone();
             match e["type"].as_str() {
-                Some("message") => messages.push(e["message"].clone()),
+                Some("message") => {
+                    let m = &e["message"];
+                    recovery.message(m)?;
+                    if m["role"] == "user" {
+                        latest_user = Some((&e["id"], m));
+                    }
+                    messages.push(m.clone());
+                }
+                Some("custom") if e["customType"] == "danso.operation.v1" => {
+                    recovery.operation(&e["data"])?
+                }
+                Some("custom") if e["customType"] == "danso.compaction.v1" => {
+                    // Validate the prefix here, not just the journal's final state:
+                    // a checkpoint must never hide an in-flight tool batch.
+                    recovery.complete()?;
+                    let data = &e["data"];
+                    let (user_id, user) = latest_user.context("compaction lacks user request")?;
+                    ensure!(
+                        data["version"] == 1
+                            && data["throughId"] == prev
+                            && data["userEntryId"] == *user_id,
+                        "invalid compaction boundary"
+                    );
+                    crate::compaction::validate_summary(
+                        &data["summary"],
+                        crate::compaction::MAX_SUMMARY_BYTES,
+                    )?;
+                    messages = vec![
+                        crate::compaction::context_message(&data["summary"]),
+                        user.clone(),
+                    ];
+                }
                 Some(
                     "custom" | "model_change" | "thinking_level_change" | "session_info" | "label",
                 ) => {}
                 _ => bail!("unsupported Pi context entry; import-only in v0"),
             }
+            prev = e["id"].clone();
         }
-        Ok(messages)
+        Ok((messages, recovery))
     }
+}
 
-    pub fn check_recovery(&self) -> Result<()> {
-        let mut unresolved = HashSet::new();
-        let mut calls = HashSet::new();
-        let mut results = HashSet::new();
-        for e in &self.entries[1..] {
-            if e["customType"] == "danso.operation.v1" {
-                let id = e["data"]["toolCallId"]
-                    .as_str()
-                    .context("invalid operation id")?;
-                match e["data"]["state"].as_str() {
-                    Some("started") => {
-                        unresolved.insert(id);
-                    }
-                    Some("settled") => {
-                        unresolved.remove(id);
-                    }
-                    _ => bail!("invalid operation state"),
-                }
+#[derive(Default)]
+struct Recovery {
+    calls: std::collections::HashMap<String, String>,
+    results: HashSet<String>,
+    started: HashSet<String>,
+    settled: HashSet<String>,
+}
+impl Recovery {
+    fn message(&mut self, m: &Value) -> Result<()> {
+        match m["role"].as_str() {
+            Some("user" | "toolResult") => {
+                ensure!(
+                    m["content"].is_string()
+                        || m["content"].as_array().is_some_and(|a| a
+                            .iter()
+                            .all(|b| b["type"] == "text" && b["text"].is_string())),
+                    "unsupported text content in journal"
+                );
             }
-            let m = &e["message"];
-            if m["role"] == "assistant" {
-                if let Some(blocks) = m["content"].as_array() {
-                    for b in blocks.iter().filter(|b| b["type"] == "toolCall") {
-                        let id = b["id"].as_str().context("invalid tool call")?;
-                        ensure!(calls.insert(id), "duplicate tool call id");
-                    }
-                }
-            } else if m["role"] == "toolResult" {
-                results.insert(m["toolCallId"].as_str().context("invalid result id")?);
+            Some("assistant") => {
+                ensure!(
+                    m["content"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().all(|b| b["type"] == "toolCall"
+                            || (b["type"] == "text" && b["text"].is_string()))),
+                    "unsupported assistant content in journal"
+                );
+            }
+            _ => bail!("unsupported message role in journal"),
+        }
+        if m["role"] == "assistant" {
+            for c in crate::runtime::tool_calls(m)? {
+                ensure!(
+                    self.calls.insert(c.id, c.name).is_none(),
+                    "duplicate tool call id"
+                );
+            }
+        } else if m["role"] == "toolResult" {
+            let id = m["toolCallId"].as_str().context("invalid result id")?;
+            ensure!(
+                self.calls.contains_key(id) && self.results.insert(id.to_owned()),
+                "orphan or duplicate tool result"
+            );
+            if let Some(name) = m["toolName"].as_str() {
+                ensure!(self.calls[id] == name, "tool result name mismatch");
             }
         }
+        Ok(())
+    }
+    fn operation(&mut self, d: &Value) -> Result<()> {
+        let id = d["toolCallId"].as_str().context("invalid operation id")?;
+        ensure!(self.calls.contains_key(id), "orphan operation record");
+        match d["state"].as_str() {
+            Some("started") => ensure!(
+                !self.results.contains(id)
+                    && !self.settled.contains(id)
+                    && self.started.insert(id.to_owned()),
+                "invalid operation start"
+            ),
+            Some("settled") => ensure!(
+                self.results.contains(id)
+                    && self.started.remove(id)
+                    && self.settled.insert(id.to_owned()),
+                "invalid operation settlement"
+            ),
+            _ => bail!("invalid operation state"),
+        }
+        Ok(())
+    }
+    fn complete(&self) -> Result<()> {
         ensure!(
-            unresolved.is_empty() && calls.is_subset(&results),
+            self.started.is_empty() && self.calls.keys().all(|id| self.results.contains(id)),
             "unresolved tool operation; manual recovery required (never automatically replayed)"
         );
         Ok(())

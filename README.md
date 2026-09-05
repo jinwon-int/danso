@@ -32,6 +32,13 @@ scenario, offline verification and authorized execution command.
 Choose GPT or GLM with `--provider openai` / `--provider glm`; see
 [provider configuration and examples](docs/providers.md).
 
+## Long tasks
+
+Opt in to automatic context checkpoints with `--compact-at-bytes 196608`.
+Compacted sessions retain the original journal and resume without replaying
+completed tools. See [compaction and recovery](docs/compaction.md) for limits,
+summary semantics and the offline/live stress workflow.
+
 ## Extending Danso
 
 The agent loop uses replaceable provider, tool executor, session store and

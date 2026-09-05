@@ -17,12 +17,7 @@ impl OpenAi {
             effort,
         })
     }
-}
-impl Provider for OpenAi {
-    fn validate_history(&self, messages: &[Value]) -> Result<()> {
-        history(messages).map(|_| ())
-    }
-    async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
+    fn body(&self, request: &ModelRequest<'_>) -> Result<Value> {
         let tools: Vec<Value> = request
             .tools
             .iter()
@@ -36,6 +31,18 @@ impl Provider for OpenAi {
         if let Some(effort) = &self.effort {
             body["reasoning"] = json!({"effort":effort});
         }
+        Ok(body)
+    }
+}
+impl Provider for OpenAi {
+    fn validate_history(&self, messages: &[Value]) -> Result<()> {
+        history(messages).map(|_| ())
+    }
+    fn request_bytes(&self, request: &ModelRequest<'_>) -> Result<usize> {
+        Ok(serde_json::to_vec(&self.body(request)?)?.len())
+    }
+    async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
+        let body = self.body(&request)?;
         let response = self.http.post(&body, usage).await?;
         let t = wire::tokens(
             &response["usage"],

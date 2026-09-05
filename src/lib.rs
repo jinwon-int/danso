@@ -1,4 +1,5 @@
 pub mod app;
+pub mod compaction;
 pub mod context;
 pub mod contracts;
 pub mod output;

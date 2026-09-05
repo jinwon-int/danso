@@ -17,12 +17,7 @@ impl Glm {
             effort,
         })
     }
-}
-impl Provider for Glm {
-    fn validate_history(&self, messages: &[Value]) -> Result<()> {
-        history(messages).map(|_| ())
-    }
-    async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
+    fn body(&self, request: &ModelRequest<'_>) -> Result<Value> {
         let mut messages = vec![json!({"role":"system","content":request.system})];
         messages.extend(history(request.messages)?);
         let tools: Vec<Value> = request
@@ -38,6 +33,18 @@ impl Provider for Glm {
         if let Some(effort) = &self.effort {
             body["reasoning_effort"] = json!(effort);
         }
+        Ok(body)
+    }
+}
+impl Provider for Glm {
+    fn validate_history(&self, messages: &[Value]) -> Result<()> {
+        history(messages).map(|_| ())
+    }
+    fn request_bytes(&self, request: &ModelRequest<'_>) -> Result<usize> {
+        Ok(serde_json::to_vec(&self.body(request)?)?.len())
+    }
+    async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
+        let body = self.body(&request)?;
         let response = self.http.post(&body, usage).await?;
         let t = wire::tokens(
             &response["usage"],
