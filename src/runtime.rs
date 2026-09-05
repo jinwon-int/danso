@@ -90,7 +90,7 @@ pub async fn run(
                 let summary =
                     crate::compaction::summarize(provider, &messages, limit, &mut remaining, usage)
                         .await?;
-                let compacted = vec![crate::compaction::context_message(&summary), latest];
+                let compacted = crate::compaction::checkpoint_messages(&summary, &messages)?;
                 let after = provider.request_bytes(&ModelRequest {
                     system: &system,
                     messages: &compacted,

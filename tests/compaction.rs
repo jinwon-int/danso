@@ -155,3 +155,74 @@ fn journal_capacity_failure_preserves_resumability() {
         .check_recovery()
         .unwrap();
 }
+
+#[test]
+fn journal_receipts_survive_misleading_summaries_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+    let user = json!({"role":"user","content":"read first, edit, test"});
+    session.message(user.clone()).unwrap();
+    for (id, name, target, error) in [
+        ("r", "read", "add.sh", false),
+        ("b", "bash", "bash test.sh", true),
+    ] {
+        let args = if name == "read" {
+            json!({"path":target})
+        } else {
+            json!({"command":target})
+        };
+        session.message(json!({"role":"assistant","content":[{"type":"toolCall","id":id,"name":name,"arguments":args}],"stopReason":"toolUse"})).unwrap();
+        session.operation(id, "started").unwrap();
+        session.message(json!({"role":"toolResult","toolCallId":id,"toolName":name,"content":[{"type":"text","text":"가\n".repeat(5000)}],"isError":error})).unwrap();
+        session.operation(id, "settled").unwrap();
+    }
+    let mut misleading = compaction::empty_summary();
+    misleading["tests"] = json!(["all tests passed"]);
+    session.record_compaction(misleading).unwrap();
+    let messages = session.messages().unwrap();
+    assert_eq!(messages[0], user);
+    let receipts = messages[1]["dansoToolReceipts"].clone();
+    assert_eq!(receipts[0]["target"], "add.sh");
+    assert_eq!(receipts[0]["status"], "success");
+    assert_eq!(receipts[1]["status"], "error");
+    assert!(
+        receipts[1]["outputExcerpt"]
+            .as_str()
+            .unwrap()
+            .contains("[truncated]")
+    );
+    assert!(serde_json::to_vec(&receipts).unwrap().len() <= 1024);
+    // Even a summary that entirely forgets the completed work cannot erase receipts.
+    session
+        .record_compaction(compaction::empty_summary())
+        .unwrap();
+    let expected = session.messages().unwrap();
+    assert_eq!(expected[1]["dansoToolReceipts"], receipts);
+    drop(session);
+    let resumed = Session::open(&path, Path::new("/fixture")).unwrap();
+    assert_eq!(resumed.messages().unwrap(), expected);
+    assert_eq!(resumed.tool_call_ids().unwrap().len(), 2);
+}
+
+#[test]
+fn receipt_projection_is_bounded_and_does_not_call_unknown_success() {
+    let mut messages = vec![json!({"role":"user","content":"task"})];
+    for i in 0..20 {
+        messages.push(json!({"role":"assistant","content":[{"type":"toolCall","id":format!("c{i}"),"name":"read","arguments":{"path":"\"\n한".repeat(1000)}}]}));
+        messages.push(json!({"role":"toolResult","toolCallId":format!("c{i}"),"content":"\"\n한".repeat(1000)}));
+    }
+    let projected =
+        compaction::checkpoint_messages(&compaction::empty_summary(), &messages).unwrap();
+    let receipts = &projected[1]["dansoToolReceipts"];
+    assert!(serde_json::to_vec(receipts).unwrap().len() <= 1024);
+    assert!(!receipts.as_array().unwrap().is_empty());
+    assert!(
+        receipts
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["status"] == "unknown")
+    );
+    assert!(receipts.as_array().unwrap().len() <= 4);
+}

@@ -220,7 +220,7 @@ impl Session {
                     // a checkpoint must never hide an in-flight tool batch.
                     recovery.complete()?;
                     let data = &e["data"];
-                    let (user_id, user) = latest_user.context("compaction lacks user request")?;
+                    let (user_id, _) = latest_user.context("compaction lacks user request")?;
                     ensure!(
                         data["version"] == 1
                             && data["throughId"] == prev
@@ -231,10 +231,7 @@ impl Session {
                         &data["summary"],
                         crate::compaction::MAX_SUMMARY_BYTES,
                     )?;
-                    messages = vec![
-                        crate::compaction::context_message(&data["summary"]),
-                        user.clone(),
-                    ];
+                    messages = crate::compaction::checkpoint_messages(&data["summary"], &messages)?;
                 }
                 Some(
                     "custom" | "model_change" | "thinking_level_change" | "session_info" | "label",

@@ -27,7 +27,7 @@ summarizes the active conversation into exactly five structured fields:
 The latest original user request is retained verbatim. Discovered system/project
 instructions remain unchanged. Older text and tool evidence are summarized;
 opaque provider reasoning is omitted. After compression, model context consists
-of the checkpoint, the latest user request, then new messages. The checkpoint is
+of the latest user request, the checkpoint with recent tool receipts, then new messages. The checkpoint is
 labeled historical, potentially lossy data and never grants authorization.
 
 Summaries are model-generated and can omit or misinterpret details despite
@@ -128,6 +128,40 @@ checkpoint with an unclassified transport failure. One retry with
 `--reasoning-effort low` saved five checkpoints but repeated reads under new
 call IDs and exhausted the shared turn budget (23 completed requests); it did
 not finish the edit/test/report workflow or reach resumed-session validation.
-Offline multi-compaction/resume tests pass, but real long-task completion is
-not yet validated. Global ID checks prevent replay of existing calls; they do
+These were the initial implementation results; see the progress-receipt
+validation below for the subsequent successful run. Global ID checks prevent replay of existing calls; they do
 not prevent a model from requesting the same operation with a new ID.
+
+## Progress receipts
+
+Following Piri's separation of summaries and retained evidence, Danso rebuilds
+up to four recent settled tool receipts from the journal at each checkpoint.
+Each contains the tool, a bounded path/command, explicit success/error/unknown
+status, and a short leading output excerpt. Combined receipt JSON is at most
+1024 bytes; older entries are removed first and shortened strings are marked.
+Receipts survive subsequent model summaries and are rebuilt identically on
+resume. They remain untrusted historical data, never native tool calls. An error
+or absent status cannot become success merely because the summary says so.
+
+The original request now precedes the checkpoint and continuation guidance,
+so the last context message describes current progress rather than reissuing
+the original task. This reduces a restart cue but cannot guarantee model behavior
+or prevent a model from issuing the same operation under a fresh ID. Old custom
+checkpoint records remain readable without rewriting them. Whole-journal
+recovery still gates projection; no uncertain operation is acknowledged.
+
+Reference designs inspected: Piri `84859e40`
+(`packages/agent/src/harness/session/context.ts`, compaction retained tail and
+file-operation details), and ccc-node `164907ec`
+(`bridge/core/session_resume.py`, transcript-backed resume). Danso uses bounded
+receipts instead of copying potentially oversized native tool results or adding
+provider-specific replay behavior.
+
+Progress-receipt live validation (2026-09-06): one GLM-5.3-Flash run with
+`--reasoning-effort low --compact-at-bytes 16384` passed. Two checkpoints
+preceded completion of exactly `read`, `read`, `edit`, `bash`, `write`; the
+resumed invocation recalled prior context without executing tools or changing
+workspace files. Coding used 12 completed requests/27,266 tokens; resume used
+one request/1,447 tokens. This is one bounded fixture, not evidence that every
+long task or provider will avoid repetition. Compaction remains opt-in and
+experimental. Original failed-run evidence above is retained.
