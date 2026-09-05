@@ -27,6 +27,8 @@ linear conversation. An uncertain interrupted tool requires manual recovery.
 See [the v0 contract](docs/v0.md) for trust/discovery subsets, exit codes,
 budgets, recovery behavior, fixture provenance and offline test commands.
 The model adapter is mock-tested; live provider acceptance remains pending.
+See [the opt-in live acceptance workflow](docs/live-acceptance.md) for the
+scenario, offline verification and authorized execution command.
 
 ## Extending Danso
 
