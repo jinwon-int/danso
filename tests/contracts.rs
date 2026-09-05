@@ -95,12 +95,7 @@ fn context_trust_discovery_and_budget() {
 
 #[test]
 fn tool_surface_is_exact() {
-    let defs = tools::definitions();
-    let names: Vec<_> = defs
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|d| d["name"].as_str().unwrap())
-        .collect();
+    let defs = tools::builtins().definitions();
+    let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
     assert_eq!(names, ["read", "bash", "edit", "write"]);
 }

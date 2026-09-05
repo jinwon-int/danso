@@ -28,6 +28,14 @@ See [the v0 contract](docs/v0.md) for trust/discovery subsets, exit codes,
 budgets, recovery behavior, fixture provenance and offline test commands.
 The model adapter is mock-tested; live provider acceptance remains pending.
 
+## Extending Danso
+
+The agent loop uses replaceable provider, tool executor, session store and
+output interfaces. Each builtin tool owns its schema and handler and is
+registered once. See [the architecture and extension recipes](docs/architecture.md)
+and [the executable extension example](tests/extensibility.rs) before adding
+features. Production v0 still exposes exactly four tools.
+
 ## Share with Pi
 
 v0 implements these portable contracts within the documented subset:
