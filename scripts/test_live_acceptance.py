@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import live_acceptance as live
 import test_e2e as e2e
+import test_providers as providers
 from test_e2e import BIN, reply, call
 
 
@@ -47,6 +48,27 @@ class Workflow(unittest.TestCase):
                 'ANTHROPIC_API_KEY': self.env['ANTHROPIC_API_KEY'],
                 'DANSO_ANTHROPIC_BASE_URL': self.env['DANSO_ANTHROPIC_BASE_URL']})
         self.assertEqual(len(self.requests), 1)
+
+
+class MultiProviderWorkflow(providers.Fixture):
+    def test_openai_and_glm_workflow(self):
+        actions = [('read', {'path': 'add.sh'}), ('read', {'path': 'test.sh'}),
+                   ('edit', {'path': 'add.sh', 'oldText': '$1 - $2', 'newText': '$1 + $2'}),
+                   ('bash', {'command': 'bash test.sh'}),
+                   ('write', {'path': 'report.md', 'content': live.REPORT})]
+        for provider in ('openai', 'glm'):
+            with self.subTest(provider=provider):
+                self.responses.extend([(200, providers.response(provider, actions)),
+                                       (200, providers.response(provider)),
+                                       (200, providers.response(provider, text='abc123'))])
+                with patch.object(live.secrets, 'token_hex', return_value='abc123'):
+                    root = live.run(BIN, 'fixture', self.env(provider), provider, 'max')
+                result = json.loads((root / 'result.json').read_text())
+                self.assertEqual(result['status'], 'passed')
+                self.assertEqual(result['provider'], provider)
+                self.assertEqual(result['reasoning_effort'], 'max')
+                for run in result['runs']:
+                    self.assertEqual(run['models'], [f'{provider}/fixture'])
 
 
 class Safety(unittest.TestCase):
@@ -87,6 +109,16 @@ class Safety(unittest.TestCase):
         restore = {'name': 'write', 'arguments': {'path': 'test.sh', 'content': live.TEST}}
         with self.assertRaisesRegex(ValueError, 'unexpected tool sequence'):
             live.validate_calls(calls[:3] + [tamper, calls[3], restore, calls[4]])
+
+    def test_ambient_endpoint_needs_explicit_selection(self):
+        for provider, (key, base) in live.PROVIDERS.items():
+            result = subprocess.run(['python3', str(Path(live.__file__)), '--live',
+                                     '--provider', provider, '--model', 'fixture'],
+                                    capture_output=True, text=True,
+                                    env={'PATH': '/usr/bin:/bin', key: 'fake-key', base: 'https://example.com'})
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('explicitly with --base-url', result.stderr)
+            self.assertNotIn('fake-key', result.stderr)
 
     def test_usage_must_agree(self):
         with self.assertRaises(ValueError):

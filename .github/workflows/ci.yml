@@ -21,4 +21,7 @@ jobs:
           cargo +1.98.1 fmt --check
           cargo +1.98.1 clippy --locked --all-targets -- -D warnings
           cargo +1.98.1 test --locked
+          cargo +1.98.1 build --locked
           python3 scripts/test_e2e.py
+          python3 scripts/test_providers.py
+          python3 scripts/test_live_acceptance.py

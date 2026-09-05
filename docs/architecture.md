@@ -14,6 +14,8 @@ flowchart TD
     Loop --> Store[SessionStore]
     Loop --> Sink[EventSink]
     Provider --> Anthropic[Anthropic HTTP adapter]
+    Provider --> OpenAI[OpenAI Responses adapter]
+    Provider --> GLM[Z.AI Chat Completions adapter]
     Executor --> Runner[Runner: sandbox and resource limits]
     Runner --> Registry[Worker registry: builtin tools]
     Store --> Session[Pi v3 JSONL journal]
@@ -117,7 +119,10 @@ Run the full existing gates after changing a contract:
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+cargo build --locked
 python3 scripts/test_e2e.py
+python3 scripts/test_providers.py
+python3 scripts/test_live_acceptance.py
 ```
 
 The real-bubblewrap E2E suite continues to cover CLI behavior and the actual

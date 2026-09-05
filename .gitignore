@@ -1,2 +1,4 @@
 /target/
 *.jsonl.lock
+
+__pycache__/

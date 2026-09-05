@@ -17,6 +17,8 @@ module boundary; `app.rs` is the composition root and `runtime.rs` is agent poli
 - For a new extension, test it through the common runtime and relevant failure
   gates. Keep the Pi fixture and real-sandbox E2E tests passing.
 - Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`,
-  `cargo test --locked`, and `python3 scripts/test_e2e.py` before a PR.
+  `cargo test --locked`, `cargo build --locked`, `python3 scripts/test_e2e.py`,
+  `python3 scripts/test_providers.py`, and `python3 scripts/test_live_acceptance.py`
+  before a PR.
 - Tests use synthetic credentials and local providers. Do not turn tests into
   real model calls or fleet changes.

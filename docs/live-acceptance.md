@@ -1,6 +1,6 @@
 # Live provider acceptance
 
-This opt-in check covers the remaining real Anthropic adapter acceptance gap.
+This opt-in check covers the real provider acceptance gap for Anthropic, GPT and GLM.
 It does not deploy Danso or access an existing project. Passing offline tests
 is not evidence that a real provider has accepted a request.
 
@@ -8,6 +8,7 @@ is not evidence that a real provider has accepted a request.
 
 ```sh
 cargo build --locked
+python3 scripts/test_providers.py
 python3 scripts/test_live_acceptance.py
 ```
 
@@ -17,19 +18,31 @@ Run it separately from the normal E2E suite; it never requires a live API key.
 
 ## Authorized live run
 
-After the operator chooses a model and authorizes the call, supply
-`ANTHROPIC_API_KEY` through the existing credential mechanism, then run from
-the repository root:
+After the operator chooses a service/model and authorizes the call, supply its
+credential through the existing environment mechanism, then run from the
+repository root:
 
 ```sh
+# OPENAI_API_KEY supplied externally
+python3 scripts/live_acceptance.py --live --provider openai \
+  --model gpt-5.6-luna --reasoning-effort max
+
+# ZAI_API_KEY supplied externally
+python3 scripts/live_acceptance.py --live --provider glm --model YOUR_GLM_MODEL
+
+# ANTHROPIC_API_KEY supplied externally (the original default)
 python3 scripts/live_acceptance.py --live --model YOUR_ANTHROPIC_MODEL
 ```
 
-The command uses the default Anthropic endpoint and rejects a custom base URL.
-It does not locate/copy credentials from another harness. Only PATH, an empty
-private HOME, and the explicitly supplied provider key reach the harness.
-The workspace contains synthetic files; no project instructions are loaded.
-The key remains outside the tool sandbox.
+See [provider configuration](providers.md) for API bases and supported options.
+By default the command uses the selected service's default endpoint. A custom
+endpoint requires an explicit `--base-url`; an ambient endpoint override alone
+is rejected. That URL receives the selected credential and synthetic task.
+The command does not locate/copy credentials from another harness. Only PATH,
+an empty private HOME, and the selected provider's credential and explicit base
+reach the harness. No project instructions are loaded. The key remains outside
+the tool sandbox. `--binary` must name a trusted Danso build, since that process
+receives the credential.
 
 There are two sequential harness invocations, each capped at eight model turns
 and 180 seconds; each tool has a ten-second wall timeout. This is at most sixteen

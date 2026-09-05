@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in Anthropic acceptance. All artifacts are retained in a private temp tree."""
+"""Opt-in provider acceptance. All artifacts are retained in a private temp tree."""
 import argparse
 import json
 import os
@@ -8,6 +8,13 @@ import secrets
 import stat
 import subprocess
 import tempfile
+
+PROVIDERS = {
+    'anthropic': ('ANTHROPIC_API_KEY', 'DANSO_ANTHROPIC_BASE_URL'),
+    'openai': ('OPENAI_API_KEY', 'DANSO_OPENAI_BASE_URL'),
+    'glm': ('ZAI_API_KEY', 'DANSO_GLM_BASE_URL'),
+}
+EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
 
 BROKEN = '#!/bin/bash\nprintf "%s\\n" "$(($1 - $2))"\n'
 FIXED = BROKEN.replace('$1 - $2', '$1 + $2')
@@ -71,7 +78,10 @@ def validate_calls(calls):
             'unexpected edit, test command, or report')
 
 
-def run(binary, model, provider_env):
+def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None):
+    key_name, base_name = PROVIDERS[provider]
+    require(reasoning_effort is None or (provider != 'anthropic' and reasoning_effort in EFFORTS),
+            'unsupported reasoning effort')
     root = Path(tempfile.mkdtemp(prefix='danso-acceptance-'))
     print(f'Artifacts retained: {root}', flush=True)
     repo = root / 'repo'
@@ -93,14 +103,17 @@ def run(binary, model, provider_env):
         'Without calling any tools, return only the conversation token I gave you '
         'in my previous request.'
     ]
-    env = {'PATH': '/usr/bin:/bin', 'HOME': str(home), **provider_env}
+    env = {'PATH': '/usr/bin:/bin', 'HOME': str(home)}
+    env.update({k: provider_env[k] for k in (key_name, base_name) if k in provider_env})
     summaries = []
     try:
         first_bytes = None
         for index, prompt in enumerate(prompts, 1):
             command = [str(binary), '--cwd', str(repo), '--session', str(session),
-                       '--model', model, '--max-turns', '8', '--timeout-seconds', '180',
+                       '--provider', provider, '--model', model, '--max-turns', '8', '--timeout-seconds', '180',
                        '--tool-timeout-seconds', '10', '-p', '--', prompt]
+            if reasoning_effort is not None:
+                command[1:1] = ['--reasoning-effort', reasoning_effort]
             # Danso supervises its workers; allow its own timeout to finish first.
             result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=195)
             save(root / f'run-{index}.stdout', result.stdout)
@@ -136,7 +149,8 @@ def run(binary, model, provider_env):
                 require(summaries[-1]['requests'] == 1, 'resume usage includes extra responses')
                 require(all(read_regular(repo / name) == body for name, body in snapshot.items()),
                         'resume changed workspace')
-        save(root / 'result.json', json.dumps({'status': 'passed', 'model': model,
+        save(root / 'result.json', json.dumps({'status': 'passed', 'provider': provider, 'model': model,
+             'reasoning_effort': reasoning_effort,
              'runs': summaries, 'cost': 'unknown; costUsd=0 is a compatibility placeholder'}, indent=2) + '\n')
         return root
     except Exception:
@@ -148,17 +162,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--live', action='store_true', help='authorize two real provider invocations')
     parser.add_argument('--model', required=True)
+    parser.add_argument('--provider', choices=PROVIDERS, default='anthropic')
+    parser.add_argument('--base-url', help='explicitly trusted API base; receives the selected provider key')
+    parser.add_argument('--reasoning-effort', choices=EFFORTS)
     parser.add_argument('--binary', type=Path, default=Path('target/debug/danso'))
     args = parser.parse_args()
     if not args.live:
         parser.error('--live is required; this sends requests and may incur charges')
-    if os.environ.get('DANSO_ANTHROPIC_BASE_URL'):
-        parser.error('this acceptance command supports only the default Anthropic endpoint')
-    key = os.environ.get('ANTHROPIC_API_KEY')
+    key_name, base_name = PROVIDERS[args.provider]
+    if args.provider == 'anthropic' and args.reasoning_effort is not None:
+        parser.error('reasoning-effort is unsupported by the Anthropic adapter')
+    if os.environ.get(base_name) and not args.base_url:
+        parser.error('an ambient endpoint override exists; select it explicitly with --base-url')
+    key = os.environ.get(key_name)
     if not key:
-        parser.error('ANTHROPIC_API_KEY must be supplied by the operator')
+        parser.error(f'{key_name} must be supplied by the operator')
+    env = {key_name: key}
+    if args.base_url:
+        env[base_name] = args.base_url
     try:
-        run(args.binary.resolve(strict=True), args.model, {'ANTHROPIC_API_KEY': key})
+        run(args.binary.resolve(strict=True), args.model, env, args.provider, args.reasoning_effort)
     except Exception:
         # Raw exceptions/provider output may contain confidential material.
         print('FAIL: inspect the retained private artifacts; no automatic retry.')

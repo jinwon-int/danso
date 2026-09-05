@@ -18,6 +18,12 @@ pub struct Args {
     pub session: PathBuf,
     #[arg(long)]
     pub model: String,
+    /// Wire protocol / service to use. Defaults to the original Anthropic path.
+    #[arg(long, default_value = "anthropic", value_parser = ["anthropic", "openai", "glm"])]
+    pub provider: String,
+    /// Optional model-specific reasoning effort for OpenAI / GLM.
+    #[arg(long, value_parser = ["none", "minimal", "low", "medium", "high", "xhigh", "max"])]
+    pub reasoning_effort: Option<String>,
     #[arg(long, value_enum, default_value = "json")]
     pub mode: Mode,
     /// Final answer only; equivalent to --mode text.
@@ -44,6 +50,8 @@ impl Args {
             cwd: self.cwd.clone(),
             session: self.session.clone(),
             model: self.model.clone(),
+            provider: self.provider.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
             trust_project: self.trust_project,
             unsafe_no_sandbox: self.unsafe_no_sandbox,
             max_turns: self.max_turns,
