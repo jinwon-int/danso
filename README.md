@@ -6,9 +6,31 @@ Minimal Rust coding-agent harness.
 
 Not a port of [piri](https://github.com/jinwon-int/piri), [earendil-works/pi](https://github.com/earendil-works/pi), or [pi_agent_rust](https://github.com/Dicklesworthstone/pi_agent_rust).
 
+## Build and run
+
+The first v0 implementation is a Linux headless loop with an Anthropic Messages
+API path, default bubblewrap isolation, durable sessions, and bounded context.
+
+```sh
+cargo build --release --locked
+mkdir -p "$HOME/.danso/sessions"
+# Supply ANTHROPIC_API_KEY through your existing credential mechanism.
+target/release/danso --cwd /path/to/repo --trust-project \
+  --session "$HOME/.danso/sessions/task.jsonl" \
+  --model YOUR_ANTHROPIC_MODEL -p 'Explain this repository'
+```
+
+Requires Rust 1.98.1 to build and `/usr/bin/bwrap` with user namespaces to run.
+Without `-p`, stdout is JSONL. Reuse the session path to continue a completed
+linear conversation. An uncertain interrupted tool requires manual recovery.
+
+See [the v0 contract](docs/v0.md) for trust/discovery subsets, exit codes,
+budgets, recovery behavior, fixture provenance and offline test commands.
+The model adapter is mock-tested; live provider acceptance remains pending.
+
 ## Share with Pi
 
-v0 aims to speak these contracts:
+v0 implements these portable contracts within the documented subset:
 
 - Agent Skills (`SKILL.md`) and `AGENTS.md`
 - Session JSONL v3
