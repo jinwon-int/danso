@@ -170,6 +170,29 @@ Rust changes or replace integration gates. Root/system mount boundaries and
 network isolation remain unchanged. A real-sandbox regression verifies that the
 worker profile can run where the previous nested integration attempt failed.
 
+#### Listing planned commands (`--list`)
+
+`--list` prints exactly one JSON object to stdout with the shape
+`{"profile":str,"executed":false,"commands":[{"argv":[str,...],"cwd":str},...]}`
+and exits 0 without running any check or subprocess. The `argv` lists come from
+the same `commands(profile)` source used for execution, in the existing order;
+`cwd` is the repository root for the host profile and the `scripts/` directory
+for the worker profile, matching where each command runs. Listing does not
+validate a host toolchain or sandbox and does not replace the full host gates;
+it only reports what a full run would attempt.
+
+```sh
+python3 scripts/dev_check.py --profile worker --list
+```
+
+```sh
+python3 scripts/dev_check.py --profile host --list
+```
+
+`--list` and `--json` are mutually exclusive for either profile; combining them
+exits 2 with no stdout. Without `--list`, behavior and return codes are
+unchanged.
+
 The opt-in [ccc-node auxiliary worker](ccc-node-worker.md) owns subprocess
 supervision and native ccc-node event mapping outside the Rust agent loop.
 
