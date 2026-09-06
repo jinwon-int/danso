@@ -52,6 +52,24 @@ class Compaction(fixture.Fixture):
                                '--max-turns', '32', *extra, '-p', 'ORIGINAL_GOAL finish without repeated effects'],
                               capture_output=True, text=True, timeout=25, env=env or self.env(provider))
 
+    def test_working_directory_context_preserves_full_project_budget(self):
+        agents = self.home / '.pi' / 'agent' / 'AGENTS.md'
+        agents.parent.mkdir(parents=True)
+        wrapper = f'\n<project_instructions path="{agents.resolve()}">\n\n</project_instructions>\n'
+        content = 'x' * (65536 - len(wrapper.encode()))
+        agents.write_text(content)
+        self.responses = [reply('glm')]
+        result = fixture.Fixture.run_cli(self, 'glm')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.requests), 1)
+        system = self.requests[0]['messages'][0]['content']
+        self.assertIn(content, system)
+        self.assertIn('Runtime working directory (JSON path data): ', system)
+        agents.write_text(content + 'x')
+        result = fixture.Fixture.run_cli(self, 'glm')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(len(self.requests), 1)
+
     def records(self):
         return [json.loads(l) for l in self.session.read_text().splitlines()]
 

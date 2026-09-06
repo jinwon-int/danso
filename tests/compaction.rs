@@ -92,6 +92,7 @@ async fn checkpoint_persistence_failure_prevents_next_provider_request() {
         RunInput {
             prompt: "continue",
             context: "",
+            execution_context: "",
             max_turns: 8,
             compact_at_bytes: Some(8192),
         },

@@ -8,6 +8,8 @@ use std::{
 };
 
 pub const CONTEXT_LIMIT: usize = 64 * 1024;
+/// Separate from the project budget; covers JSON escaping of native paths.
+pub const EXECUTION_CONTEXT_LIMIT: usize = 32 * 1024;
 pub const FILE_LIMIT: u64 = 256 * 1024;
 
 pub fn read_bounded(path: &Path, limit: u64) -> Result<String> {

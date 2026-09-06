@@ -229,8 +229,8 @@ rediscovering a directory from lossy summaries. A non-UTF-8 path is represented
 as null with guidance to use relative paths, never a lossy replacement path.
 
 This context is built by the application from the same directory given to the
-executor. It is available without trusting project files, is included in context
-and wire-size budgeting, and is not appended as journal history. It describes
+executor. It is available without trusting project files, has a separate 32 KiB limit preserving the 64 KiB
+bootstrap/skills budget, and counts toward the total wire-size budget, and is not appended as journal history. It describes
 execution facts without adding filesystem permissions or changing sandbox
 behavior. Local-provider integration checks verify the guidance before/after
 multiple checkpoints and restart, plus actual per-call directory reset. A live

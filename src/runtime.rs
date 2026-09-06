@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 pub struct RunInput<'a> {
     pub prompt: &'a str,
     pub context: &'a str,
+    pub execution_context: &'a str,
     pub max_turns: u32,
     pub compact_at_bytes: Option<usize>,
 }
@@ -36,6 +37,10 @@ pub async fn run(
         ensure!(
             input.context.len() <= crate::context::CONTEXT_LIMIT,
             "bootstrap/skills context exceeds 65536 bytes"
+        );
+        ensure!(
+            input.execution_context.len() <= crate::context::EXECUTION_CONTEXT_LIMIT,
+            "execution context exceeds 32768 bytes"
         );
         if let Some(limit) = input.compact_at_bytes {
             ensure!(
@@ -65,8 +70,8 @@ pub async fn run(
         .collect::<Vec<_>>()
         .join(", ");
     let base_system = format!(
-        "You are a headless coding worker. Use only {names}. Skills are loaded using read. Prefer targeted line-range reads and searches over whole-file dumps. After compaction, continue from recorded progress; re-read only missing or changed information.{}",
-        input.context
+        "You are a headless coding worker. Use only {names}. Skills are loaded using read. Prefer targeted line-range reads and searches over whole-file dumps. After compaction, continue from recorded progress; re-read only missing or changed information.{}{}",
+        input.context, input.execution_context
     );
     sink.emit(Event::Session(session.header()))
         .map_err(at(Kind::Output))?;
