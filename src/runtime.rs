@@ -24,28 +24,33 @@ pub async fn run(
     sink: &mut impl EventSink,
     usage: &mut Usage,
 ) -> Result<()> {
-    ensure!(
-        (1..=128).contains(&input.max_turns),
-        "max-turns must be 1..128"
-    );
-    ensure!(
-        !input.prompt.trim().is_empty() && input.prompt.len() <= crate::context::CONTEXT_LIMIT,
-        "prompt must be 1..65536 bytes"
-    );
-    ensure!(
-        input.context.len() <= crate::context::CONTEXT_LIMIT,
-        "bootstrap/skills context exceeds 65536 bytes"
-    );
-    if let Some(limit) = input.compact_at_bytes {
+    (|| {
         ensure!(
-            (crate::compaction::MIN_THRESHOLD..=crate::compaction::MAX_THRESHOLD).contains(&limit),
-            "compact-at-bytes must be 8192..393216"
+            (1..=128).contains(&input.max_turns),
+            "max-turns must be 1..128"
         );
         ensure!(
-            session.supports_compaction(),
-            "session store does not support compaction"
+            !input.prompt.trim().is_empty() && input.prompt.len() <= crate::context::CONTEXT_LIMIT,
+            "prompt must be 1..65536 bytes"
         );
-    }
+        ensure!(
+            input.context.len() <= crate::context::CONTEXT_LIMIT,
+            "bootstrap/skills context exceeds 65536 bytes"
+        );
+        if let Some(limit) = input.compact_at_bytes {
+            ensure!(
+                (crate::compaction::MIN_THRESHOLD..=crate::compaction::MAX_THRESHOLD)
+                    .contains(&limit),
+                "compact-at-bytes must be 8192..393216"
+            );
+            ensure!(
+                session.supports_compaction(),
+                "session store does not support compaction"
+            );
+        }
+        Ok::<(), anyhow::Error>(())
+    })()
+    .map_err(at(Kind::Configuration))?;
     session.check_recovery().map_err(at(Kind::Session))?;
     let mut ids = session.tool_call_ids().map_err(at(Kind::Session))?;
     let mut messages = session.messages().map_err(at(Kind::Session))?;
@@ -145,21 +150,25 @@ pub async fn run(
             )
             .await
             .map_err(at(Kind::Provider))?;
-        ensure!(
-            message["role"] == "assistant",
-            "provider must return an assistant message"
-        );
-        let calls = tool_calls(&message)?;
-        ensure!(
-            !calls.is_empty()
-                || message["stopReason"] == "stop"
-                || message["stopReason"] == "length",
-            "invalid terminal response"
-        );
-        ensure!(
-            calls.is_empty() || message["stopReason"] == "toolUse",
-            "invalid tool response"
-        );
+        let calls = (|| {
+            ensure!(
+                message["role"] == "assistant",
+                "provider must return an assistant message"
+            );
+            let calls = tool_calls(&message)?;
+            ensure!(
+                !calls.is_empty()
+                    || message["stopReason"] == "stop"
+                    || message["stopReason"] == "length",
+                "invalid terminal response"
+            );
+            ensure!(
+                calls.is_empty() || message["stopReason"] == "toolUse",
+                "invalid tool response"
+            );
+            Ok::<_, anyhow::Error>(calls)
+        })()
+        .map_err(at(Kind::Provider))?;
         // All adapters must pass this gate before any new side effect.
         for call in &calls {
             ensure!(ids.insert(call.id.clone()), "duplicate tool call id");
@@ -172,10 +181,11 @@ pub async fn run(
         .map_err(at(Kind::Output))?;
         messages.push(message.clone());
         if calls.is_empty() {
-            ensure!(
-                message["stopReason"] == "stop",
-                "provider response truncated"
-            );
+            if message["stopReason"] != "stop" {
+                return Err(at(Kind::Provider)(anyhow::anyhow!(
+                    "provider response truncated"
+                )));
+            }
             sink.emit(Event::FinalAnswer(&message))
                 .map_err(at(Kind::Output))?;
             return Ok(());

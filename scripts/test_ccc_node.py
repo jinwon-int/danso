@@ -377,6 +377,27 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
         from integrations.ccc_node import _failure
         self.assertEqual(process.returncode, 2)
         self.assertEqual(_failure(stderr, process.returncode).code, 'danso_configuration')
+        process = await asyncio.create_subprocess_exec(str(fixture.BIN), '--cwd', str(self.repo),
+                    '--session', str(self.runtime.root / 'invalid.jsonl'), '--provider', 'glm',
+                    '--model', 'fixture', '--compact-at-bytes', '1', '-p', 'hello',
+                    env=self.env('glm'), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await process.communicate()
+        self.assertEqual(process.returncode, 2)
+        self.assertEqual(_failure(stderr, process.returncode).code, 'danso_configuration')
+        self.assertEqual(len(self.requests), 0)
+
+    async def test_truncated_provider_response_keeps_provider_category(self):
+        import test_e2e
+        runtime = DansoRuntime(binary=fixture.BIN, state_directory=self.runtime.root,
+                provider='anthropic', model='fixture', environment={'HOME': str(self.home),
+                'PATH': '/usr/bin:/bin', 'ANTHROPIC_API_KEY': 'synthetic',
+                'DANSO_ANTHROPIC_BASE_URL': self.env('glm')['DANSO_GLM_BASE_URL']})
+        self.responses.append((200, test_e2e.reply([{'type': 'text', 'text': 'PRIVATE_PARTIAL'}], stop='max_tokens')))
+        session = await runtime.start_or_resume(contract.SessionRequest(working_directory=str(self.repo)))
+        events = await collect(session)
+        self.assertEqual([e.kind for e in events], ['error'])
+        self.assertEqual(events[0].code, 'danso_provider')
+        self.assertNotIn('PRIVATE', repr(events))
 
     def test_malformed_diagnostics_fall_back_without_text_inference(self):
         from integrations.ccc_node import _failure
