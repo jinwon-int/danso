@@ -8,7 +8,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".into(),
-            description: "Run a shell command in the workspace; network is disabled in the sandbox"
+            description: "Run Bash with pipefail in the workspace; pipeline failures propagate, but later commands can mask failures. Check actual test results; network is disabled in the sandbox"
                 .into(),
             parameters: json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"], "additionalProperties": false}),
         }
@@ -19,6 +19,8 @@ impl Tool for BashTool {
             .args([
                 "--noprofile",
                 "--norc",
+                "-o",
+                "pipefail",
                 "-c",
                 super::files::string(args, "command")?,
             ])

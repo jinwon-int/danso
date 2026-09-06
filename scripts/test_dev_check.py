@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""Development profile boundaries, including execution inside the real sandbox."""
+"""Worker-safe development profile unit tests. Host integration is in test_dev_check_host."""
 import contextlib
 import io
-from pathlib import Path
-import shutil
 import subprocess
 import unittest
 from unittest.mock import patch
 
 import dev_check
-import test_e2e as e2e
 
 
 class Profiles(unittest.TestCase):
@@ -27,6 +24,13 @@ class Profiles(unittest.TestCase):
                 dev_check.main([])
             self.assertEqual(run.call_count, 1)
 
+    def test_host_profile_keeps_separate_integration_gate(self):
+        host = dev_check.commands('host')
+        self.assertTrue(any(command[-1] == 'scripts/test_dev_check_host.py' for command in host))
+        worker = dev_check.commands('worker')
+        self.assertIn('test_dev_check', worker[0])
+        self.assertNotIn('test_dev_check_host', str(worker))
+
     def test_host_failure_stops_without_worker_fallback(self):
         for result in (subprocess.CompletedProcess([], 2), OSError('private-marker')):
             with self.subTest(result=type(result).__name__):
@@ -38,31 +42,6 @@ class Profiles(unittest.TestCase):
                     self.assertEqual(run.call_count, 1)
                     self.assertNotIn('private-marker', output.getvalue())
                     self.assertNotIn('PASS', output.getvalue())
-
-
-class WorkerSandbox(unittest.TestCase):
-    setUp = e2e.Acceptance.setUp
-    tearDown = e2e.Acceptance.tearDown
-    command = e2e.Acceptance.command
-    run_cli = e2e.Acceptance.run_cli
-    final = e2e.Acceptance.final
-    tool = e2e.Acceptance.tool
-    results = e2e.Acceptance.results
-
-    def test_worker_subset_runs_inside_real_danso_sandbox(self):
-        scripts = self.repo / 'scripts'
-        scripts.mkdir()
-        for name in ('dev_check.py', 'live_acceptance.py', 'test_live_acceptance.py',
-                     'test_e2e.py', 'test_providers.py'):
-            shutil.copy2(Path(__file__).parent / name, scripts / name)
-        self.tool('bash', {'command': 'python3 scripts/dev_check.py --profile worker'})
-        result = self.run_cli()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        tools = self.results()
-        self.assertEqual(len(tools), 1)
-        self.assertFalse(tools[0]['isError'], tools[0])
-        self.assertIn('PASS: worker checks only.', str(tools[0]['content']))
-        self.assertIn('host checks remain required', str(tools[0]['content']))
 
 
 if __name__ == '__main__':

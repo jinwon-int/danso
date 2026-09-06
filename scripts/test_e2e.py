@@ -88,6 +88,34 @@ class Acceptance(unittest.TestCase):
         return [e['message'] for e in map(json.loads, self.session.read_text().splitlines())
                 if e.get('message', {}).get('role') == 'toolResult']
 
+    def test_bash_pipeline_failure_and_explicit_status_handling(self):
+        commands = [
+            ("python3 -c 'import sys; print(\"FAILED test\"); sys.exit(7)' | tail -n 1", True),
+            ("printf 'ok\\n' | cat", False),
+            ("false | cat; printf 'later command\\n'", False),
+            ("false | cat || printf 'handled\\n'", False),
+            ("printf x | (cat; exit 9)", True),
+        ]
+        self.responses.append((200, reply([
+            call('bash', {'command': command}, f'pipeline{i}')
+            for i, (command, _) in enumerate(commands)
+        ], 'tool_use')))
+        self.final()
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipts = self.results()
+        self.assertEqual([r['isError'] for r in receipts], [expected for _, expected in commands])
+        self.assertIn('FAILED test', str(receipts[0]['content']))
+        self.assertIn('later command', str(receipts[2]['content']))
+        self.assertIn('handled', str(receipts[3]['content']))
+        # The next model request receives failed tool receipts, even though the
+        # scripted model may subsequently produce a normal final response.
+        wire_results = [block for message in self.requests[1]['messages']
+                        for block in message['content'] if isinstance(block, dict)
+                        and block.get('type') == 'tool_result']
+        self.assertEqual([block['is_error'] for block in wire_results],
+                         [expected for _, expected in commands])
+
     def test_four_tools_context_session_and_resume(self):
         (self.repo / 'AGENTS.md').write_text('PROJECT_SENTINEL')
         skills = self.repo / '.pi/skills/test'
