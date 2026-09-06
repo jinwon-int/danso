@@ -20,7 +20,7 @@ def run_suites(selectors, loader=None):
         for selector in selectors:
             try:
                 suite = loader.loadTestsFromName(selector)
-            except Exception:
+            except (Exception, SystemExit):
                 # Imports/load_tests may raise errors unittest's loader does not
                 # wrap. Preserve the failed selector without inventing test runs.
                 print('ERROR: could not load selected suite: ' + selector, file=sys.stderr)

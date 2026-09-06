@@ -69,7 +69,7 @@ class Receipts(unittest.TestCase):
         checks.validate_receipt(receipt)
 
     def test_loader_exceptions_produce_failed_receipt_and_continue(self):
-        for error in (SyntaxError('PRIVATE fixture'), RuntimeError('PRIVATE fixture')):
+        for error in (SyntaxError('PRIVATE fixture'), RuntimeError('PRIVATE fixture'), SystemExit(0)):
             loader = unittest.TestLoader()
             with patch.object(loader, 'loadTestsFromName', side_effect=[error, unittest.TestSuite()]), contextlib.redirect_stderr(io.StringIO()):
                 receipt = checks.run_suites(['broken', 'empty'], loader)
