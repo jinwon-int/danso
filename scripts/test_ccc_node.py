@@ -65,6 +65,8 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
         events = await collect(s)
         self.assertEqual([e.kind for e in events], ['error'])
         self.assertFalse(events[0].retryable)
+        self.assertEqual(events[0].code, 'danso_provider')
+        self.assertIn('reported_requests=0', events[0].message)
         self.assertNotIn('PRIVATE', repr(events))
         self.assertEqual(len(self.requests), 1)
 
@@ -82,6 +84,7 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(s._process)
         events = await collect(s, 'continue')
         self.assertEqual(events[0].kind, 'error')
+        self.assertEqual(events[0].code, 'danso_session')
         self.assertEqual(len(self.requests), 1)
         self.assertEqual((self.repo / 'count').read_text(), 'once\n')
 
@@ -314,6 +317,114 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
         records = [json.loads(line) for line in
                    (self.runtime.root / (s.session_id + '.jsonl')).read_text().splitlines()]
         self.assertFalse(any(r.get('customType') == 'danso.compaction.v1' for r in records))
+        self.assertEqual(events[0].code, 'danso_compaction')
+
+    async def test_request_budget_reports_validated_usage(self):
+        self.runtime.max_turns = 1
+        self.responses.append((200, fixture.response('glm', [('write', {'path': 'once', 'content': 'ok'})])))
+        events = await collect(await self.new_session())
+        self.assertEqual([e.kind for e in events], ['error'])
+        self.assertEqual(events[0].code, 'danso_request_budget')
+        self.assertIn('exit_code=3', events[0].message)
+        self.assertIn('reported_requests=1', events[0].message)
+        self.assertFalse(events[0].retryable)
+        self.assertEqual((self.repo / 'once').read_text(), 'ok')
+
+    async def test_compaction_budget_is_not_summary_validation(self):
+        self.runtime.max_turns = 2
+        self.runtime.compact_at_bytes = 8192
+        self.responses.append((200, fixture.response('glm', [('bash', {'command': "printf '%09000d' 0"})])))
+        events = await collect(await self.new_session())
+        self.assertEqual(events[0].code, 'danso_request_budget')
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_provider_timeout_and_compaction_provider_failure(self):
+        import time
+        def stalled(body):
+            time.sleep(1.3)
+            return fixture.response('glm', text='late')
+        from integrations.ccc_node import PROVIDERS
+        for provider in ('glm', 'openai', 'anthropic'):
+            with self.subTest(provider=provider):
+                key, endpoint = PROVIDERS[provider]
+                environment = {'HOME': str(self.home), 'PATH': '/usr/bin:/bin',
+                               key: 'synthetic-key', endpoint: self.env('glm')['DANSO_GLM_BASE_URL']}
+                runtime = DansoRuntime(binary=fixture.BIN, state_directory=self.runtime.root,
+                                       provider=provider, model='fixture', environment=environment,
+                                       provider_timeout_seconds=1)
+                self.responses.append((200, stalled))
+                session = await runtime.start_or_resume(contract.SessionRequest(working_directory=str(self.repo)))
+                events = await collect(session)
+                self.assertEqual(events[0].code, 'danso_provider_timeout')
+                await asyncio.sleep(.4)
+        self.runtime.compact_at_bytes = 8192
+        self.runtime.provider_timeout = 3
+        self.responses.extend([(200, fixture.response('glm', [('bash', {'command': "printf '%09000d' 0"})])),
+                               (503, {'error': 'PRIVATE_SUMMARY_RESPONSE'})])
+        events = await collect(await self.new_session())
+        self.assertEqual(events[0].code, 'danso_provider')
+        self.assertNotIn('PRIVATE', repr(events))
+
+    async def test_configuration_failure_and_cli_validation(self):
+        self.runtime.environment['DANSO_GLM_BASE_URL'] = 'bad-url'
+        events = await collect(await self.new_session())
+        self.assertEqual(events[0].code, 'danso_configuration')
+        self.assertIn('exit_code=2', events[0].message)
+        self.assertEqual(len(self.requests), 0)
+        process = await asyncio.create_subprocess_exec(str(fixture.BIN), '--unknown',
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await process.communicate()
+        from integrations.ccc_node import _failure
+        self.assertEqual(process.returncode, 2)
+        self.assertEqual(_failure(stderr, process.returncode).code, 'danso_configuration')
+        process = await asyncio.create_subprocess_exec(str(fixture.BIN), '--cwd', str(self.repo),
+                    '--session', str(self.runtime.root / 'invalid.jsonl'), '--provider', 'glm',
+                    '--model', 'fixture', '--compact-at-bytes', '1', '-p', 'hello',
+                    env=self.env('glm'), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await process.communicate()
+        self.assertEqual(process.returncode, 2)
+        self.assertEqual(_failure(stderr, process.returncode).code, 'danso_configuration')
+        self.assertEqual(len(self.requests), 0)
+
+    async def test_truncated_provider_response_keeps_provider_category(self):
+        import test_e2e
+        runtime = DansoRuntime(binary=fixture.BIN, state_directory=self.runtime.root,
+                provider='anthropic', model='fixture', environment={'HOME': str(self.home),
+                'PATH': '/usr/bin:/bin', 'ANTHROPIC_API_KEY': 'synthetic',
+                'DANSO_ANTHROPIC_BASE_URL': self.env('glm')['DANSO_GLM_BASE_URL']})
+        self.responses.append((200, test_e2e.reply([{'type': 'text', 'text': 'PRIVATE_PARTIAL'}], stop='max_tokens')))
+        session = await runtime.start_or_resume(contract.SessionRequest(working_directory=str(self.repo)))
+        events = await collect(session)
+        self.assertEqual([e.kind for e in events], ['error'])
+        self.assertEqual(events[0].code, 'danso_provider')
+        self.assertNotIn('PRIVATE', repr(events))
+
+    def test_malformed_diagnostics_fall_back_without_text_inference(self):
+        from integrations.ccc_node import _failure
+        good = json.dumps({'version': 1, 'category': 'request_budget', 'exit_code': 3})
+        bad = [None, 'not json', '[]', '"PRIVATE"',
+               good.replace('1', 'true', 1), good.replace('3', '2'),
+               good.replace('request_budget', 'PRIVATE_CATEGORY'),
+               good[:-1] + ', "private": "PRIVATE"}',
+               good[:-1] + ', "category": "provider"}',
+               '[' * 2000 + '0' + ']' * 2000]
+        for payload in bad:
+            text = 'PRIVATE provider timed out compaction budget exhausted\n'
+            if payload is not None: text += 'DANSO_ERROR=' + payload
+            result = _failure(text.encode(), 3)
+            self.assertEqual(result.code, 'danso_failed')
+            self.assertNotIn('PRIVATE', repr(result))
+            self.assertFalse(result.retryable)
+        duplicated = ('DANSO_ERROR=' + good + '\n') * 2
+        self.assertEqual(_failure(duplicated.encode(), 3).code, 'danso_failed')
+        self.assertEqual(_failure(('DANSO_ERROR=' + good).encode(), 124).code, 'danso_timeout')
+
+    async def test_diagnostic_cannot_authorize_success(self):
+        diag = json.dumps({'version': 1, 'category': 'provider', 'exit_code': 3})
+        self.fake_binary("import sys\nprint('untrusted answer')\nprint(" + repr('DANSO_ERROR=' + diag) + ", file=sys.stderr)\n")
+        events = await collect(await self.new_session())
+        self.assertEqual([e.kind for e in events], ['error'])
+        self.assertNotIn('untrusted answer', repr(events))
 
     async def test_no_ambient_credential_or_bootstrap_inheritance(self):
         self.assertNotIn('CCC_STATE_DIR', self.runtime.environment)

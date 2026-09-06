@@ -118,10 +118,14 @@ fn transport_error(
     } else {
         "provider transport failed"
     };
-    anyhow::anyhow!(
+    crate::failure::at(if error.is_timeout() {
+        crate::failure::Kind::ProviderTimeout
+    } else {
+        crate::failure::Kind::Provider
+    })(anyhow::anyhow!(
         "{message}: phase={phase} elapsed_ms={} request_bytes={request_bytes}",
         started.elapsed().as_millis()
-    )
+    ))
 }
 
 #[cfg(test)]

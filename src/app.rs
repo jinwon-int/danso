@@ -2,6 +2,7 @@
 use crate::{
     context,
     contracts::EventSink,
+    failure::{Kind, at},
     provider::{Selected, anthropic::Anthropic, glm::Glm, openai::OpenAi},
     runtime::{self, RunInput},
     session::Session,
@@ -71,7 +72,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         "session must live outside writable workspace"
     );
     let ctx = context::discover(&cwd, &home, args.trust_project)?;
-    let session = Session::open(&session_path, &cwd)?;
+    let session = Session::open(&session_path, &cwd).map_err(at(Kind::Session))?;
     ensure!(!args.model.trim().is_empty(), "model must not be empty");
     if let Some(effort) = &args.reasoning_effort {
         ensure!(
@@ -149,4 +150,5 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         usage,
     )
     .await
+    .map_err(at(Kind::Runtime))
 }

@@ -38,6 +38,7 @@ flowchart TD
 | `tools/runner.rs` | Worker isolation, environment clearing, resource/time/output limits | Tool implementation details |
 | `session.rs` | Pi v3 persistence, locking, linear history, recovery validation | Provider I/O or replaying effects |
 | `context.rs` | Trust-aware discovery and context budgets | Model requests or tool execution |
+| `failure.rs` | Typed failure categories and body-free CLI error records | Inferring causes from provider text or authorizing retries |
 | `usage.rs`, `output.rs` | Normalized usage, event rendering, usage prefixes | Authorization or execution policy |
 
 The existing Pi message envelope remains the shared message representation

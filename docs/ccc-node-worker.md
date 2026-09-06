@@ -52,7 +52,8 @@ Supported behavior:
   numeric token usage), then `CompletionEvent`. Output is buffered, not streamed.
   A zero exit alone is insufficient: nonempty UTF-8 output and matching valid
   `DANSO_USAGE`/`PIRI_USAGE` counters are required. Unknown cost is omitted.
-- Failure: one terminal, non-retryable `ErrorEvent`, with static sanitized text.
+- Failure: one terminal, non-retryable `ErrorEvent`, with validated category,
+  numeric exit code and optionally reported usage counters.
   No raw provider stderr or partial answer is forwarded. Private journals remain
   for diagnosis; uncertain tools are never automatically acknowledged or replayed.
 - Interrupt: idle is a no-op. Active execution receives SIGTERM, with SIGKILL
@@ -82,6 +83,37 @@ Resume the saved adapter UUID with a new runtime/session object and the desired
 threshold. Native Danso reads the stored checkpoint and keeps completed tool IDs
 from the entire journal, so old effects remain forbidden after compaction.
 Checkpoint creation is recorded in the private journal, not a new ccc-node event.
+
+## Failure diagnostics
+
+Native CLI failures emit one body-free stderr record, for example:
+
+```text
+DANSO_ERROR={"version":1,"category":"request_budget","exit_code":3}
+```
+
+Categories are tagged at source boundaries, never inferred from error strings:
+`configuration`, `session`, `sandbox`, `provider`, `provider_timeout`,
+`compaction`, `request_budget`, `output`, `runtime`, `run_timeout`, `interrupted`.
+Provider includes transport, HTTP, history and response-processing failures;
+compaction covers local checkpoint generation/validation/size failures. A known
+provider or request-budget failure inside compaction retains that more specific
+category. Session errors include recovery and durable journal writes. Runtime is
+the fallback for other loop-policy failures (for example duplicate tool IDs).
+
+The adapter emits `danso_<category>` (whole-run timeout keeps `danso_timeout`).
+Caller-initiated interruption still takes precedence as `danso_cancelled`.
+It validates the version, exact fields, allowed enum, and matching nonzero exit
+code. Missing/duplicate/malformed/unknown diagnostics fall back to `danso_failed`
+(or the existing exit-124 timeout); arbitrary error text is never forwarded.
+The error message includes only the enum, numeric exit code and valid matching
+usage counters. `reported_requests` counts accumulated provider usage records,
+not every attempted HTTP request; reported tokens may omit failed/unreported
+requests. No cost is inferred. Errors never become completion events or retries.
+
+Older saved evaluations containing only `danso_failed` cannot be retrospectively
+classified by this change. Standard CLI exit codes and human stderr are retained;
+`__tool` workers do not emit this parent-process diagnostic envelope.
 
 ## Offline validation
 
