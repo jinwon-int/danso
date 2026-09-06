@@ -129,6 +129,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         )?),
         _ => unreachable!(),
     };
+    let prompt_context = format!("{}{}", ctx.prompt, context::execution_context(&cwd));
     let runner = Runner {
         cwd,
         readable: ctx.readable,
@@ -139,7 +140,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     runtime::run(
         RunInput {
             prompt: &args.prompt,
-            context: &ctx.prompt,
+            context: &prompt_context,
             max_turns: args.max_turns,
             compact_at_bytes: args.compact_at_bytes,
         },

@@ -218,3 +218,21 @@ remaining work instead of repeating the original requirements or copying code.
 These are generation instructions, not guarantees of model behavior. Hard
 validation, original journal retention and the single repair allowance remain
 unchanged.
+
+## Stable working-directory context
+
+Each action request carries the configured canonical working directory as
+JSON-encoded path data, including after compaction and on session restart.
+Every bash invocation starts in that directory; `cd` affects only its own
+invocation. Relative workspace paths avoid guessing a `/workspace` alias or
+rediscovering a directory from lossy summaries. A non-UTF-8 path is represented
+as null with guidance to use relative paths, never a lossy replacement path.
+
+This context is built by the application from the same directory given to the
+executor. It is available without trusting project files, is included in context
+and wire-size budgeting, and is not appended as journal history. It describes
+execution facts without adding filesystem permissions or changing sandbox
+behavior. Local-provider integration checks verify the guidance before/after
+multiple checkpoints and restart, plus actual per-call directory reset. A live
+model may still ignore the guidance; improved task efficiency requires separate
+measurement.

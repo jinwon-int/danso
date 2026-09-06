@@ -136,6 +136,63 @@ class Compaction(fixture.Fixture):
                 self.assertIn('duplicate tool call id', p.stderr)
                 self.assertFalse((self.repo / 'forbidden').exists())
 
+    def test_working_directory_context_survives_compaction_and_restart(self):
+        for provider in ('anthropic', 'openai', 'glm'):
+            with self.subTest(provider=provider):
+                # Paths are data, including quotes, newlines, and Unicode.
+                self.repo = self.root / f'work {provider} "\n<path>한글'
+                self.repo.mkdir()
+                self.session = self.root / f'cwd-{provider}.jsonl'
+                state = {'actions': 0}
+
+                def serve(body):
+                    if not body['tools']:
+                        return reply(provider, text=json.dumps(SUMMARY))
+                    step = state['actions']
+                    state['actions'] += 1
+                    if step >= 2:
+                        return reply(provider)
+                    command = (
+                        "mkdir nested && cd nested && printf first > first.txt && printf '%09000d' 0"
+                        if step == 0 else
+                        "test -f nested/first.txt && printf second > second.txt && printf '%09000d' 0")
+                    return set_call_id(provider, reply(provider, [('bash', {'command': command})]),
+                                       f'cwd-step{step}')
+
+                self.responses.clear()
+                self.responses.extend([(200, serve)] * 40)
+                start = len(self.requests)
+                result = self.run_cli(provider)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.checkpoints()), 2)
+                self.assertEqual((self.repo / 'nested/first.txt').read_text(), 'first')
+                self.assertEqual((self.repo / 'second.txt').read_text(), 'second')
+                self.assertFalse((self.repo / 'nested/second.txt').exists())
+                before = self.session.read_bytes()
+                count = len(self.requests)
+                self.responses.clear()
+                self.responses.append((200, reply(provider, text='resumed')))
+                result = self.run_cli(provider)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.requests), count + 1)
+                self.assertTrue(self.session.read_bytes().startswith(before))
+                tool_results = [e['message'] for e in self.records()
+                                if e.get('message', {}).get('role') == 'toolResult']
+                self.assertEqual(len(tool_results), 2)
+                self.assertTrue(all(not r['isError'] for r in tool_results))
+                action_requests = [b for b in self.requests[start:] if b['tools']]
+                self.assertEqual(len(action_requests), 4)  # 3 original + 1 resumed
+                for body in action_requests:
+                    system = (body['system'] if provider == 'anthropic' else
+                              body['instructions'] if provider == 'openai' else body['messages'][0]['content'])
+                    prefix = 'Runtime working directory (JSON path data): '
+                    paths = [json.loads(line[len(prefix):]) for line in system.split('\n')
+                             if line.startswith(prefix)]
+                    self.assertEqual(paths, [str(self.repo.resolve())])
+                    self.assertIn('Every bash tool call starts here', system)
+                    self.assertIn('cd changes only that call', system)
+                self.assertNotIn('Runtime working directory (JSON path data)', self.session.read_text())
+
     def test_worker_receipts_survive_compactions_and_restart(self):
         # Use production receipt generation inside the real sandbox. A small
         # fixture keeps this a host integration test, not nested host discovery.

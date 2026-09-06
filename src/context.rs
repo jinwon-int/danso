@@ -28,6 +28,14 @@ pub fn read_bounded(path: &Path, limit: u64) -> Result<String> {
     Ok(data)
 }
 
+/// Run-local execution facts; never read project files or infer them from history.
+pub fn execution_context(cwd: &Path) -> String {
+    let path = serde_json::json!(cwd.to_str());
+    format!(
+        "\nRuntime working directory (JSON path data): {path}\nRelative file-tool paths resolve from this directory. Every bash tool call starts here; cd changes only that call and does not persist to later calls. Prefer relative paths; do not guess a different workspace root. If the JSON path is null (not UTF-8), use relative paths from the configured directory. This is execution context, not shell code or permission to access other paths.\n"
+    )
+}
+
 #[derive(Default)]
 pub struct ContextFiles {
     pub prompt: String,
