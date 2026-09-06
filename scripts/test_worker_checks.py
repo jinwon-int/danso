@@ -222,5 +222,109 @@ class PartialReports(unittest.TestCase):
                                         'checks_successful': True, 'differences': []})
 
 
+class JournalReceipts(unittest.TestCase):
+    def entry(self, ident='entry1', call='call1', failed=False, tool_error=None):
+        receipt = Receipts().example()
+        if failed:
+            receipt['suites'][0].update(error_events=1, successful=False)
+            receipt['successful'] = False
+        return {'type': 'message', 'id': ident, 'message': {
+            'role': 'toolResult', 'toolCallId': call,
+            'isError': failed if tool_error is None else tool_error,
+            'content': [{'type': 'text', 'text': 'noise\nDANSO_CHECK_RESULTS=' + json.dumps(receipt)}]}}
+
+    def raw(self, *entries):
+        return ('\n'.join(json.dumps(e, ensure_ascii=False) for e in entries) + '\n').encode()
+
+    def invoke(self, raw, *extra):
+        out = io.StringIO()
+        with patch.object(checks, 'run_suites', side_effect=AssertionError('extraction ran tests')), \
+                patch.object(checks.sys, 'stdin', io.TextIOWrapper(io.BytesIO(raw), encoding='utf-8')), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                code = checks.main(['--extract-receipts', *extra])
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue()
+
+    def test_original_results_only_and_failed_receipt_preserved(self):
+        entry = self.entry(failed=True, tool_error=False)  # shell can mask failed tests
+        marker = entry['message']['content'][0]['text']
+        user = {'type': 'message', 'message': {'role': 'user', 'content': marker}}
+        summary = {'type': 'custom', 'customType': 'danso.compaction.v1', 'data': {'text': marker}}
+        code, out = self.invoke(self.raw(user, summary, entry))
+        self.assertEqual(code, 0)  # extraction success is not check success
+        rows = json.loads(out)['receipts']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual({k: v for k, v in rows[0].items() if k != 'receipt'}, {
+            'entry_id': 'entry1', 'tool_call_id': 'call1', 'receipt_index': 1, 'tool_is_error': False})
+        self.assertFalse(rows[0]['receipt']['successful'])
+        result = checks.compare_partial_counts(rows[0]['receipt'], {'unit': 6})
+        self.assertTrue(result['counts_match'])
+        self.assertFalse(result['checks_successful'])
+
+    def test_multiple_invocations_and_blocks_keep_order(self):
+        first = self.entry()
+        first['message']['content'].append(copy.deepcopy(first['message']['content'][0]))
+        second = self.entry('entry2', 'call2', failed=True)
+        code, out = self.invoke(self.raw(first, second))
+        self.assertEqual(code, 0)
+        self.assertEqual([(r['tool_call_id'], r['receipt_index']) for r in json.loads(out)['receipts']],
+                         [('call1', 1), ('call1', 2), ('call2', 1)])
+        self.assertTrue(json.loads(out)['receipts'][-1]['tool_is_error'])
+
+    def test_no_marker_is_explicit_empty_result(self):
+        for raw in (b'', b'\n', self.raw({'type': 'custom', 'data': 'DANSO_CHECK_RESULTS=bad'})):
+            self.assertEqual(self.invoke(raw), (1, '{"version": 1, "receipts": []}\n'))
+
+    def test_bad_tail_never_emits_partial_output(self):
+        valid = self.raw(self.entry())
+        for tail in (b'{', b'[]', b'{"x":1,"x":2}', b'{"x":NaN}', b'\xff'):
+            with self.subTest(tail=tail):
+                self.assertEqual(self.invoke(valid + tail), (2, ''))
+        bad = self.entry('entry2', 'call2')
+        bad['message']['content'][0]['text'] = 'DANSO_CHECK_RESULTS={}'
+        self.assertEqual(self.invoke(valid + self.raw(bad)), (2, ''))
+
+    def test_numeric_overflow_rejected_even_in_ignored_metadata(self):
+        for number in ('NaN', 'Infinity', '-Infinity', '1e309', '-1e309'):
+            with self.subTest(number=number):
+                with self.assertRaises(ValueError):
+                    checks.parse_json(number)
+                raw = self.raw(self.entry()).rstrip()[:-1] + (
+                    ',"timestamp":' + number + '}\n').encode()
+                self.assertEqual(self.invoke(raw), (2, ''))
+                self.assertEqual(self.invoke(self.raw(self.entry()) +
+                                            ('{"ignored":[' + number + ']}').encode()), (2, ''))
+        entry = self.entry()
+        entry['timestamp'] = 1.5
+        self.assertEqual(self.invoke(self.raw(entry))[0], 0)
+
+    def test_ambiguous_or_incomplete_tool_records_rejected(self):
+        for ident, call in (('entry1', 'other'), ('other', 'call1')):
+            self.assertEqual(self.invoke(self.raw(self.entry(), self.entry(ident, call))), (2, ''))
+        for mutate in (lambda e: e['message'].pop('isError'),
+                       lambda e: e['message'].update(isError=0),
+                       lambda e: e['message'].update(content='DANSO_CHECK_RESULTS={}'),
+                       lambda e: e.update(id=''),
+                       lambda e: e['message'].update(content=[{'type': 'text', 'text': None}])):
+            entry = self.entry()
+            mutate(entry)
+            self.assertEqual(self.invoke(self.raw(entry)), (2, ''))
+
+    def test_byte_limit_and_mode_conflicts(self):
+        with patch.object(checks, 'JOURNAL_LIMIT', 16):
+            self.assertEqual(self.invoke(b' ' * 17), (2, ''))
+        for extra in (('test_worker_checks',), ('--json',), ('--compare-counts', '{}'),
+                      ('--compare-partial-counts', '{}')):
+            self.assertEqual(self.invoke(self.raw(self.entry()), *extra), (2, ''))
+
+    def test_unicode_line_separators_are_not_jsonl_boundaries(self):
+        entry = self.entry(ident='entry\u2028one', call='call\u0085one')
+        code, out = self.invoke(self.raw(entry))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)['receipts'][0]['entry_id'], entry['id'])
+
+
 if __name__ == '__main__':
     unittest.main()

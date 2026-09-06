@@ -210,6 +210,10 @@ class Compaction(fixture.Fixture):
                     self.assertEqual((self.repo / 'effects.txt').read_text(), 'step1\nstep2\n')
                     retained = next(e for e in self.records() if e['id'] == tool_result['id'])
                     self.assertEqual(retained, tool_result)
+                    extracted = checks.extract_receipts(self.session.read_bytes())
+                    self.assertEqual(extracted['receipts'], [{
+                        'entry_id': tool_result['id'], 'tool_call_id': 'receipt-step0',
+                        'receipt_index': 1, 'tool_is_error': failed, 'receipt': receipt}])
                     # Audit original evidence, not a lossy summary's success claim.
                     audit = checks.compare_partial_counts(receipt, {'receipt_case.Passing': 1})
                     self.assertTrue(audit['counts_match'])

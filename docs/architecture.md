@@ -257,3 +257,48 @@ all selectors were reported; check `unreported_selectors` before treating a run
 as fully accounted for. The same limits apply as for strict comparison: this is
 a structured-count check, not receipt authentication or arbitrary prose
 parsing; retain the receipt with its run evidence.
+
+#### Extract original receipts from a journal
+
+```sh
+python3 scripts/worker_checks.py --extract-receipts < session.jsonl > receipts.json
+```
+
+This read-only mode accepts up to 16 MiB of UTF-8 JSONL on stdin. It never opens
+journal paths, modifies a session, runs tests or resumes tools. It extracts only
+complete `DANSO_CHECK_RESULTS=` lines from text blocks in original `message`
+entries with role `toolResult`; user/assistant text and custom checkpoints are
+ignored. Plain unmarked JSON output is not treated as a receipt.
+
+Output is `{"version":1,"receipts":[...]}`. Each row contains `entry_id`,
+`tool_call_id`, a 1-based `receipt_index` within that tool result, `tool_is_error`
+and the validated `receipt`. All markers are retained in journal/block/line
+order, including multiple checks in one shell call and failed checks. No latest
+run is chosen, no cross-run total is calculated, and no repeated run is removed.
+Tool status is independent of receipt status: a shell command can mask a failed
+check, so auditing must inspect `receipt.successful` too.
+
+Exit 0 means receipts were extracted, **not** that checks passed; exit 1 returns
+an empty receipts list when none were found. Invalid JSON/UTF-8, duplicate JSON
+keys or tool-result identities, malformed marked receipts, missing marked-result
+status, and oversized input exit 2 without partial stdout. Non-finite JSON
+numbers are rejected by all receipt parsing modes.
+
+Select a specific row using its IDs and index, then pass only its `receipt` to
+`--compare-counts` or `--compare-partial-counts`. For example, with `jq` installed,
+this selects the first receipt of an explicitly chosen call and rejects zero or
+multiple matches before extracting it:
+
+```sh
+jq -e '[.receipts[] | select(.tool_call_id == "CALL_ID" and .receipt_index == 1)] |
+  if length == 1 then .[0].receipt else error("ambiguous or absent receipt") end' \
+  receipts.json > selected-receipt.json
+python3 scripts/worker_checks.py --compare-partial-counts \
+  '{"test_dev_check":4}' < selected-receipt.json
+```
+
+Extraction is an offline evidence aid, not journal chain/operation validation,
+receipt authentication, or permission to resume. A tool can print fabricated
+markers and an edited journal can contain fabricated results. Keep the original
+run evidence; normal runtime recovery remains the authority for resuming a
+session. Bounded checkpoint excerpts cannot replace the original receipt.
