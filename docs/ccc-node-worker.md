@@ -6,6 +6,7 @@ and maps validated results to native ccc-node events. This is an opt-in auxiliar
 worker integration, not a registered `CCC_AGENT_PROVIDER` or Telegram provider.
 It does not replace a running ccc-node service or enable broker dispatch.
 
+Use Python 3.11 or newer, matching ccc-node's supported minimum.
 Install/use the normal ccc-node Python environment (`telegram_bot` package),
 make this repository importable, and build Danso with `cargo build --locked`.
 For example, from a ccc-node process with an explicitly supplied credential:
