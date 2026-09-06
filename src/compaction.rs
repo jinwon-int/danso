@@ -186,12 +186,14 @@ pub async fn summarize(
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
             let candidate = make(boundaries[mid]);
-            let bytes = provider.request_bytes(&ModelRequest {
-                // Reserve the longer repair prompt before choosing a fragment.
-                system: &repair_system,
-                messages: &candidate,
-                tools: &[],
-            })?;
+            let bytes = provider
+                .request_bytes(&ModelRequest {
+                    // Reserve the longer repair prompt before choosing a fragment.
+                    system: &repair_system,
+                    messages: &candidate,
+                    tools: &[],
+                })
+                .map_err(at(Kind::Provider))?;
             if bytes <= threshold {
                 lo = mid;
             } else {

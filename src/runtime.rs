@@ -82,20 +82,24 @@ pub async fn run(
     while remaining > 0 {
         async {
             if let Some(limit) = input.compact_at_bytes {
-                let before = provider.request_bytes(&ModelRequest {
-                    system: &system,
-                    messages: &messages,
-                    tools: &definitions,
-                })?;
+                let before = provider
+                    .request_bytes(&ModelRequest {
+                        system: &system,
+                        messages: &messages,
+                        tools: &definitions,
+                    })
+                    .map_err(at(Kind::Provider))?;
                 if before > limit {
                     // The current request and static instructions cannot be summarized
                     // away. Reject impossible budgets before spending summary calls.
                     let latest = crate::compaction::latest_user(&messages)?;
-                    let bare = provider.request_bytes(&ModelRequest {
-                        system: &system,
-                        messages: std::slice::from_ref(&latest),
-                        tools: &definitions,
-                    })?;
+                    let bare = provider
+                        .request_bytes(&ModelRequest {
+                            system: &system,
+                            messages: std::slice::from_ref(&latest),
+                            tools: &definitions,
+                        })
+                        .map_err(at(Kind::Provider))?;
                     let summary_budget = (limit / 8).min(crate::compaction::MAX_SUMMARY_BYTES);
                     ensure!(
                         bare + 2 * summary_budget + 512 <= limit,
@@ -111,11 +115,13 @@ pub async fn run(
                     )
                     .await?;
                     let compacted = crate::compaction::checkpoint_messages(&summary, &messages)?;
-                    let after = provider.request_bytes(&ModelRequest {
-                        system: &system,
-                        messages: &compacted,
-                        tools: &definitions,
-                    })?;
+                    let after = provider
+                        .request_bytes(&ModelRequest {
+                            system: &system,
+                            messages: &compacted,
+                            tools: &definitions,
+                        })
+                        .map_err(at(Kind::Provider))?;
                     ensure!(
                         after <= limit && after < before,
                         "compaction did not reduce request below threshold"
