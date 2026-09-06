@@ -2,6 +2,7 @@
 """Explicit worker subset or full host development checks. No live provider calls."""
 import argparse
 from pathlib import Path
+import json
 import subprocess
 import sys
 
@@ -26,9 +27,21 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--profile', choices=('worker', 'host'), required=True)
     parser.add_argument('--json', action='store_true', help='worker-only structured test receipt on stdout')
+    parser.add_argument('--list', action='store_true', dest='list',
+                        help='print the planned commands as JSON without running anything')
     args = parser.parse_args(argv)
     if args.json and args.profile != 'worker':
         parser.error('--json supports the worker profile only')
+    if args.json and args.list:
+        parser.error('--list is mutually exclusive with --json')
+    if args.list:
+        cwd = ROOT / 'scripts' if args.profile == 'worker' else ROOT
+        print(json.dumps({
+            'profile': args.profile,
+            'executed': False,
+            'commands': [{'argv': list(command), 'cwd': str(cwd)} for command in commands(args.profile)],
+        }, indent=2))
+        return 0
     if args.json:
         pass
     elif args.profile == 'worker':
