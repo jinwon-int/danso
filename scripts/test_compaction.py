@@ -184,6 +184,8 @@ class Compaction(fixture.Fixture):
                 key = 'input' if provider == 'openai' else 'messages'
                 self.assertEqual(first[key][-1], repair[key][-1])
                 self.assertIn('only checkpoint-repair attempt', json.dumps(repair))
+                self.assertIn('Target at most 512 UTF-8 bytes', json.dumps(first))
+                self.assertIn('target of 256 bytes', json.dumps(repair))
                 for body in state['summary_requests'] + state['action_requests']:
                     self.assertLessEqual(len(json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode()), 8192)
 

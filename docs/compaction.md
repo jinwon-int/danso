@@ -172,7 +172,8 @@ A terminal text response with invalid JSON, an invalid five-field schema, or an
 oversize checkpoint gets at most one repair request **per compaction**, shared
 across all fragments and all three failure kinds. The retry uses the same
 original evidence and previous valid checkpoint with stricter JSON instructions
-and a smaller target size. It never feeds back the invalid response, strips
+and a target of one quarter of the hard summary allowance. Normal summarization
+targets half that allowance, leaving room for later progress. It never feeds back the invalid response, strips
 markdown fences, guesses missing fields, or truncates evidence. This improves
 format recovery without guaranteeing that a model will return valid JSON.
 
@@ -182,3 +183,27 @@ Only a fully validated summary can be committed. Tool calls, nonterminal replies
 invalid response envelopes and transport errors still stop immediately. A second
 format/schema/size failure anywhere in the same compaction stops and retains the
 original journal; this is not a general provider retry policy.
+
+## Targeted reads and concise progress
+
+The `read` tool accepts optional `offset` (1-based line) and `limit` (1..2000
+lines). Providing either selects a range: omitted offset means 1, omitted limit
+means 200. Ranged output includes line bounds, total lines and the next offset
+or EOF. Content retains original line endings. An offset one past the last
+line returns an explicit empty EOF result; farther offsets fail. With neither
+option, existing full-file behavior is unchanged. The 256 KiB file limit,
+sandbox filesystem boundary and 64 KiB tool-output limit still apply. A range
+does not grant access to paths outside that boundary.
+
+For example, `read` arguments `{"path":"src/runtime.rs","offset":70,"limit":40}`
+read only the relevant section. The worker is encouraged to use ranges/searches
+and continue from checkpoints instead of repeating whole-file dumps. This does
+not block rereads or cache file contents; changed files remain readable.
+
+The summarizer is reminded that the latest original request is preserved
+verbatim alongside the checkpoint. It should keep a short objective and focus
+on additional constraints, changed paths, actual test results, uncertainty and
+remaining work instead of repeating the original requirements or copying code.
+These are generation instructions, not guarantees of model behavior. Hard
+validation, original journal retention and the single repair allowance remain
+unchanged.

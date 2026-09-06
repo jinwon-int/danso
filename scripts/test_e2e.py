@@ -153,6 +153,53 @@ class Acceptance(unittest.TestCase):
         self.assertTrue(all(r['isError'] for r in self.results()))
         self.assertEqual((self.repo / 'file').read_text(), 'same same')
 
+    def test_ranged_read_preserves_content_and_reports_navigation(self):
+        text = 'first\r\n한글😀\r\nlast'
+        (self.repo / 'lines.txt').write_bytes(text.encode())
+        (self.repo / 'empty.txt').write_text('')
+        (self.repo / 'many.txt').write_text('row\n' * 202)
+        (self.repo / 'big-range.txt').write_text('source line\n' * 1000)
+        cases = [({'path': 'lines.txt'}, text),
+                 ({'path': 'lines.txt', 'offset': 2, 'limit': 1},
+                  '[read: lines 2-2 of 3; next offset 3]\n한글😀\r\n'),
+                 ({'path': 'lines.txt', 'limit': 1},
+                  '[read: lines 1-1 of 3; next offset 2]\nfirst\r\n'),
+                 ({'path': 'lines.txt', 'offset': 3}, '[read: lines 3-3 of 3; EOF]\nlast'),
+                 ({'path': 'lines.txt', 'offset': 4}, '[read: no lines at offset 4; 3 total lines; EOF]\n'),
+                 ({'path': 'empty.txt', 'limit': 1}, '[read: no lines at offset 1; 0 total lines; EOF]\n'),
+                 ({'path': 'many.txt', 'offset': 2},
+                  '[read: lines 2-201 of 202; next offset 202]\n' + 'row\n' * 200),
+                 ({'path': 'big-range.txt', 'offset': 500, 'limit': 40},
+                  '[read: lines 500-539 of 1000; next offset 540]\n' + 'source line\n' * 40)]
+        self.responses.append((200, reply([call('read', args, f'r{i}') for i, (args, _) in enumerate(cases)], 'tool_use')))
+        self.final()
+        p = self.run_cli()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.results()), len(cases))
+        for result, (_, expected) in zip(self.results(), cases):
+            self.assertFalse(result['isError'])
+            self.assertEqual(result['content'][0]['text'], expected)
+
+    def test_ranged_read_rejects_invalid_ranges_and_preserves_file_gates(self):
+        (self.repo / 'file').write_text('hello')
+        (self.repo / 'large').write_bytes(b'x' * (256 * 1024 + 1))
+        outside = self.root / 'outside-range-secret'
+        outside.write_text('OUTSIDE_RANGE_SECRET')
+        (self.repo / 'link').symlink_to(outside)
+        invalid = [{'offset': v} for v in (0, -1, 1.5, None, '1', 2**64)]
+        invalid += [{'limit': v} for v in (0, -1, 2001, True, None)]
+        args = [{'path': 'file', **value} for value in invalid]
+        args += [{'path': 'file', 'offset': 3}, {'path': 'large', 'limit': 1},
+                 {'path': 'link', 'limit': 1}]
+        self.responses.append((200, reply([call('read', arg, f'r{i}') for i, arg in enumerate(args)], 'tool_use')))
+        self.final()
+        p = self.run_cli()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.results()), len(args))
+        self.assertTrue(all(result['isError'] for result in self.results()), self.results())
+        self.assertNotIn('OUTSIDE_RANGE_SECRET', json.dumps(self.results()))
+        self.assertEqual((self.repo / 'file').read_text(), 'hello')
+
     def test_output_limit_and_timeout(self):
         self.responses.append((200, reply([
             call('bash', {'command': 'yes x'}, 'big'),
