@@ -19,7 +19,7 @@ def commands(profile):
             ['cargo', 'test', '--locked'], ['cargo', 'build', '--locked'],
             *[[sys.executable, f'scripts/{name}'] for name in
               ('test_e2e.py', 'test_compaction.py', 'test_providers.py',
-               'test_live_acceptance.py', 'test_dev_check.py')]]
+               'test_live_acceptance.py', 'test_dev_check.py', 'test_ccc_node.py')]]
 
 
 def main(argv=None):
