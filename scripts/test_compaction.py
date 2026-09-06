@@ -56,9 +56,10 @@ class Compaction(fixture.Fixture):
         agents = self.home / '.pi' / 'agent' / 'AGENTS.md'
         agents.parent.mkdir(parents=True)
         wrapper = f'\n<project_instructions path="{agents.resolve()}">\n\n</project_instructions>\n'
+        wrapper += '\n<available_skills>\n</available_skills>\nRead the skill file before using its instructions.\n'
         content = 'x' * (65536 - len(wrapper.encode()))
         agents.write_text(content)
-        self.responses = [reply('glm')]
+        self.responses = [(200, reply('glm'))]
         result = fixture.Fixture.run_cli(self, 'glm')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.requests), 1)
