@@ -130,6 +130,7 @@ python3 scripts/test_compaction.py
 python3 scripts/test_providers.py
 python3 scripts/test_live_acceptance.py
 python3 scripts/test_dev_check.py
+python3 scripts/test_ccc_node.py
 ```
 
 The real-bubblewrap E2E suite continues to cover CLI behavior and the actual
@@ -149,3 +150,6 @@ worker profile does not install or expose a Rust toolchain, and cannot validate
 Rust changes or replace integration gates. Root/system mount boundaries and
 network isolation remain unchanged. A real-sandbox regression verifies that the
 worker profile can run where the previous nested integration attempt failed.
+
+The opt-in [ccc-node auxiliary worker](ccc-node-worker.md) owns subprocess
+supervision and native ccc-node event mapping outside the Rust agent loop.
