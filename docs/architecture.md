@@ -147,6 +147,7 @@ python3 scripts/test_compaction.py
 python3 scripts/test_providers.py
 python3 scripts/test_live_acceptance.py
 python3 scripts/test_dev_check.py
+python3 scripts/test_worker_checks.py
 python3 scripts/test_dev_check_host.py
 python3 scripts/test_ccc_node.py
 ```
@@ -185,3 +186,44 @@ allowlist or test-result parser. A successful tool exit does not prove all check
 passed; inspect their results and distinguish attempted, passed, failed, and
 omitted checks in reports. Early-closing consumers such as `head` can cause a
 producer's SIGPIPE to make the pipeline fail; prefer bounded reads at the source.
+
+### Worker check receipts and count comparison
+
+`dev_check.py --profile worker` runs each configured unittest selector once and
+emits a `DANSO_CHECK_RESULTS=` JSON line before the wrapper's PASS/FAIL outcome.
+Each suite row identifies its selector and actual `tests_run`, `failure_events`,
+`error_events`, `skipped`, `expected_failures`, `unexpected_successes`, and
+`successful`. Top-level `tests_run` is the sum across this invocation's suites,
+not the count for any one module. Subtest failures and class-setup errors are
+**events**, not distinct failed tests; do not subtract them to invent a passed
+count. A zero-test suite is unsuccessful. Skips and expected failures retain
+unittest semantics and remain visible. Import failures produce error results.
+
+Save a plain JSON receipt (test output and diagnostics go to stderr):
+
+```sh
+python3 scripts/dev_check.py --profile worker --json > worker-results.json
+```
+
+This option is worker-only; it does not claim Rust or host-gate test totals.
+The runner still exits nonzero on unsuccessful tests. If execution is interrupted
+or receipt emission fails, no complete receipt can be assumed.
+
+Compare reported per-selector counts against a saved receipt without running
+checks again. For example, this claim intentionally assigns the combined total
+to a unit module; replace the illustrative counts with the report being audited:
+
+```sh
+python3 scripts/worker_checks.py --compare-counts \
+  '{"test_live_acceptance.Safety":5,"test_live_acceptance.FailureReporting":8,"test_dev_check":19,"test_worker_checks":8}' \
+  < worker-results.json
+```
+
+Comparison requires every selector exactly once, rejects malformed or
+inconsistent receipts, and returns JSON differences. Exit 0 means counts match
+**and** the recorded checks were successful; exit 1 means a count mismatch or
+recorded failure; exit 2 means invalid input. It compares structured count claims,
+not arbitrary model prose, and does not authenticate an edited receipt or rerun
+old tests. Retain the receipt with its run evidence. Cross-run totals and repeated
+checks are not deduplicated automatically. The configured worker selectors are
+disjoint; callers extending them must keep that property.
