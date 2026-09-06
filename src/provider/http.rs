@@ -9,12 +9,16 @@ pub struct Http {
     key: reqwest::header::HeaderValue,
 }
 impl Http {
-    pub fn new(base: &str, suffix: &str, key: &str) -> Result<Self> {
+    pub fn new(base: &str, suffix: &str, key: &str, timeout_seconds: u64) -> Result<Self> {
+        ensure!(
+            (1..=300).contains(&timeout_seconds),
+            "invalid provider timeout"
+        );
         Self::with_timeouts(
             base,
             suffix,
             key,
-            Duration::from_secs(60),
+            Duration::from_secs(timeout_seconds),
             Duration::from_secs(10),
         )
     }

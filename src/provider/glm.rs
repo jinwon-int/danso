@@ -11,8 +11,17 @@ pub struct Glm {
 }
 impl Glm {
     pub fn new(model: String, key: String, base: &str, effort: Option<String>) -> Result<Self> {
+        Self::new_with_timeout(model, key, base, effort, 60)
+    }
+    pub fn new_with_timeout(
+        model: String,
+        key: String,
+        base: &str,
+        effort: Option<String>,
+        timeout_seconds: u64,
+    ) -> Result<Self> {
         Ok(Self {
-            http: Http::new(base, "chat/completions", &key)?,
+            http: Http::new(base, "chat/completions", &key, timeout_seconds)?,
             model,
             effort,
         })

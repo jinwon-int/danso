@@ -23,6 +23,7 @@ pub struct RunConfig {
     pub max_turns: u32,
     pub compact_at_bytes: Option<usize>,
     pub timeout_seconds: u64,
+    pub provider_timeout_seconds: u64,
     pub tool_timeout_seconds: u64,
 }
 
@@ -33,7 +34,8 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     );
     ensure!(
         (1..=3600).contains(&args.timeout_seconds)
-            && (1..=300).contains(&args.tool_timeout_seconds),
+            && (1..=300).contains(&args.tool_timeout_seconds)
+            && (1..=300).contains(&args.provider_timeout_seconds),
         "invalid timeout"
     );
     ensure!(
@@ -103,19 +105,26 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
                 args.reasoning_effort.is_none(),
                 "reasoning-effort is unsupported by the Anthropic adapter"
             );
-            Selected::Anthropic(Anthropic::new(args.model.clone(), key, &base)?)
+            Selected::Anthropic(Anthropic::new_with_timeout(
+                args.model.clone(),
+                key,
+                &base,
+                args.provider_timeout_seconds,
+            )?)
         }
-        "openai" => Selected::OpenAi(OpenAi::new(
+        "openai" => Selected::OpenAi(OpenAi::new_with_timeout(
             args.model.clone(),
             key,
             &base,
             args.reasoning_effort.clone(),
+            args.provider_timeout_seconds,
         )?),
-        "glm" => Selected::Glm(Glm::new(
+        "glm" => Selected::Glm(Glm::new_with_timeout(
             args.model.clone(),
             key,
             &base,
             args.reasoning_effort.clone(),
+            args.provider_timeout_seconds,
         )?),
         _ => unreachable!(),
     };
