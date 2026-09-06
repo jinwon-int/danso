@@ -228,3 +228,32 @@ not arbitrary model prose, and does not authenticate an edited receipt or rerun
 old tests. Retain the receipt with its run evidence. Cross-run totals and repeated
 checks are not deduplicated automatically. The configured worker selectors are
 disjoint; callers extending them must keep that property.
+
+#### Partial count comparison (`--compare-partial-counts`)
+
+When a report claims only a subset of the receipt's selectors, use
+`--compare-partial-counts`. Claims must be a nonempty JSON object whose keys are
+selectors present in the receipt with nonnegative integer counts (booleans are
+rejected). Like `--compare-counts`, it reads the same bounded plain receipt JSON
+from stdin, never runs tests, and is mutually exclusive with `--json`,
+`--compare-counts`, and positional test selectors. Invalid claims, unknown or
+duplicate keys, or an invalid receipt exit 2 with no stdout JSON. Example
+(adjust the counts to the report being audited):
+
+```sh
+python3 scripts/worker_checks.py --compare-partial-counts \
+  '{"test_live_acceptance.Safety":5,"test_dev_check":4}' \
+  < worker-results.json
+```
+
+The result JSON has the exact shape
+`{"version":1,"counts_match":bool,"checks_successful":bool,"differences":[{"selector":str,"reported":int,"actual":int},...],"unreported_selectors":[str,...]}`.
+`differences` includes only claimed mismatches; both `differences` and
+`unreported_selectors` follow receipt suite order. Exit 0 requires **both** that
+every supplied count matches **and** that the entire receipt is successful; a
+failed suite that was not reported still forces exit 1. Note that
+`counts_match: true` only describes the supplied claims — it does **not** mean
+all selectors were reported; check `unreported_selectors` before treating a run
+as fully accounted for. The same limits apply as for strict comparison: this is
+a structured-count check, not receipt authentication or arbitrary prose
+parsing; retain the receipt with its run evidence.

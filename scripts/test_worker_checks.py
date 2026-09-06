@@ -143,5 +143,84 @@ class Receipts(unittest.TestCase):
         run.assert_not_called()
 
 
+class PartialReports(unittest.TestCase):
+    def receipt(self, failed=False):
+        rows = []
+        # Deliberately not alphabetical: output order belongs to the receipt.
+        for selector, count in (('z', 1), ('a', 2), ('m', 3)):
+            rows.append({'selector': selector, **{key: 0 for key in checks.COUNTERS},
+                         'tests_run': count, 'successful': True})
+        if failed:
+            rows[2].update(error_events=1, successful=False)
+        return {'version': 1, 'profile': 'worker', 'suites': rows,
+                'tests_run': 6, 'successful': not failed}
+
+    def invoke(self, claims, receipt=None, extra=(), mode='--compare-partial-counts', raw=None):
+        if raw is None:
+            raw = json.dumps(self.receipt() if receipt is None else receipt)
+        out = io.StringIO()
+        with patch.object(checks, 'run_suites', side_effect=AssertionError('comparison ran tests')), \
+                patch.object(checks.sys, 'stdin', io.StringIO(raw)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                code = checks.main([mode, claims, *extra])
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue()
+
+    def test_subset_and_exact_schema(self):
+        code, out = self.invoke('{"a":2}')
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {
+            'version': 1, 'counts_match': True, 'checks_successful': True,
+            'differences': [], 'unreported_selectors': ['z', 'm']})
+
+    def test_order_and_complete_claims(self):
+        code, out = self.invoke('{"m":8,"z":9}')
+        self.assertEqual(code, 1)
+        result = json.loads(out)
+        self.assertEqual(result['differences'], [
+            {'selector': 'z', 'reported': 9, 'actual': 1},
+            {'selector': 'm', 'reported': 8, 'actual': 3}])
+        self.assertEqual(result['unreported_selectors'], ['a'])
+        code, out = self.invoke('{"m":3,"a":2,"z":1}')
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)['unreported_selectors'], [])
+
+    def test_unreported_failure_prevents_success(self):
+        code, out = self.invoke('{"z":1}', self.receipt(failed=True))
+        self.assertEqual(code, 1)
+        result = json.loads(out)
+        self.assertTrue(result['counts_match'])
+        self.assertFalse(result['checks_successful'])
+
+    def test_invalid_claims_have_no_stdout(self):
+        for claims in ('{}', '[]', 'null', '{', '{"z":true}', '{"z":-1}',
+                       '{"unknown":1}', '{"z":1,"z":1}', '{"z":1.0}', '{"z":NaN}'):
+            with self.subTest(claims=claims):
+                self.assertEqual(self.invoke(claims), (2, ''))
+
+    def test_invalid_receipts_and_modes(self):
+        bad = self.receipt()
+        bad['tests_run'] = 7
+        self.assertEqual(self.invoke('{"z":1}', bad), (2, ''))
+        for extra in (('test_worker_checks',), ('--json',),
+                      ('--compare-counts', '{"z":1}')):
+            with self.subTest(extra=extra):
+                self.assertEqual(self.invoke('{"z":1}', extra=extra), (2, ''))
+
+    def test_size_limit_and_duplicate_receipt_keys(self):
+        for raw in (' ' * (1024 * 1024 + 1),
+                    json.dumps(self.receipt())[:-1] + ',"version":1}'):
+            self.assertEqual(self.invoke('{"z":1}', raw=raw), (2, ''))
+
+    def test_strict_comparison_unchanged(self):
+        self.assertEqual(self.invoke('{"z":1}', mode='--compare-counts'), (2, ''))
+        code, out = self.invoke('{"z":1,"a":2,"m":3}', mode='--compare-counts')
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {'version': 1, 'counts_match': True,
+                                        'checks_successful': True, 'differences': []})
+
+
 if __name__ == '__main__':
     unittest.main()
