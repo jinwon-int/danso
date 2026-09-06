@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import json
+import math
 import sys
 import unittest
 
@@ -51,8 +52,16 @@ def reject_constant(_):
     raise ValueError('non-finite JSON value')
 
 
+def finite_float(text):
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError('non-finite JSON number')
+    return value
+
+
 def parse_json(text):
-    return json.loads(text, object_pairs_hook=unique_object, parse_constant=reject_constant)
+    return json.loads(text, object_pairs_hook=unique_object,
+                      parse_constant=reject_constant, parse_float=finite_float)
 
 
 def validate_receipt(receipt):

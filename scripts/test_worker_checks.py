@@ -286,6 +286,20 @@ class JournalReceipts(unittest.TestCase):
         bad['message']['content'][0]['text'] = 'DANSO_CHECK_RESULTS={}'
         self.assertEqual(self.invoke(valid + self.raw(bad)), (2, ''))
 
+    def test_numeric_overflow_rejected_even_in_ignored_metadata(self):
+        for number in ('NaN', 'Infinity', '-Infinity', '1e309', '-1e309'):
+            with self.subTest(number=number):
+                with self.assertRaises(ValueError):
+                    checks.parse_json(number)
+                raw = self.raw(self.entry()).rstrip()[:-1] + (
+                    ',"timestamp":' + number + '}\n').encode()
+                self.assertEqual(self.invoke(raw), (2, ''))
+                self.assertEqual(self.invoke(self.raw(self.entry()) +
+                                            ('{"ignored":[' + number + ']}').encode()), (2, ''))
+        entry = self.entry()
+        entry['timestamp'] = 1.5
+        self.assertEqual(self.invoke(self.raw(entry))[0], 0)
+
     def test_ambiguous_or_incomplete_tool_records_rejected(self):
         for ident, call in (('entry1', 'other'), ('other', 'call1')):
             self.assertEqual(self.invoke(self.raw(self.entry(), self.entry(ident, call))), (2, ''))
