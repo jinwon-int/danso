@@ -47,8 +47,12 @@ def unique_object(pairs):
     return result
 
 
+def reject_constant(_):
+    raise ValueError('non-finite JSON value')
+
+
 def parse_json(text):
-    return json.loads(text, object_pairs_hook=unique_object)
+    return json.loads(text, object_pairs_hook=unique_object, parse_constant=reject_constant)
 
 
 def validate_receipt(receipt):
@@ -108,15 +112,79 @@ def compare_partial_counts(receipt, claims):
             'unreported_selectors': unreported}
 
 
+JOURNAL_LIMIT = 16 * 1024 * 1024
+
+
+def extract_receipts(raw):
+    """Extract original tool-result markers, not summaries or journal authority."""
+    if type(raw) is not bytes or len(raw) > JOURNAL_LIMIT:
+        raise ValueError('invalid journal input')
+    text = raw.decode('utf-8')
+    rows = []
+    entry_ids = set()
+    call_ids = set()
+    for line in text.split('\n'):
+        if not line.strip():
+            continue
+        entry = parse_json(line)
+        if type(entry) is not dict:
+            raise ValueError('invalid journal entry')
+        if entry.get('type') != 'message':
+            continue
+        message = entry.get('message')
+        if type(message) is not dict:
+            raise ValueError('invalid journal message')
+        if message.get('role') != 'toolResult':
+            continue
+        entry_id, call_id = entry.get('id'), message.get('toolCallId')
+        if (type(entry_id) is not str or not entry_id or entry_id in entry_ids
+                or type(call_id) is not str or not call_id or call_id in call_ids
+                or type(message.get('content')) is not list):
+            raise ValueError('invalid or ambiguous tool result')
+        entry_ids.add(entry_id)
+        call_ids.add(call_id)
+        index = 0
+        for block in message['content']:
+            if type(block) is not dict:
+                raise ValueError('invalid content block')
+            if block.get('type') != 'text':
+                continue
+            if type(block.get('text')) is not str:
+                raise ValueError('invalid text block')
+            for output_line in block['text'].split('\n'):
+                if not output_line.startswith('DANSO_CHECK_RESULTS='):
+                    continue
+                receipt = parse_json(output_line.split('=', 1)[1])
+                validate_receipt(receipt)
+                if type(message.get('isError')) is not bool:
+                    raise ValueError('missing tool result status')
+                index += 1
+                rows.append({'entry_id': entry_id, 'tool_call_id': call_id,
+                             'receipt_index': index, 'tool_is_error': message['isError'],
+                             'receipt': receipt})
+    return {'version': 1, 'receipts': rows}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--json', action='store_true')
+    mode.add_argument('--extract-receipts', action='store_true',
+                      help='extract original worker receipts from journal JSONL on stdin; never run tests')
     mode.add_argument('--compare-counts', metavar='JSON', help='compare claimed counts with a receipt on stdin; never run tests')
     mode.add_argument('--compare-partial-counts', metavar='JSON',
                       help='compare a subset of claimed counts with a receipt on stdin; never run tests')
     parser.add_argument('selectors', nargs='*')
     args = parser.parse_args(argv)
+    if args.extract_receipts:
+        if args.selectors:
+            parser.error('extraction does not accept test selectors')
+        try:
+            result = extract_receipts(sys.stdin.buffer.read(JOURNAL_LIMIT + 1))
+        except (ValueError, TypeError, RecursionError, OSError):
+            parser.error('invalid journal or worker receipt')
+        print(json.dumps(result), flush=True)
+        return 0 if result['receipts'] else 1
     if args.compare_counts is not None or args.compare_partial_counts is not None:
         if args.selectors:
             parser.error('comparison does not accept test selectors')
