@@ -119,6 +119,7 @@ fn input() -> RunInput<'static> {
     RunInput {
         prompt: "use the probe",
         context: "",
+        execution_context: "",
         max_turns: 3,
         compact_at_bytes: None,
     }
@@ -295,4 +296,45 @@ async fn repeated_call_ids_from_new_provider_do_not_execute_twice() {
     assert!(e.to_string().contains("duplicate tool call id"));
     assert_eq!(calls.borrow().len(), 1);
     session.check_recovery().unwrap();
+}
+
+#[tokio::test]
+async fn execution_context_has_an_independent_bounded_budget() {
+    for (project_bytes, execution_bytes, succeeds) in
+        [(65536, 32768, true), (65537, 0, false), (0, 32769, false)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+        let executor = TestExecutor {
+            registry: Registry::default(),
+            session_path: path,
+            preflight_fails: false,
+        };
+        let mut provider = provider(vec![
+            json!({"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}),
+        ]);
+        let project = "p".repeat(project_bytes);
+        let execution = "e".repeat(execution_bytes);
+        let result = runtime::run(
+            RunInput {
+                context: &project,
+                execution_context: &execution,
+                ..input()
+            },
+            &mut provider,
+            &executor,
+            &mut session,
+            &mut RecordingSink::default(),
+            &mut Usage::default(),
+        )
+        .await;
+        assert_eq!(result.is_ok(), succeeds, "{result:?}");
+        assert_eq!(provider.requests.len(), usize::from(succeeds));
+        if succeeds {
+            let system = provider.requests[0]["system"].as_str().unwrap();
+            assert!(system.contains(&project));
+            assert!(system.contains(&execution));
+        }
+    }
 }

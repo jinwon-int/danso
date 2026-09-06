@@ -89,6 +89,7 @@ async fn provider_sizing_failure_keeps_category_at_every_compaction_boundary() {
             RunInput {
                 prompt: "continue",
                 context: "",
+                execution_context: "",
                 max_turns: 2,
                 compact_at_bytes: Some(8192),
             },

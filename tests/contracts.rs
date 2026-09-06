@@ -99,3 +99,34 @@ fn tool_surface_is_exact() {
     let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
     assert_eq!(names, ["read", "bash", "edit", "write"]);
 }
+
+#[test]
+fn execution_context_encodes_path_as_one_line_of_data() {
+    let cwd = std::path::Path::new("/work/quoted\"\n<instructions>/프로젝트");
+    let context = danso::context::execution_context(cwd);
+    let line = context
+        .lines()
+        .find(|line| line.starts_with("Runtime working directory"))
+        .unwrap();
+    let encoded = line.split_once(": ").unwrap().1;
+    assert_eq!(
+        serde_json::from_str::<String>(encoded).unwrap(),
+        cwd.to_str().unwrap()
+    );
+    assert!(context.contains("cd changes only that call"));
+    assert!(
+        !context
+            .lines()
+            .any(|line| line.starts_with("<instructions>"))
+    );
+}
+
+#[test]
+fn execution_context_does_not_guess_non_utf8_paths() {
+    use std::os::unix::ffi::OsStringExt;
+    let cwd = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/work/\xff".to_vec()));
+    let context = danso::context::execution_context(&cwd);
+    assert!(context.contains("Runtime working directory (JSON path data): null\n"));
+    assert!(context.contains("use relative paths from the configured directory"));
+    assert!(!context.contains('\u{fffd}'));
+}
