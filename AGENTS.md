@@ -19,6 +19,9 @@ module boundary; `app.rs` is the composition root and `runtime.rs` is agent poli
 - Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`,
   `cargo test --locked`, `cargo build --locked`, `python3 scripts/test_e2e.py`,
   `python3 scripts/test_compaction.py`, `python3 scripts/test_providers.py`, and `python3 scripts/test_live_acceptance.py`
-  before a PR.
+  before a PR. Also run `python3 scripts/test_dev_check.py`.
+- Inside a Danso worker, use `python3 scripts/dev_check.py --profile worker`
+  for the Python subset; Rust and nested sandbox integration are host checks.
+  Report omitted checks explicitly. On the host, `python3 scripts/dev_check.py --profile host` runs the full required gate list; it never falls back to a subset.
 - Tests use synthetic credentials and local providers. Do not turn tests into
   real model calls or fleet changes.

@@ -135,6 +135,11 @@ pub async fn summarize(
 ) -> Result<Value> {
     let max_summary = (threshold / 8).min(MAX_SUMMARY_BYTES);
     let system = format!("{SYSTEM} Maximum serialized checkpoint size: {max_summary} UTF-8 bytes.");
+    let repair_system = format!(
+        "{system} The prior response exceeded the checkpoint size budget. Regenerate from the same original evidence with a target of {} bytes; retain the five fields and essential progress. This is the only size-repair attempt.",
+        max_summary / 2
+    );
+    let mut repair_available = true;
     // Only portable evidence is summarized. Large encrypted/raw reasoning copies
     // are neither useful to the summarizer nor required after the checkpoint.
     let evidence: Vec<Value> = messages
@@ -177,7 +182,8 @@ pub async fn summarize(
             let mid = lo + (hi - lo) / 2;
             let candidate = make(boundaries[mid]);
             let bytes = provider.request_bytes(&ModelRequest {
-                system: &system,
+                // Reserve the longer repair prompt before choosing a fragment.
+                system: &repair_system,
                 messages: &candidate,
                 tools: &[],
             })?;
@@ -193,34 +199,51 @@ pub async fn summarize(
             "checkpoint and summarizer instructions exceed request budget"
         );
         let input = make(end);
-        *remaining -= 1;
-        let response = provider
-            .complete(
-                ModelRequest {
-                    system: &system,
-                    messages: &input,
-                    tools: &[],
-                },
-                usage,
-            )
-            .await?;
-        ensure!(
-            response["role"] == "assistant" && response["stopReason"] == "stop",
-            "checkpoint response is not terminal text"
-        );
-        let mut text = String::new();
-        for b in response["content"]
-            .as_array()
-            .context("invalid checkpoint response")?
-        {
+        let mut repairing = false;
+        summary = loop {
             ensure!(
-                b["type"] == "text",
-                "checkpoint response cannot contain tool calls"
+                *remaining > 1,
+                "turn budget exhausted during compaction (one action turn reserved)"
             );
-            text.push_str(b["text"].as_str().context("invalid checkpoint text")?);
-        }
-        summary = serde_json::from_str(&text).context("invalid checkpoint JSON")?;
-        validate_summary(&summary, max_summary)?;
+            *remaining -= 1;
+            let response = provider
+                .complete(
+                    ModelRequest {
+                        system: if repairing { &repair_system } else { &system },
+                        messages: &input,
+                        tools: &[],
+                    },
+                    usage,
+                )
+                .await?;
+            ensure!(
+                response["role"] == "assistant" && response["stopReason"] == "stop",
+                "checkpoint response is not terminal text"
+            );
+            let mut text = String::new();
+            for b in response["content"]
+                .as_array()
+                .context("invalid checkpoint response")?
+            {
+                ensure!(
+                    b["type"] == "text",
+                    "checkpoint response cannot contain tool calls"
+                );
+                text.push_str(b["text"].as_str().context("invalid checkpoint text")?);
+            }
+            let candidate: Value =
+                serde_json::from_str(&text).context("invalid checkpoint JSON")?;
+            // Retry only a well-formed checkpoint that violates the byte limit.
+            // Malformed JSON/schema, tool calls and transport failures still stop.
+            validate_summary(&candidate, usize::MAX)?;
+            if serde_json::to_vec(&candidate)?.len() > max_summary && repair_available {
+                repair_available = false;
+                repairing = true;
+                continue;
+            }
+            validate_summary(&candidate, max_summary)?;
+            break candidate;
+        };
         offset += end;
         if offset == ledger.len() {
             return Ok(summary);

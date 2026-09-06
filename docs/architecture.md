@@ -129,8 +129,23 @@ python3 scripts/test_e2e.py
 python3 scripts/test_compaction.py
 python3 scripts/test_providers.py
 python3 scripts/test_live_acceptance.py
+python3 scripts/test_dev_check.py
 ```
 
 The real-bubblewrap E2E suite continues to cover CLI behavior and the actual
 Anthropic wire adapter. The Piri fixture test covers interchange. Adapter tests
 complement these tests; they do not replace isolation or protocol evidence.
+
+## Development check environments
+
+Use `python3 scripts/dev_check.py --profile worker` inside the coding worker. It
+runs the Python safety and mocked failure-report tests, without Cargo, network
+listeners or nested bubblewrap. Its PASS explicitly covers only this subset.
+
+Use `python3 scripts/dev_check.py --profile host` on a development host with
+Cargo/rustfmt/clippy and functioning bubblewrap. This runs all required checks
+and stops on the first failure, with no automatic fallback to worker mode. The
+worker profile does not install or expose a Rust toolchain, and cannot validate
+Rust changes or replace integration gates. Root/system mount boundaries and
+network isolation remain unchanged. A real-sandbox regression verifies that the
+worker profile can run where the previous nested integration attempt failed.

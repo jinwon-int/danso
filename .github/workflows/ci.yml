@@ -26,3 +26,4 @@ jobs:
           python3 scripts/test_compaction.py
           python3 scripts/test_providers.py
           python3 scripts/test_live_acceptance.py
+          python3 scripts/test_dev_check.py
