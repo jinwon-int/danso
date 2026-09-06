@@ -15,6 +15,18 @@ pub struct Anthropic {
 }
 impl Anthropic {
     pub fn new(model: String, key: String, base: &str) -> Result<Self> {
+        Self::new_with_timeout(model, key, base, 60)
+    }
+    pub fn new_with_timeout(
+        model: String,
+        key: String,
+        base: &str,
+        timeout_seconds: u64,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=300).contains(&timeout_seconds),
+            "invalid provider timeout"
+        );
         ensure!(!key.is_empty(), "ANTHROPIC_API_KEY is empty");
         // Only HTTPS or literal loopback HTTP is allowed; never follow redirects
         // carrying a credential to a different host.
@@ -30,7 +42,7 @@ impl Anthropic {
             "endpoint must not contain credentials"
         );
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(timeout_seconds))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {

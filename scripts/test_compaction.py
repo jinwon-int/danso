@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import threading
 import signal
+import time
 from unittest.mock import patch
 import live_acceptance as live
 import unittest
@@ -389,6 +390,64 @@ class Compaction(fixture.Fixture):
         p = fixture.Fixture.run_cli(self, 'glm')
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual((self.repo / 'effects.txt').read_text(), 'done\n')
+
+    def test_provider_timeout_validation_precedes_dispatch(self):
+        for provider in ('anthropic', 'openai', 'glm'):
+            for value in ('0', '301'):
+                self.session = self.root / f'timeout-invalid-{provider}-{value}.jsonl'
+                p = self.run_cli(provider, '--provider-timeout-seconds', value)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertFalse(self.session.exists())
+                self.assertEqual(len(self.requests), 0)
+
+    def test_provider_timeout_option_controls_all_adapters(self):
+        for provider in ('anthropic', 'openai', 'glm'):
+            for seconds, expected in (('1', 3), ('2', 0)):
+                self.session = self.root / f'timeout-{provider}-{seconds}.jsonl'
+                before = len(self.requests)
+                def delayed(body):
+                    time.sleep(1.2)
+                    return reply(provider)
+                self.responses.append((200, delayed))
+                p = self.run_cli(provider, '--provider-timeout-seconds', seconds)
+                self.assertEqual(p.returncode, expected, p.stderr)
+                self.assertEqual(len(self.requests), before + 1)
+                if expected:
+                    self.assertIn('timed out', p.stderr)
+
+    def test_whole_run_timeout_still_bounds_longer_provider_timeout(self):
+        for provider in ('anthropic', 'openai', 'glm'):
+            self.session = self.root / f'whole-timeout-{provider}.jsonl'
+            before = len(self.requests)
+            def delayed(body):
+                time.sleep(1.2)
+                return reply(provider)
+            self.responses.append((200, delayed))
+            p = self.run_cli(provider, '--provider-timeout-seconds', '2', '--timeout-seconds', '1')
+            self.assertEqual(p.returncode, 124, p.stderr)
+            self.assertEqual(len(self.requests), before + 1)
+            self.assertEqual(len(self.checkpoints()), 0)
+
+    def test_summary_uses_provider_timeout_without_transport_retry(self):
+        for provider in ('anthropic', 'openai', 'glm'):
+            self.session = self.root / f'summary-timeout-{provider}.jsonl'
+            (self.repo / 'effects.txt').write_text('')
+            self.responses.clear()
+            state = self.queue_task(provider, rounds=1)
+            original = self.responses[0][1]
+            def serve(body):
+                response = original(body)
+                if not body['tools']:
+                    time.sleep(1.2)
+                return response
+            self.responses[:] = [(200, serve)] * 50
+            p = self.run_cli(provider, '--provider-timeout-seconds', '1')
+            self.assertEqual(p.returncode, 3, p.stderr)
+            self.assertIn('timed out', p.stderr)
+            self.assertEqual(state['summaries'], 1)
+            self.assertEqual(state['actions'], 1)
+            self.assertEqual(len(self.checkpoints()), 0)
+            self.assertEqual((self.repo / 'effects.txt').read_text(), 'step0\n')
 
     def test_checkpoint_cannot_cover_an_unsettled_prefix(self):
         # The final journal is settled, but this checkpoint interrupts the batch.

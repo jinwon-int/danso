@@ -42,6 +42,9 @@ pub struct Args {
     pub compact_at_bytes: Option<usize>,
     #[arg(long, default_value_t = 300)]
     pub timeout_seconds: u64,
+    /// Total time per provider request, including response body (1..300 seconds).
+    #[arg(long, default_value_t = 60)]
+    pub provider_timeout_seconds: u64,
     #[arg(long, default_value_t = 30)]
     pub tool_timeout_seconds: u64,
 }
@@ -60,6 +63,7 @@ impl Args {
             max_turns: self.max_turns,
             compact_at_bytes: self.compact_at_bytes,
             timeout_seconds: self.timeout_seconds,
+            provider_timeout_seconds: self.provider_timeout_seconds,
             tool_timeout_seconds: self.tool_timeout_seconds,
         }
     }

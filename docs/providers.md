@@ -69,7 +69,7 @@ target/debug/danso --provider glm --model YOUR_GLM_MODEL \
   and keeps `totalTokens` free of double counting. Per-response and cumulative
   arithmetic are checked; overflow fails without changing the last valid summary. Cost remains unknown (zero
   solely for Piri schema compatibility).
-- Requests are capped at 512 KiB, responses at 1 MiB, and HTTP transport at 60s.
+- Requests are capped at 512 KiB, responses at 1 MiB, and HTTP transport at 60s by default.
   The CLI run/turn/tool limits still apply. Large reasoning histories can reach
   the byte cap; opt-in [context compaction](compaction.md) can summarize portable evidence
   and start a fresh provider reasoning context while preserving the journal.
@@ -97,7 +97,7 @@ Protocol references checked for this implementation:
 
 ## OpenAI/GLM transport diagnostics
 
-The shared Bearer transport uses a 60-second total request deadline and a
+The shared Bearer transport uses a default 60-second total request deadline and a
 separate 10-second connection deadline. The latter includes establishing the
 connection (DNS/TCP/TLS); it is not a reason to retry automatically. Anthropic
 uses its separate adapter and is not changed by this policy.
@@ -124,3 +124,20 @@ context in 10.24s. DNS/TCP/TLS each took under 0.06s; header waits were 1.85s an
 The timed probes used HTTPS/1.1 and a 180s upper bound, and executed no returned
 tool calls. They did not reproduce the earlier 60s timeout, so its cause remains
 unconfirmed; these observations do not justify increasing the default deadline.
+
+## Request timeout override
+
+`--provider-timeout-seconds 120` sets the total time for each provider HTTP
+request, including response-body reads. It applies to Anthropic, OpenAI and GLM,
+including checkpoint summarization and its one permitted format repair. The
+default remains 60 seconds; accepted values are 1..300. The OpenAI/GLM connection
+limit remains 10 seconds, capped by the shorter total when applicable.
+
+This is separate from `--timeout-seconds`, which bounds the entire CLI run,
+and `--tool-timeout-seconds`, which bounds each tool. A longer provider timeout
+does not extend either limit or add retries. The option must be passed again
+on resume; sessions do not persist runtime timeout configuration.
+
+Example for a bounded GLM experiment: add `--provider-timeout-seconds 120
+--timeout-seconds 600` to the normal invocation. This enables comparison, not
+a claim that extending the timeout fixes service latency or task completion.
