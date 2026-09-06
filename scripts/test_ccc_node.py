@@ -186,6 +186,60 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(s._process)
         self.assertFalse(s._active)
 
+    async def test_double_cancel_spawn(self):
+        self.fake_binary('import time\ntime.sleep(20)\n')
+        entered, release = asyncio.Event(), asyncio.Event()
+        original, created = asyncio.create_subprocess_exec, []
+        async def delayed(*args, **kwargs):
+            p = await original(*args, **kwargs)
+            created.append(p)
+            entered.set()
+            await release.wait()
+            return p
+        s = await self.new_session()
+        try:
+            with patch('asyncio.create_subprocess_exec', delayed):
+                task = asyncio.create_task(collect(s))
+                await entered.wait()
+                task.cancel()
+                await asyncio.sleep(.01)
+                task.cancel()
+                await asyncio.sleep(.01)
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertIsNotNone(created[0].returncode, 'created process remains alive after double cancellation')
+        finally:
+            from integrations.ccc_node import _stop
+            await _stop(created[0])
+    async def test_repeated_cancel_waits_for_cleanup(self):
+        from integrations import ccc_node
+        self.fake_binary("import time\nfrom pathlib import Path\nPath('ready').write_text('yes')\ntime.sleep(20)\n")
+        entered, release = asyncio.Event(), asyncio.Event()
+        original, created = ccc_node._stop, []
+        async def delayed_stop(process):
+            created.append(process)
+            entered.set()
+            await release.wait()
+            await original(process)
+        s = await self.new_session()
+        with patch('integrations.ccc_node._stop', delayed_stop):
+            task = asyncio.create_task(collect(s))
+            async with asyncio.timeout(3):
+                while not (self.repo / 'ready').exists():
+                    await asyncio.sleep(.01)
+                task.cancel()
+                await entered.wait()
+                task.cancel()
+                await asyncio.sleep(.01)
+                self.assertFalse(task.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+        self.assertIsNotNone(created[0].returncode)
+        self.assertIsNone(s._process)
+        self.assertFalse(s._active)
+
     async def test_weak_state_and_symlink_resume_rejected(self):
         weak = self.root / 'weak'
         weak.mkdir(mode=0o755)

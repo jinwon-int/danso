@@ -42,6 +42,18 @@ async def _stop(process):
     await process.wait()
 
 
+async def _wait_owned(task):
+    """Drain owned work despite repeated caller cancellation, then report it."""
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), cancelled
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
+
+
 def _usage(stderr):
     groups = [[line.split('=', 1)[1] for line in stderr.splitlines()
                if line.startswith(prefix + '=')] for prefix in ('DANSO_USAGE', 'PIRI_USAGE')]
@@ -148,11 +160,9 @@ class DansoSession:
                 spawn = asyncio.create_task(asyncio.create_subprocess_exec(
                     *command, cwd=self.cwd, env=r.environment, stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True))
-                try:
-                    self._process = await asyncio.shield(spawn)
-                except asyncio.CancelledError:
-                    self._process = await spawn
-                    raise
+                self._process, cancelled = await _wait_owned(spawn)
+                if cancelled:
+                    raise asyncio.CancelledError
                 if self._interrupted:
                     await self.interrupt()
                 readers = [asyncio.create_task(_read(self._process.stdout)),
@@ -179,12 +189,19 @@ class DansoSession:
             except (OSError, ValueError):
                 events.append(ErrorEvent(code='danso_adapter_error', message='Worker output or startup failed validation.'))
             finally:
-                if self._process is not None:
-                    await self._terminate()
-                for task in readers:
-                    task.cancel()
-                await asyncio.gather(*readers, return_exceptions=True)
-                self._process, self._active = None, False
+                _, cancelled = await _wait_owned(asyncio.create_task(self._cleanup(readers)))
+                if cancelled:
+                    raise asyncio.CancelledError
 
             for event in events:
                 yield event
+
+    async def _cleanup(self, readers):
+        try:
+            if self._process is not None:
+                await self._terminate()
+        finally:
+            for task in readers:
+                task.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+            self._process, self._active = None, False
