@@ -94,3 +94,33 @@ Protocol references checked for this implementation:
 - [OpenAI official function calling guide](https://developers.openai.com/api/docs/guides/function-calling)
 - [OpenAI Responses create reference](https://developers.openai.com/api/reference/resources/responses/methods/create)
 - [Z.AI Chat Completion reference](https://docs.z.ai/api-reference/llm/chat-completion)
+
+## OpenAI/GLM transport diagnostics
+
+The shared Bearer transport uses a 60-second total request deadline and a
+separate 10-second connection deadline. The latter includes establishing the
+connection (DNS/TCP/TLS); it is not a reason to retry automatically. Anthropic
+uses its separate adapter and is not changed by this policy.
+
+Transport failures now include only static labels and measured numbers:
+
+```text
+provider request timed out: phase=before_response_headers elapsed_ms=60001 request_bytes=30502
+```
+
+- `connect`: reqwest classified the failure as connection establishment.
+- `before_response_headers`: failure before complete headers without a
+  connection classification; this label alone does not prove server slowness.
+- `response_body`: headers arrived, but reading the body failed or timed out.
+
+`elapsed_ms` is measured from dispatch with a monotonic clock; `request_bytes`
+is the serialized JSON body length. Errors contain no URL, key, request/response
+body, or underlying exception text. Redirects, byte limits, usage accounting
+and the no-retry policy remain unchanged.
+
+On 2026-09-06, two direct diagnostic requests returned HTTP 200: a small control
+request in 1.96s and a 30,502-byte action request reconstructed from the saved task
+context in 10.24s. DNS/TCP/TLS each took under 0.06s; header waits were 1.85s and 10.15s.
+The timed probes used HTTPS/1.1 and a 180s upper bound, and executed no returned
+tool calls. They did not reproduce the earlier 60s timeout, so its cause remains
+unconfirmed; these observations do not justify increasing the default deadline.
