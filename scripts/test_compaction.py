@@ -163,6 +163,59 @@ class Compaction(fixture.Fixture):
                 self.assertFalse((self.repo / 'forbidden').exists())
                 self.assertEqual((self.repo / 'effects.txt').read_text(), 'step0\n')
 
+    def test_oversize_summary_repairs_once_using_same_evidence(self):
+        for provider in ('anthropic', 'openai', 'glm'):
+            with self.subTest(provider=provider):
+                self.session = self.root / f'repaired-{provider}.jsonl'
+                self.responses.clear()
+                state = self.queue_task(provider, rounds=1)
+                original = self.responses[0][1]
+                def serve(body):
+                    normal = original(body)
+                    if not body['tools'] and state['summaries'] == 1:
+                        return reply(provider, text=json.dumps({**SUMMARY, 'pending': ['x' * 2000]}))
+                    return normal
+                self.responses[:] = [(200, serve)] * 50
+                p = self.run_cli(provider)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(len(self.checkpoints()), 1)
+                first, repair = state['summary_requests'][:2]
+                key = 'input' if provider == 'openai' else 'messages'
+                self.assertEqual(first[key][-1], repair[key][-1])
+                self.assertIn('only size-repair attempt', json.dumps(repair))
+                for body in state['summary_requests'] + state['action_requests']:
+                    self.assertLessEqual(len(json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode()), 8192)
+
+    def test_repair_allowance_is_per_compaction_and_reserves_action_turn(self):
+        for mode in ('later_fragment', 'budget', 'tool_reply'):
+            with self.subTest(mode=mode):
+                self.session = self.root / f'repair-limit-{mode}.jsonl'
+                self.responses.clear()
+                state = self.queue_task('glm', rounds=1)
+                original = self.responses[0][1]
+                def serve(body):
+                    normal = original(body)
+                    if not body['tools']:
+                        n = state['summaries']
+                        if mode == 'tool_reply' and n == 2:
+                            return reply('glm', [('write', {'path': 'forbidden', 'content': 'x'})])
+                        if n == 1 or (mode == 'later_fragment' and n == 3):
+                            return reply('glm', text=json.dumps({**SUMMARY, 'pending': ['x' * 2000]}))
+                    return normal
+                self.responses[:] = [(200, serve)] * 50
+                if mode == 'budget':
+                    p = subprocess.run([str(fixture.BIN), '--cwd', str(self.repo), '--session', str(self.session),
+                                        '--provider', 'glm', '--model', 'fixture', '--compact-at-bytes', '8192',
+                                        '--max-turns', '3', '-p', 'ORIGINAL_GOAL'], env=self.env('glm'),
+                                       capture_output=True, text=True, timeout=20)
+                else:
+                    p = self.run_cli('glm')
+                self.assertEqual(p.returncode, 3, p.stderr)
+                self.assertEqual(state['summaries'], {'budget': 1, 'later_fragment': 3, 'tool_reply': 2}[mode])
+                self.assertEqual(state['actions'], 1)
+                self.assertEqual(len(self.checkpoints()), 0)
+                self.assertFalse((self.repo / 'forbidden').exists())
+
     def test_summary_calls_consume_turn_budget_and_preserve_source(self):
         state = self.queue_task('glm', rounds=3)
         # The overridden run avoids duplicate clap flags.

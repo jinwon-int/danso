@@ -63,3 +63,10 @@ v0 implements these portable contracts within the documented subset:
 - Replacing `piri` on the fleet
 
 See [issues](https://github.com/jinwon-int/danso/issues) for the v0 slice.
+
+## Development checks
+
+Inside a Danso coding worker, run `python3 scripts/dev_check.py --profile worker`
+for the Python subset. On the host, run `python3 scripts/dev_check.py --profile host`
+for all required Rust and sandbox integration checks. Worker success does not
+replace the host gate; see [check environments](docs/architecture.md#development-check-environments).

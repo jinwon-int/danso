@@ -70,7 +70,7 @@ resume. The existing Pi fixture continues to validate basic interchange.
 If summarization, validation, checkpoint persistence or output rendering fails,
 the run stops. A failed or interrupted summary never authorizes tools or creates
 a partial checkpoint. Resume reads the original history or the last complete
-checkpoint; there is no automatic ACK, replay, repair or retry.
+checkpoint; there is no automatic ACK, tool replay or journal repair. A bounded summary-size retry is described below.
 
 ## Limits and accounting
 
@@ -165,3 +165,14 @@ workspace files. Coding used 12 completed requests/27,266 tokens; resume used
 one request/1,447 tokens. This is one bounded fixture, not evidence that every
 long task or provider will avoid repetition. Compaction remains opt-in and
 experimental. Original failed-run evidence above is retained.
+
+## Oversize summary recovery
+
+A terminal, schema-valid JSON checkpoint exceeding its byte allowance gets at
+most one size-repair request **per compaction**, shared across all fragments.
+The retry uses the same original evidence and prior valid checkpoint, with a
+smaller target size; it never substitutes or truncates an invalid summary. The
+longer retry prompt is included when choosing wire-sized fragments. Both attempts
+consume the shared turn budget and reserve an action request. No partial journal
+checkpoint is written. Invalid JSON/schema, tool calls, transport errors and a
+second oversize response still stop; this is not a general provider retry policy.
