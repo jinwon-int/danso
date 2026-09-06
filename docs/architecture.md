@@ -147,6 +147,7 @@ python3 scripts/test_compaction.py
 python3 scripts/test_providers.py
 python3 scripts/test_live_acceptance.py
 python3 scripts/test_dev_check.py
+python3 scripts/test_dev_check_host.py
 python3 scripts/test_ccc_node.py
 ```
 
@@ -157,7 +158,7 @@ complement these tests; they do not replace isolation or protocol evidence.
 ## Development check environments
 
 Use `python3 scripts/dev_check.py --profile worker` inside the coding worker. It
-runs the Python safety and mocked failure-report tests, without Cargo, network
+runs the Python safety, mocked failure-report and development-profile unit tests, without Cargo, network
 listeners or nested bubblewrap. Its PASS explicitly covers only this subset.
 
 Use `python3 scripts/dev_check.py --profile host` on a development host with
@@ -170,3 +171,17 @@ worker profile can run where the previous nested integration attempt failed.
 
 The opt-in [ccc-node auxiliary worker](ccc-node-worker.md) owns subprocess
 supervision and native ccc-node event mapping outside the Rust agent loop.
+
+`python3 -m unittest test_dev_check -v` (from `scripts/`) runs worker-safe
+unit tests only. The real-sandbox case lives in `test_dev_check_host.py`, which
+both the host profile and CI execute explicitly. Broad unittest discovery still
+includes host-only modules; it is not a worker check.
+
+Bash tools start with `pipefail`: `failing_check | tail` returns a failure even
+when `tail` succeeds. This preserves pipeline failure status without enabling
+`errexit` or stopping later commands. `failing_check; echo done`, explicit
+`|| true`, or disabling pipefail can still return success. It is not an execution
+allowlist or test-result parser. A successful tool exit does not prove all checks
+passed; inspect their results and distinguish attempted, passed, failed, and
+omitted checks in reports. Early-closing consumers such as `head` can cause a
+producer's SIGPIPE to make the pipeline fail; prefer bounded reads at the source.

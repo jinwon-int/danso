@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-WORKER_TESTS = ('test_live_acceptance.Safety', 'test_live_acceptance.FailureReporting')
+WORKER_TESTS = ('test_live_acceptance.Safety', 'test_live_acceptance.FailureReporting', 'test_dev_check')
 
 
 def commands(profile):
@@ -19,7 +19,7 @@ def commands(profile):
             ['cargo', 'test', '--locked'], ['cargo', 'build', '--locked'],
             *[[sys.executable, f'scripts/{name}'] for name in
               ('test_e2e.py', 'test_compaction.py', 'test_providers.py',
-               'test_live_acceptance.py', 'test_dev_check.py', 'test_ccc_node.py')]]
+               'test_live_acceptance.py', 'test_dev_check.py', 'test_dev_check_host.py', 'test_ccc_node.py')]]
 
 
 def main(argv=None):
@@ -27,7 +27,7 @@ def main(argv=None):
     parser.add_argument('--profile', choices=('worker', 'host'), required=True)
     args = parser.parse_args(argv)
     if args.profile == 'worker':
-        print('WORKER SUBSET ONLY: Python safety/failure-report tests. '
+        print('WORKER SUBSET ONLY: Python safety/failure-report/profile unit tests. '
               'Rust and sandbox integration checks are NOT run; host checks remain required.', flush=True)
     else:
         print('HOST CHECKS: Rust toolchain and functioning bubblewrap required. No fallback or live calls.', flush=True)

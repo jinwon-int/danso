@@ -30,4 +30,5 @@ jobs:
           python3 scripts/test_providers.py
           python3 scripts/test_live_acceptance.py
           python3 scripts/test_dev_check.py
+          python3 scripts/test_dev_check_host.py
           python3 scripts/test_ccc_node.py
