@@ -57,7 +57,7 @@ pub async fn run(
         .collect::<Vec<_>>()
         .join(", ");
     let system = format!(
-        "You are a headless coding worker. Use only {names}. Skills are loaded using read.{}",
+        "You are a headless coding worker. Use only {names}. Skills are loaded using read. Prefer targeted line-range reads and searches over whole-file dumps. After compaction, continue from recorded progress; re-read only missing or changed information.{}",
         input.context
     );
     sink.emit(Event::Session(session.header()))?;
