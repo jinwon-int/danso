@@ -31,6 +31,17 @@ class Profiles(unittest.TestCase):
         self.assertIn('test_dev_check', worker[0])
         self.assertNotIn('test_dev_check_host', str(worker))
 
+    def test_json_profile_has_no_wrapper_stdout_and_rejects_host(self):
+        with patch.object(dev_check.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(dev_check.main(['--profile', 'worker', '--json']), 0)
+            self.assertEqual(output.getvalue(), '')
+            self.assertEqual(run.call_args.args[0][-1], '--json')
+        with patch.object(dev_check.subprocess, 'run') as run, contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            dev_check.main(['--profile', 'host', '--json'])
+        run.assert_not_called()
+
     def test_host_failure_stops_without_worker_fallback(self):
         for result in (subprocess.CompletedProcess([], 2), OSError('private-marker')):
             with self.subTest(result=type(result).__name__):
