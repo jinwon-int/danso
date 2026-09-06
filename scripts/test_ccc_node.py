@@ -255,6 +255,66 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
             await self.new_session(session_id=s.session_id)
         self.assertEqual(len(self.requests), 0)
 
+    async def test_compaction_setting_validation(self):
+        self.assertIsNone(self.runtime.compact_at_bytes)
+        for value in (True, False, 8191, 393217, '8192', 8192.0):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                DansoRuntime(binary=fixture.BIN, state_directory=self.root / 'state',
+                             provider='glm', model='fixture', environment=self.env('glm'),
+                             compact_at_bytes=value)
+        self.assertEqual(len(self.requests), 0)
+
+    async def test_compacted_session_resume_and_old_id_rejected(self):
+        import test_compaction as cp
+        self.runtime.compact_at_bytes = 8192
+        state = {'actions': 0}
+        def serve(body):
+            if not body['tools']:
+                return fixture.response('glm', text=json.dumps(cp.SUMMARY))
+            state['actions'] += 1
+            if state['actions'] == 1:
+                return cp.set_call_id('glm', fixture.response('glm', [('bash', {
+                    'command': "echo once >> effects.txt; printf '%09000d' 0"})]), 'before-compaction')
+            return fixture.response('glm', text='finished')
+        self.responses.extend([(200, serve)] * 20)
+        s = await self.new_session()
+        self.assertEqual((await collect(s))[-1].kind, 'completion')
+        journal = self.runtime.root / (s.session_id + '.jsonl')
+        records = [json.loads(line) for line in journal.read_text().splitlines()]
+        self.assertTrue(any(r.get('customType') == 'danso.compaction.v1' for r in records))
+        before = journal.read_bytes()
+        self.responses.clear()
+        self.responses.append((200, fixture.response('glm', text='recalled')))
+        runtime = DansoRuntime(binary=fixture.BIN, state_directory=self.runtime.root,
+                               provider='glm', model='fixture', environment=self.env('glm'),
+                               compact_at_bytes=8192)
+        resumed = await runtime.start_or_resume(contract.SessionRequest(
+            working_directory=str(self.repo), session_id=s.session_id))
+        count = len(self.requests)
+        self.assertEqual((await collect(resumed))[-1].kind, 'completion')
+        self.assertEqual(len(self.requests), count + 1)
+        self.assertTrue(journal.read_bytes().startswith(before))
+        self.assertEqual((self.repo / 'effects.txt').read_text(), 'once\n')
+        self.responses.append((200, cp.set_call_id('glm', fixture.response('glm', [
+            ('write', {'path': 'forbidden', 'content': 'bad'})]), 'before-compaction')))
+        events = await collect(resumed)
+        self.assertEqual([e.kind for e in events], ['error'])
+        self.assertFalse((self.repo / 'forbidden').exists())
+
+    async def test_failed_compaction_emits_error_without_checkpoint(self):
+        self.runtime.compact_at_bytes = 8192
+        def serve(body):
+            if not body['tools']:
+                return fixture.response('glm', text='invalid checkpoint')
+            return fixture.response('glm', [('bash', {'command': "printf '%09000d' 0"})])
+        self.responses.extend([(200, serve)] * 5)
+        s = await self.new_session()
+        events = await collect(s)
+        self.assertEqual([e.kind for e in events], ['error'])
+        records = [json.loads(line) for line in
+                   (self.runtime.root / (s.session_id + '.jsonl')).read_text().splitlines()]
+        self.assertFalse(any(r.get('customType') == 'danso.compaction.v1' for r in records))
+
     async def test_no_ambient_credential_or_bootstrap_inheritance(self):
         self.assertNotIn('CCC_STATE_DIR', self.runtime.environment)
         self.assertNotIn('PIRI_BOOTSTRAP_CONTEXT_FILE', self.runtime.environment)

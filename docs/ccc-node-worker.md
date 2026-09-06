@@ -63,12 +63,25 @@ Supported behavior:
   The normal Linux bubblewrap sandbox stays enabled.
 
 Memory routing, custom sandbox/approval policies, approval reviewers, provider
-switching, model discovery, tool progress streaming and compaction are not
+switching, model discovery and tool progress streaming are not
 implemented by this initial adapter. Unsupported request policies and memory
 routes fail before launch instead of being silently ignored. Project trust is
 not enabled. The explicitly selected HOME may still contain normal Danso global
 context; use an isolated HOME rather than an audience-scoped ccc memory route.
 A successful smoke test does not establish long-task GLM reliability.
+
+## Optional compaction
+
+Set `compact_at_bytes=16384` on `DansoRuntime` to opt in to native checkpoint
+compaction (integer range 8192..393216). The default `None` retains the normal
+uncompressed request limit. Summary requests share the same request/turn budget,
+provider timeout and whole-run deadline. Invalid summaries remain failures; the
+adapter does not repair journals or retry failed turns.
+
+Resume the saved adapter UUID with a new runtime/session object and the desired
+threshold. Native Danso reads the stored checkpoint and keeps completed tool IDs
+from the entire journal, so old effects remain forbidden after compaction.
+Checkpoint creation is recorded in the private journal, not a new ccc-node event.
 
 ## Offline validation
 

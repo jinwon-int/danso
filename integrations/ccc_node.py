@@ -74,12 +74,16 @@ def _usage(stderr):
 class DansoRuntime:
     """One configured model; explicit credentials and private journal directory."""
     def __init__(self, *, binary, state_directory, provider, model, environment,
-                 timeout_seconds=300, provider_timeout_seconds=60, max_turns=16):
+                 timeout_seconds=300, provider_timeout_seconds=60, max_turns=16, compact_at_bytes=None):
         if provider not in PROVIDERS or not model or not isinstance(model, str):
             raise ValueError('invalid provider/model')
         for value, maximum in ((timeout_seconds, 3600), (provider_timeout_seconds, 300), (max_turns, 128)):
             if type(value) is not int or not 1 <= value <= maximum:
                 raise ValueError('invalid worker limit')
+        if compact_at_bytes is not None and (type(compact_at_bytes) is not int
+                or not 8192 <= compact_at_bytes <= 393216):
+            raise ValueError('invalid compaction threshold')
+        self.compact_at_bytes = compact_at_bytes
         self.binary = str(Path(binary).resolve(strict=True))
         root = Path(state_directory).absolute()
         if root.resolve() != root:
@@ -152,6 +156,8 @@ class DansoSession:
                        '-p']
             if self.effort is not None:
                 command += ['--reasoning-effort', self.effort]
+            if r.compact_at_bytes is not None:
+                command += ['--compact-at-bytes', str(r.compact_at_bytes)]
             command += ['--', message]
             self._active, self._interrupted = True, False
             readers, events = [], []
