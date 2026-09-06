@@ -106,6 +106,17 @@ The offline suite forces multiple compactions with an 8 KiB budget across all
 three providers, checks resume and global ID retention, and covers malformed
 summaries, budget exhaustion, corrupt boundaries, unsettled prefixes, interruption
 and disk-write failure. It uses local fake providers and real bubblewrap.
+It also generates real structured worker test receipts for passing and failing
+fixtures across all three providers, forces three checkpoints, and restarts the
+session. The original receipt and its tool error status remain unchanged in the
+journal even when the summary incorrectly claims success. A partial count audit
+of that original receipt still rejects an unreported failed suite. Run markers
+verify no test or effect is repeated during the scripted restart.
+
+This checks persistence and auditing boundaries with local fake providers; it
+does not prove a live model will recall exact counts or refrain from requesting
+new tool calls. Bounded checkpoint excerpts are not complete test receipts: use
+the original journal evidence when auditing counts after compaction.
 
 For a separately authorized live stress test, the existing acceptance runner can
 pad source reads and test output to force at least two compactions:

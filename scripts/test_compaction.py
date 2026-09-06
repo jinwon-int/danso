@@ -14,6 +14,7 @@ import unittest
 
 import test_providers as fixture
 import test_e2e as anthropic
+import worker_checks as checks
 
 SUMMARY = {'objective': 'Keep ORIGINAL_GOAL and finish the task', 'constraints': ['Do not repeat completed effects'],
            'changes': ['effects.txt records completed bash effects'], 'tests': ['prior tool calls succeeded'],
@@ -134,6 +135,86 @@ class Compaction(fixture.Fixture):
                 self.assertEqual(p.returncode, 3, p.stderr)
                 self.assertIn('duplicate tool call id', p.stderr)
                 self.assertFalse((self.repo / 'forbidden').exists())
+
+    def test_worker_receipts_survive_compactions_and_restart(self):
+        # Use production receipt generation inside the real sandbox. A small
+        # fixture keeps this a host integration test, not nested host discovery.
+        for name in ('worker_checks.py', 'dev_check.py'):
+            (self.repo / name).write_bytes(Path(__file__).with_name(name).read_bytes())
+        for provider in ('anthropic', 'openai', 'glm'):
+            for failed in (False, True):
+                with self.subTest(provider=provider, failed=failed):
+                    self.session = self.root / f'receipts-{provider}-{failed}.jsonl'
+                    (self.repo / 'check-runs.txt').write_text('')
+                    (self.repo / 'effects.txt').write_text('')
+                    (self.repo / 'receipt_case.py').write_text(
+                        'import unittest\n'
+                        'class Passing(unittest.TestCase):\n'
+                        '    def test_pass(self): self.assertTrue(True)\n'
+                        'class Outcome(unittest.TestCase):\n'
+                        f'    def test_outcome(self): self.assertTrue({not failed!r})\n')
+                    (self.repo / 'run_receipt.py').write_text(
+                        'import json\nfrom worker_checks import run_suites\n'
+                        'with open("check-runs.txt", "a") as f: f.write("run\\n")\n'
+                        'receipt = run_suites(["receipt_case.Passing", "receipt_case.Outcome"])\n'
+                        'print("DANSO_CHECK_RESULTS=" + json.dumps(receipt), flush=True)\n'
+                        'print("x" * 9000, flush=True)\n'
+                        'raise SystemExit(0 if receipt["successful"] else 1)\n')
+                    state = {'actions': 0}
+
+                    def serve(body):
+                        if not body['tools']:
+                            # Intentionally inaccurate for the failed case.
+                            return reply(provider, text=json.dumps(SUMMARY))
+                        step = state['actions']
+                        state['actions'] += 1
+                        if step >= 3:
+                            return reply(provider)
+                        command = ('python3 run_receipt.py' if step == 0 else
+                                   f"echo step{step} >> effects.txt; printf '%09000d' 0")
+                        return set_call_id(provider, reply(provider, [('bash', {'command': command})]),
+                                           f'receipt-step{step}')
+
+                    self.responses.clear()
+                    self.responses.extend([(200, serve)] * 50)
+                    result = self.run_cli(provider)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(len(self.checkpoints()), 3)
+                    for checkpoint in self.checkpoints():
+                        self.assertEqual(checkpoint['data']['summary']['tests'], SUMMARY['tests'])
+                    records = self.records()
+                    tool_result = next(e for e in records if
+                                       e.get('message', {}).get('role') == 'toolResult' and
+                                       e['message'].get('toolCallId') == 'receipt-step0')
+                    self.assertEqual(tool_result['message']['isError'], failed)
+                    output = '\n'.join(c.get('text', '') for c in tool_result['message']['content'])
+                    lines = [line for line in output.splitlines() if line.startswith('DANSO_CHECK_RESULTS=')]
+                    self.assertEqual(len(lines), 1)
+                    receipt = checks.parse_json(lines[0].split('=', 1)[1])
+                    checks.validate_receipt(receipt)
+                    self.assertEqual(receipt['tests_run'], 2)
+                    self.assertEqual(receipt['successful'], not failed)
+                    self.assertEqual(receipt['suites'][1]['failure_events'], int(failed))
+                    self.assertEqual((self.repo / 'check-runs.txt').read_text(), 'run\n')
+                    self.assertEqual((self.repo / 'effects.txt').read_text(), 'step1\nstep2\n')
+                    before = self.session.read_bytes()
+                    count = len(self.requests)
+                    self.responses.clear()
+                    self.responses.append((200, reply(provider, text='resumed without tools')))
+                    result = self.run_cli(provider)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(len(self.requests), count + 1)
+                    self.assertTrue(self.session.read_bytes().startswith(before))
+                    self.assertEqual(len(self.checkpoints()), 3)
+                    self.assertEqual((self.repo / 'check-runs.txt').read_text(), 'run\n')
+                    self.assertEqual((self.repo / 'effects.txt').read_text(), 'step1\nstep2\n')
+                    retained = next(e for e in self.records() if e['id'] == tool_result['id'])
+                    self.assertEqual(retained, tool_result)
+                    # Audit original evidence, not a lossy summary's success claim.
+                    audit = checks.compare_partial_counts(receipt, {'receipt_case.Passing': 1})
+                    self.assertTrue(audit['counts_match'])
+                    self.assertEqual(audit['unreported_selectors'], ['receipt_case.Outcome'])
+                    self.assertEqual(audit['checks_successful'], not failed)
 
     def test_budget_guidance_without_compaction_and_at_final_request(self):
         for provider in ('anthropic', 'openai', 'glm'):
