@@ -136,7 +136,7 @@ pub async fn summarize(
     let max_summary = (threshold / 8).min(MAX_SUMMARY_BYTES);
     let system = format!("{SYSTEM} Maximum serialized checkpoint size: {max_summary} UTF-8 bytes.");
     let repair_system = format!(
-        "{system} The prior response exceeded the checkpoint size budget. Regenerate from the same original evidence with a target of {} bytes; retain the five fields and essential progress. This is the only size-repair attempt.",
+        "{system} The prior response was not valid checkpoint JSON, did not match the five-field schema, or exceeded the size budget. Regenerate from the same original evidence with a target of {} bytes; retain the five fields and essential progress. Return only the JSON object, with no markdown fences or commentary. This is the only checkpoint-repair attempt.",
         max_summary / 2
     );
     let mut repair_available = true;
@@ -231,17 +231,24 @@ pub async fn summarize(
                 );
                 text.push_str(b["text"].as_str().context("invalid checkpoint text")?);
             }
-            let candidate: Value =
-                serde_json::from_str(&text).context("invalid checkpoint JSON")?;
-            // Retry only a well-formed checkpoint that violates the byte limit.
-            // Malformed JSON/schema, tool calls and transport failures still stop.
-            validate_summary(&candidate, usize::MAX)?;
-            if serde_json::to_vec(&candidate)?.len() > max_summary && repair_available {
-                repair_available = false;
-                repairing = true;
-                continue;
-            }
-            validate_summary(&candidate, max_summary)?;
+            // Regenerate from original evidence, never feed back invalid output.
+            // JSON, schema and size failures share one allowance for all fragments.
+            // The terminal-text checks above and provider errors remain fail-fast.
+            let candidate = serde_json::from_str::<Value>(&text)
+                .context("invalid checkpoint JSON")
+                .and_then(|candidate| {
+                    validate_summary(&candidate, max_summary)?;
+                    Ok(candidate)
+                });
+            let candidate = match candidate {
+                Ok(candidate) => candidate,
+                Err(_) if repair_available => {
+                    repair_available = false;
+                    repairing = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             break candidate;
         };
         offset += end;

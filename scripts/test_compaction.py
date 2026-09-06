@@ -182,12 +182,97 @@ class Compaction(fixture.Fixture):
                 first, repair = state['summary_requests'][:2]
                 key = 'input' if provider == 'openai' else 'messages'
                 self.assertEqual(first[key][-1], repair[key][-1])
-                self.assertIn('only size-repair attempt', json.dumps(repair))
+                self.assertIn('only checkpoint-repair attempt', json.dumps(repair))
                 for body in state['summary_requests'] + state['action_requests']:
                     self.assertLessEqual(len(json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode()), 8192)
 
+    def test_invalid_json_and_schema_repair_for_all_providers(self):
+        marker = 'CONFIDENTIAL_INVALID_SUMMARY'
+        for provider in ('anthropic', 'openai', 'glm'):
+            for bad in (marker, '```json\n' + json.dumps(SUMMARY) + '\n```',
+                        json.dumps({**SUMMARY, 'pending': marker})):
+                with self.subTest(provider=provider, bad=bad):
+                    self.session = self.root / f'format-{provider}-{len(self.requests)}.jsonl'
+                    (self.repo / 'effects.txt').write_text('')
+                    self.responses.clear()
+                    state = self.queue_task(provider, rounds=1)
+                    original = self.responses[0][1]
+                    def serve(body):
+                        normal = original(body)
+                        if not body['tools'] and state['summaries'] == 1:
+                            return reply(provider, text=bad)
+                        return normal
+                    self.responses[:] = [(200, serve)] * 50
+                    p = self.run_cli(provider)
+                    self.assertEqual(p.returncode, 0, p.stderr)
+                    self.assertEqual(len(self.checkpoints()), 1)
+                    self.assertEqual((self.repo / 'effects.txt').read_text(), 'step0\n')
+                    first, repair = state['summary_requests'][:2]
+                    key = 'input' if provider == 'openai' else 'messages'
+                    self.assertEqual(first[key][-1], repair[key][-1])
+                    self.assertIn('only checkpoint-repair attempt', json.dumps(repair))
+                    for body in state['summary_requests'] + state['action_requests']:
+                        self.assertNotIn(marker, json.dumps(body))
+                        self.assertLessEqual(len(json.dumps(body, ensure_ascii=False,
+                                                           separators=(',', ':')).encode()), 8192)
+                    self.assertNotIn(marker, self.session.read_text() + p.stderr)
+                    self.assertEqual(self.usage(p)['requests'], state['summaries'] + state['actions'])
+                    before = self.session.read_bytes()
+                    self.responses.clear()
+                    self.responses.append((200, reply(provider, text='resumed')))
+                    p = self.run_cli(provider)
+                    self.assertEqual(p.returncode, 0, p.stderr)
+                    self.assertEqual(self.usage(p)['requests'], 1)
+                    self.assertTrue(self.session.read_bytes().startswith(before))
+                    self.assertEqual((self.repo / 'effects.txt').read_text(), 'step0\n')
+
+    def test_unsafe_or_failed_summary_response_is_not_retried(self):
+        nonterminal = reply('glm', text=json.dumps(SUMMARY))
+        nonterminal['choices'][0]['finish_reason'] = 'length'
+        tool = reply('glm', [('write', {'path': 'forbidden', 'content': 'x'})])
+        for response in ((503, {}), (200, nonterminal), (200, tool), (200, {})):
+            self.session = self.root / f'fail-fast-{len(self.requests)}.jsonl'
+            (self.repo / 'effects.txt').write_text('')
+            self.responses.clear()
+            before = len(self.requests)
+            self.responses.extend([
+                (200, reply('glm', [('bash', {'command': "echo done >> effects.txt; printf '%09000d' 0"})])),
+                response,
+                (200, reply('glm', text=json.dumps(SUMMARY))),
+            ])
+            p = self.run_cli('glm')
+            self.assertEqual(p.returncode, 3, p.stderr)
+            self.assertEqual(len(self.requests) - before, 2)
+            self.assertEqual(len(self.checkpoints()), 0)
+            self.assertFalse((self.repo / 'forbidden').exists())
+            self.assertEqual((self.repo / 'effects.txt').read_text(), 'done\n')
+
+    def test_format_and_size_failures_share_one_repair_allowance(self):
+        invalid = 'CONFIDENTIAL_INVALID_SUMMARY'
+        oversize = json.dumps({**SUMMARY, 'pending': ['x' * 2000]})
+        for failures in ((invalid, invalid), (invalid, oversize), (oversize, invalid)):
+            self.session = self.root / f'mixed-{len(self.requests)}.jsonl'
+            (self.repo / 'effects.txt').write_text('')
+            self.responses.clear()
+            state = self.queue_task('glm', rounds=1)
+            original = self.responses[0][1]
+            def serve(body):
+                normal = original(body)
+                if not body['tools']:
+                    return reply('glm', text=failures[min(state['summaries'] - 1, 1)])
+                return normal
+            self.responses[:] = [(200, serve)] * 50
+            p = self.run_cli('glm')
+            self.assertEqual(p.returncode, 3, p.stderr)
+            self.assertEqual(state['summaries'], 2)
+            self.assertEqual(state['actions'], 1)
+            self.assertEqual(self.usage(p)['requests'], 3)
+            self.assertEqual(len(self.checkpoints()), 0)
+            self.assertNotIn(invalid, self.session.read_text() + p.stderr)
+            self.assertEqual((self.repo / 'effects.txt').read_text(), 'step0\n')
+
     def test_repair_allowance_is_per_compaction_and_reserves_action_turn(self):
-        for mode in ('later_fragment', 'budget', 'tool_reply'):
+        for mode in ('later_fragment', 'budget', 'tool_reply', 'format_later_fragment', 'format_budget'):
             with self.subTest(mode=mode):
                 self.session = self.root / f'repair-limit-{mode}.jsonl'
                 self.responses.clear()
@@ -199,11 +284,13 @@ class Compaction(fixture.Fixture):
                         n = state['summaries']
                         if mode == 'tool_reply' and n == 2:
                             return reply('glm', [('write', {'path': 'forbidden', 'content': 'x'})])
+                        if mode.startswith('format_') and (n == 1 or (mode == 'format_later_fragment' and n == 3)):
+                            return reply('glm', text='not JSON')
                         if n == 1 or (mode == 'later_fragment' and n == 3):
                             return reply('glm', text=json.dumps({**SUMMARY, 'pending': ['x' * 2000]}))
                     return normal
                 self.responses[:] = [(200, serve)] * 50
-                if mode == 'budget':
+                if mode in ('budget', 'format_budget'):
                     p = subprocess.run([str(fixture.BIN), '--cwd', str(self.repo), '--session', str(self.session),
                                         '--provider', 'glm', '--model', 'fixture', '--compact-at-bytes', '8192',
                                         '--max-turns', '3', '-p', 'ORIGINAL_GOAL'], env=self.env('glm'),
@@ -211,7 +298,8 @@ class Compaction(fixture.Fixture):
                 else:
                     p = self.run_cli('glm')
                 self.assertEqual(p.returncode, 3, p.stderr)
-                self.assertEqual(state['summaries'], {'budget': 1, 'later_fragment': 3, 'tool_reply': 2}[mode])
+                self.assertEqual(state['summaries'], {'budget': 1, 'later_fragment': 3, 'tool_reply': 2,
+                                                            'format_budget': 1, 'format_later_fragment': 3}[mode])
                 self.assertEqual(state['actions'], 1)
                 self.assertEqual(len(self.checkpoints()), 0)
                 self.assertFalse((self.repo / 'forbidden').exists())

@@ -70,7 +70,7 @@ resume. The existing Pi fixture continues to validate basic interchange.
 If summarization, validation, checkpoint persistence or output rendering fails,
 the run stops. A failed or interrupted summary never authorizes tools or creates
 a partial checkpoint. Resume reads the original history or the last complete
-checkpoint; there is no automatic ACK, tool replay or journal repair. A bounded summary-size retry is described below.
+checkpoint; there is no automatic ACK, tool replay or journal repair. A bounded checkpoint-format/size retry is described below.
 
 ## Limits and accounting
 
@@ -166,13 +166,19 @@ one request/1,447 tokens. This is one bounded fixture, not evidence that every
 long task or provider will avoid repetition. Compaction remains opt-in and
 experimental. Original failed-run evidence above is retained.
 
-## Oversize summary recovery
+## Checkpoint format and size recovery
 
-A terminal, schema-valid JSON checkpoint exceeding its byte allowance gets at
-most one size-repair request **per compaction**, shared across all fragments.
-The retry uses the same original evidence and prior valid checkpoint, with a
-smaller target size; it never substitutes or truncates an invalid summary. The
-longer retry prompt is included when choosing wire-sized fragments. Both attempts
-consume the shared turn budget and reserve an action request. No partial journal
-checkpoint is written. Invalid JSON/schema, tool calls, transport errors and a
-second oversize response still stop; this is not a general provider retry policy.
+A terminal text response with invalid JSON, an invalid five-field schema, or an
+oversize checkpoint gets at most one repair request **per compaction**, shared
+across all fragments and all three failure kinds. The retry uses the same
+original evidence and previous valid checkpoint with stricter JSON instructions
+and a smaller target size. It never feeds back the invalid response, strips
+markdown fences, guesses missing fields, or truncates evidence. This improves
+format recovery without guaranteeing that a model will return valid JSON.
+
+The longer repair prompt is included when choosing wire-sized fragments. Both
+attempts consume the existing turn/time budgets, with one action turn reserved.
+Only a fully validated summary can be committed. Tool calls, nonterminal replies,
+invalid response envelopes and transport errors still stop immediately. A second
+format/schema/size failure anywhere in the same compaction stops and retains the
+original journal; this is not a general provider retry policy.
