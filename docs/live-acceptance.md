@@ -78,3 +78,25 @@ interruption recovery remain covered by offline E2E tests, not induced live.
 
 For forced repeated compaction, add `--compact-at-bytes 16384`; see
 [the stress workflow and its larger budgets](compaction.md#validation).
+
+## Failure report
+
+A retained `result.json` with `status: "failed"` includes `completed_runs`, the
+number of invocations that passed **all** their own acceptance checks (0..2),
+and a fixed `failure_stage` value:
+
+| Stage | Meaning | Completed runs |
+| --- | --- | --- |
+| `first_run_execution` | First process launch, capture, or nonzero exit | 0 |
+| `first_run_validation` | First output/usage/journal/workspace validation | 0 |
+| `resume_execution` | Resumed process launch, capture, or nonzero exit | 1 |
+| `resume_validation` | Resumed output/usage/context/workspace validation | 1 |
+| `final_stress_validation` | Final checkpoint-count check or report persistence | 2 |
+
+Receiving valid usage alone does not count a run as complete. Failure stops
+continuation without retry; the passed report schema stays unchanged. The new
+fields use local constants and counters, not raw exception text, provider output,
+or credentials. Programmatic callers still receive the original exception when
+failure-report persistence succeeds. If storage itself fails, a report may not
+be available. Preflight/setup errors before the run reporting block may likewise
+produce no `result.json`; the CLI continues to print a generic failure message.
