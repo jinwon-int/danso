@@ -197,7 +197,8 @@ Each suite row identifies its selector and actual `tests_run`, `failure_events`,
 not the count for any one module. Subtest failures and class-setup errors are
 **events**, not distinct failed tests; do not subtract them to invent a passed
 count. A zero-test suite is unsuccessful. Skips and expected failures retain
-unittest semantics and remain visible. Import failures produce error results.
+unittest semantics and remain visible. Import failures produce error results;
+exceptions raised directly during loading record zero runs and one error event.
 
 Save a plain JSON receipt (test output and diagnostics go to stderr):
 

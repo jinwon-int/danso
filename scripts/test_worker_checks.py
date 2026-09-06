@@ -68,6 +68,18 @@ class Receipts(unittest.TestCase):
         self.assertFalse(row['successful'])
         checks.validate_receipt(receipt)
 
+    def test_loader_exceptions_produce_failed_receipt_and_continue(self):
+        for error in (SyntaxError('PRIVATE fixture'), RuntimeError('PRIVATE fixture')):
+            loader = unittest.TestLoader()
+            with patch.object(loader, 'loadTestsFromName', side_effect=[error, unittest.TestSuite()]), contextlib.redirect_stderr(io.StringIO()):
+                receipt = checks.run_suites(['broken', 'empty'], loader)
+            self.assertEqual([row['selector'] for row in receipt['suites']], ['broken', 'empty'])
+            self.assertEqual(receipt['tests_run'], 0)
+            self.assertEqual(receipt['suites'][0]['error_events'], 1)
+            self.assertFalse(receipt['successful'])
+            self.assertNotIn('PRIVATE', json.dumps(receipt))
+            checks.validate_receipt(receipt)
+
     def test_missing_test_is_error_not_missing_receipt(self):
         with contextlib.redirect_stderr(io.StringIO()):
             receipt = checks.run_suites(['nonexistent_danso_fixture_module'])

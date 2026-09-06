@@ -18,8 +18,16 @@ def run_suites(selectors, loader=None):
     # unittest diagnostics and test prints never enter the JSON stdout channel.
     with contextlib.redirect_stdout(sys.stderr):
         for selector in selectors:
-            result = unittest.TextTestRunner(stream=sys.stderr, verbosity=2).run(
-                loader.loadTestsFromName(selector))
+            try:
+                suite = loader.loadTestsFromName(selector)
+            except Exception:
+                # Imports/load_tests may raise errors unittest's loader does not
+                # wrap. Preserve the failed selector without inventing test runs.
+                print('ERROR: could not load selected suite: ' + selector, file=sys.stderr)
+                rows.append({'selector': selector, **{key: 0 for key in COUNTERS},
+                             'error_events': 1, 'successful': False})
+                continue
+            result = unittest.TextTestRunner(stream=sys.stderr, verbosity=2).run(suite)
             rows.append({'selector': selector, 'tests_run': result.testsRun,
                          'failure_events': len(result.failures), 'error_events': len(result.errors),
                          'skipped': len(result.skipped), 'expected_failures': len(result.expectedFailures),
