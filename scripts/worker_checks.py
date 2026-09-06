@@ -89,21 +89,45 @@ def compare_counts(receipt, claims):
             'checks_successful': receipt['successful'], 'differences': differences}
 
 
+def compare_partial_counts(receipt, claims):
+    validate_receipt(receipt)
+    if type(claims) is not dict or not claims:
+        raise ValueError('claims must be a nonempty JSON object')
+    actual = {row['selector']: row['tests_run'] for row in receipt['suites']}
+    unknown = set(claims) - set(actual)
+    if unknown or any(type(count) is not int or count < 0 for count in claims.values()):
+        # bool counts fail here: type(True) is bool, not int.
+        raise ValueError('claims must use receipt selectors with nonnegative integer counts')
+    differences = [{'selector': row['selector'], 'reported': claims[row['selector']],
+                    'actual': row['tests_run']}
+                   for row in receipt['suites'] if row['selector'] in claims
+                   and claims[row['selector']] != row['tests_run']]
+    unreported = [row['selector'] for row in receipt['suites'] if row['selector'] not in claims]
+    return {'version': 1, 'counts_match': not differences,
+            'checks_successful': receipt['successful'], 'differences': differences,
+            'unreported_selectors': unreported}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--json', action='store_true')
     mode.add_argument('--compare-counts', metavar='JSON', help='compare claimed counts with a receipt on stdin; never run tests')
+    mode.add_argument('--compare-partial-counts', metavar='JSON',
+                      help='compare a subset of claimed counts with a receipt on stdin; never run tests')
     parser.add_argument('selectors', nargs='*')
     args = parser.parse_args(argv)
-    if args.compare_counts is not None:
+    if args.compare_counts is not None or args.compare_partial_counts is not None:
         if args.selectors:
             parser.error('comparison does not accept test selectors')
         try:
             raw = sys.stdin.read(1024 * 1024 + 1)
             if len(raw) > 1024 * 1024:
                 raise ValueError('receipt too large')
-            result = compare_counts(parse_json(raw), parse_json(args.compare_counts))
+            if args.compare_counts is not None:
+                result = compare_counts(parse_json(raw), parse_json(args.compare_counts))
+            else:
+                result = compare_partial_counts(parse_json(raw), parse_json(args.compare_partial_counts))
         except (ValueError, TypeError, RecursionError):
             parser.error('invalid receipt or claimed counts')
         print(json.dumps(result), flush=True)
