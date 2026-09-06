@@ -111,6 +111,22 @@ provider, worker resources in the executor, and whole-run cancellation in the
 process supervisor. Embedders calling `runtime::run` supply their own whole-run
 timeout and cancellation supervisor; they must not assume CLI signal handling.
 
+## Worker request-budget guidance
+
+Every action request receives run-local system guidance with `remaining` (including
+that request), `total`, and `summary_requests`. Checkpoint fragments and their
+repair attempts consume the same `max_turns` allowance. After compaction the
+runtime recomputes the guidance before checking the exact serialized request
+size. It does not reserve extra requests or relax the existing exhaustion gate.
+
+The guidance asks the worker to prioritize unfinished edits, required checks and
+an accurate final report, and to leave a request for inspecting tool results.
+With one request left, a tool response cannot receive a follow-up model response.
+This is advisory: it neither proves task completion nor authorizes skipping
+validation. Token and time limits are separate. Guidance is not journaled or
+summarized; a resumed run starts with its own fresh budget. Offline tests verify
+accounting and provider transport; improved live task completion is unproven.
+
 ## Executable example and regression gates
 
 [`tests/extensibility.rs`](../tests/extensibility.rs) supplies a new scripted

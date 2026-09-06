@@ -2,6 +2,7 @@
 """Checkpoint compaction across real sandboxes and local fake providers only."""
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import threading
@@ -56,6 +57,22 @@ class Compaction(fixture.Fixture):
     def checkpoints(self):
         return [e for e in self.records() if e.get('customType') == 'danso.compaction.v1']
 
+    def assert_budget_requests(self, provider, requests, total):
+        summaries = 0
+        for index, body in enumerate(requests):
+            system = (body['system'] if provider == 'anthropic' else
+                      body['instructions'] if provider == 'openai' else body['messages'][0]['content'])
+            if not body['tools']:
+                summaries += 1
+                self.assertNotIn('Runtime request budget for this run:', system)
+                continue
+            counters = re.findall(r'Runtime request budget for this run: remaining=(\d+), total=(\d+), summary_requests=(\d+)\.', system)
+            self.assertEqual(counters, [(str(total - index), str(total), str(summaries))])
+            self.assertIn('Remaining includes this request', system)
+            self.assertIn('no follow-up model request', system)
+            self.assertIn('report incomplete work and omitted checks honestly', system)
+        self.assertNotIn('Runtime request budget for this run:', self.session.read_text())
+
     def queue_task(self, provider, rounds=3, bad_summary=None, duplicate=False):
         state = {'actions': 0, 'summaries': 0, 'action_requests': [], 'summary_requests': []}
         def serve(body):
@@ -80,11 +97,13 @@ class Compaction(fixture.Fixture):
                 (self.repo / 'effects.txt').write_text('')
                 self.responses.clear()
                 state = self.queue_task(provider)
+                start = len(self.requests)
                 p = self.run_cli(provider)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 self.assertEqual((self.repo / 'effects.txt').read_text(), 'step0\nstep1\nstep2\n')
                 self.assertEqual(len(self.checkpoints()), 3)
                 self.assertGreaterEqual(state['summaries'], 3)
+                self.assert_budget_requests(provider, self.requests[start:], 32)
                 for body in state['summary_requests'] + state['action_requests']:
                     # Parsed JSON canonical separators match serde for these ASCII fixtures.
                     self.assertLessEqual(len(json.dumps(body, separators=(',', ':'), ensure_ascii=False).encode()), 8192)
@@ -104,6 +123,7 @@ class Compaction(fixture.Fixture):
                 p = self.run_cli(provider)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 self.assertEqual(len(self.requests), count + 1)
+                self.assert_budget_requests(provider, self.requests[count:], 32)
                 self.assertEqual(self.usage(p)['requests'], 1)
                 self.assertTrue(self.session.read_bytes().startswith(before))
                 self.assertEqual((self.repo / 'effects.txt').read_text(), 'step0\nstep1\nstep2\n')
@@ -114,6 +134,47 @@ class Compaction(fixture.Fixture):
                 self.assertEqual(p.returncode, 3, p.stderr)
                 self.assertIn('duplicate tool call id', p.stderr)
                 self.assertFalse((self.repo / 'forbidden').exists())
+
+    def test_budget_guidance_without_compaction_and_at_final_request(self):
+        for provider in ('anthropic', 'openai', 'glm'):
+            for total in (1, 2, 128):
+                with self.subTest(provider=provider, total=total):
+                    self.session = self.root / f'budget-{provider}-{total}.jsonl'
+                    start = len(self.requests)
+                    self.responses.clear()
+                    self.responses.append((200, reply(provider, [('write', {'path': 'effect', 'content': 'once'})])))
+                    if total > 1:
+                        self.responses.append((200, reply(provider)))
+                    p = fixture.Fixture.run_cli(self, provider, '--max-turns', str(total))
+                    self.assertEqual(p.returncode, 3 if total == 1 else 0, p.stderr)
+                    self.assertEqual(len(self.requests) - start, min(total, 2))
+                    self.assertEqual((self.repo / 'effect').read_text(), 'once')
+                    self.assert_budget_requests(provider, self.requests[start:], total)
+                    if total == 1:
+                        self.assertIn('"category":"request_budget"', p.stderr)
+                        self.assertEqual(len(self.checkpoints()), 0)
+
+    def test_budget_guidance_counts_summary_repairs(self):
+        for provider in ('anthropic', 'openai', 'glm'):
+            with self.subTest(provider=provider):
+                self.session = self.root / f'budget-repair-{provider}.jsonl'
+                self.responses.clear()
+                start = len(self.requests)
+                state = self.queue_task(provider, rounds=1)
+                original = self.responses[0][1]
+                def serve(body):
+                    normal = original(body)
+                    if not body['tools'] and state['summaries'] == 1:
+                        return reply(provider, text='invalid checkpoint JSON')
+                    return normal
+                self.responses[:] = [(200, serve)] * 50
+                p = self.run_cli(provider)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertGreaterEqual(state['summaries'], 2)
+                self.assertEqual(len(self.checkpoints()), 1)
+                self.assert_budget_requests(provider, self.requests[start:], 32)
+                for body in self.requests[start:]:
+                    self.assertLessEqual(len(json.dumps(body, separators=(',', ':'), ensure_ascii=False).encode()), 8192)
 
     def test_live_acceptance_stress_path_offline(self):
         actions = [('read', {'path': 'add.sh'}), ('read', {'path': 'test.sh'}),

@@ -64,7 +64,7 @@ pub async fn run(
         .map(|d| d.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let system = format!(
+    let base_system = format!(
         "You are a headless coding worker. Use only {names}. Skills are loaded using read. Prefer targeted line-range reads and searches over whole-file dumps. After compaction, continue from recorded progress; re-read only missing or changed information.{}",
         input.context
     );
@@ -79,7 +79,9 @@ pub async fn run(
     .map_err(at(Kind::Output))?;
     messages.push(user);
     let mut remaining = input.max_turns;
+    let mut summary_requests = 0;
     while remaining > 0 {
+        let mut system = budget_system(&base_system, input.max_turns, remaining, summary_requests);
         async {
             if let Some(limit) = input.compact_at_bytes {
                 let before = provider
@@ -106,6 +108,7 @@ pub async fn run(
                         "current request and instructions leave no compaction budget"
                     );
                     session.check_recovery().map_err(at(Kind::Session))?;
+                    let before_summary = remaining;
                     let summary = crate::compaction::summarize(
                         provider,
                         &messages,
@@ -114,6 +117,11 @@ pub async fn run(
                         usage,
                     )
                     .await?;
+                    summary_requests += before_summary - remaining;
+                    // Rebuild after all summary fragments/repairs, then size the
+                    // exact instructions that the next action request will use.
+                    system =
+                        budget_system(&base_system, input.max_turns, remaining, summary_requests);
                     let compacted = crate::compaction::checkpoint_messages(&summary, &messages)?;
                     let after = provider
                         .request_bytes(&ModelRequest {
@@ -223,6 +231,13 @@ pub async fn run(
     Err(at(Kind::RequestBudget)(anyhow::anyhow!(
         "turn budget exhausted"
     )))
+}
+
+/// Run-local guidance, never journal history: resume receives a fresh budget.
+fn budget_system(base: &str, total: u32, remaining: u32, summaries: u32) -> String {
+    format!(
+        "{base}\nRuntime request budget for this run: remaining={remaining}, total={total}, summary_requests={summaries}. Remaining includes this request; each model request consumes one slot, including checkpoint fragments and repair attempts. Future compaction also consumes these slots. This is a request limit, not a token or time allowance. Prioritize unfinished edits, required checks, and an accurate final report; avoid repeating reads unless information is missing or state changed. Reserve a request after tools to inspect their results and report. If remaining=1, there is no follow-up model request after any tools you call. Never skip required validation silently or claim unexecuted checks passed; report incomplete work and omitted checks honestly."
+    )
 }
 
 pub(crate) fn tool_calls(message: &Value) -> Result<Vec<ToolCall>> {
