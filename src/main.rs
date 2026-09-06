@@ -3,6 +3,7 @@ use clap::Parser;
 use cli::Args;
 use danso::{
     app,
+    failure::{self, Kind},
     output::{PrintSink, report_usage},
     tools,
     usage::Usage,
@@ -40,6 +41,7 @@ fn main() {
             let code = e.exit_code();
             e.print().ok();
             if code != 0 {
+                failure::report(Kind::Configuration, code);
                 report_usage(&Usage::default());
             }
             std::process::exit(code);
@@ -54,12 +56,12 @@ fn main() {
     let mut sink = PrintSink(args.output_mode());
     let code = runtime.block_on(async {
         tokio::select! {
-            code = interrupted() => { eprintln!("run interrupted"); code },
+            code = interrupted() => { eprintln!("run interrupted"); failure::report(Kind::Interrupted, code); code },
             result = tokio::time::timeout(Duration::from_secs(args.timeout_seconds), app::run(&config, &mut sink, &mut usage)) => {
                 match result {
                     Ok(Ok(())) => 0,
-                    Ok(Err(e)) => { eprintln!("{e:#}"); if usage.attempted { 3 } else { 2 } },
-                    Err(_) => { eprintln!("run timed out"); 124 },
+                    Ok(Err(e)) => { let code = if usage.attempted { 3 } else { 2 }; eprintln!("{e:#}"); failure::report(failure::category(&e).unwrap_or(Kind::Configuration), code); code },
+                    Err(_) => { eprintln!("run timed out"); failure::report(Kind::RunTimeout, 124); 124 },
                 }
             }
         }

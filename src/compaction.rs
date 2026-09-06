@@ -1,4 +1,5 @@
 //! Append-only model checkpoints. Summaries are historical data, never authority.
+use crate::failure::{Kind, at};
 use crate::{
     provider::{ModelRequest, Provider},
     usage::Usage,
@@ -161,10 +162,11 @@ pub async fn summarize(
     let mut offset = 0;
     let mut summary = Value::Null;
     for part in 0..MAX_CHUNKS {
-        ensure!(
-            *remaining > 1,
-            "turn budget exhausted during compaction (one action turn reserved)"
-        );
+        if *remaining <= 1 {
+            return Err(at(Kind::RequestBudget)(anyhow::anyhow!(
+                "turn budget exhausted during compaction (one action turn reserved)"
+            )));
+        }
         let rest = &ledger[offset..];
         let boundaries: Vec<usize> = rest
             .char_indices()
@@ -204,10 +206,11 @@ pub async fn summarize(
         let input = make(end);
         let mut repairing = false;
         summary = loop {
-            ensure!(
-                *remaining > 1,
-                "turn budget exhausted during compaction (one action turn reserved)"
-            );
+            if *remaining <= 1 {
+                return Err(at(Kind::RequestBudget)(anyhow::anyhow!(
+                    "turn budget exhausted during compaction (one action turn reserved)"
+                )));
+            }
             *remaining -= 1;
             let response = provider
                 .complete(
@@ -218,7 +221,8 @@ pub async fn summarize(
                     },
                     usage,
                 )
-                .await?;
+                .await
+                .map_err(at(Kind::Provider))?;
             ensure!(
                 response["role"] == "assistant" && response["stopReason"] == "stop",
                 "checkpoint response is not terminal text"

@@ -2,6 +2,7 @@ pub mod app;
 pub mod compaction;
 pub mod context;
 pub mod contracts;
+pub mod failure;
 pub mod output;
 pub mod provider;
 pub mod runtime;

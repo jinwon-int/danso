@@ -54,7 +54,7 @@ async def _wait_owned(task):
             cancelled = True
 
 
-def _usage(stderr):
+def _usage(stderr, *, allow_zero=False):
     groups = [[line.split('=', 1)[1] for line in stderr.splitlines()
                if line.startswith(prefix + '=')] for prefix in ('DANSO_USAGE', 'PIRI_USAGE')]
     if any(len(group) != 1 for group in groups):
@@ -65,10 +65,63 @@ def _usage(stderr):
     keys = ('requests', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'totalTokens')
     if any(type(a.get(k)) is not int or not 0 <= a[k] <= 2**64 - 1 for k in keys):
         raise ValueError('invalid usage')
-    if a['requests'] < 1 or a['totalTokens'] != sum(a[k] for k in keys[1:-1]):
+    if (a['requests'] < 1 and not allow_zero) or a['totalTokens'] != sum(a[k] for k in keys[1:-1]):
         raise ValueError('invalid usage totals')
+    if a['requests'] == 0 and a['totalTokens'] != 0:
+        raise ValueError('invalid zero-request usage')
     # Do not relay arbitrary fields, model strings, or the zero cost placeholder.
     return {k: a[k] for k in keys}
+
+
+FAILURE_CATEGORIES = {
+    'configuration', 'session', 'sandbox', 'provider', 'provider_timeout',
+    'compaction', 'request_budget', 'output', 'runtime', 'run_timeout', 'interrupted',
+}
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate diagnostic key')
+        result[key] = value
+    return result
+
+
+def _failure(stderr, code):
+    # Native enums only: error text, URLs and provider response bodies are never
+    # used to guess a category or included in the event.
+    text = stderr.decode('utf-8', errors='replace')
+    lines = [line[len('DANSO_ERROR='):] for line in text.splitlines()
+             if line.startswith('DANSO_ERROR=')]
+    category = 'run_timeout' if code == 124 else 'failed'
+    if len(lines) == 1:
+        try:
+            diagnostic = json.loads(lines[0], object_pairs_hook=_unique_object)
+            if (type(diagnostic) is not dict or set(diagnostic) != {'version', 'category', 'exit_code'}
+                    or type(diagnostic['version']) is not int or diagnostic['version'] != 1
+                    or type(diagnostic['exit_code']) is not int or diagnostic['exit_code'] != code
+                    or not isinstance(diagnostic['category'], str)
+                    or diagnostic['category'] not in FAILURE_CATEGORIES):
+                raise ValueError('invalid diagnostic')
+            candidate = diagnostic['category']
+            expected = (124,) if candidate == 'run_timeout' else (
+                (129, 130, 143) if candidate == 'interrupted' else (2, 3))
+            if code not in expected:
+                raise ValueError('inconsistent diagnostic')
+            category = candidate
+        except (ValueError, TypeError, RecursionError):
+            pass
+    counts = ''
+    try:
+        usage = _usage(text, allow_zero=True)
+        counts = f", reported_requests={usage['requests']}, reported_tokens={usage['totalTokens']}"
+    except (ValueError, TypeError, RecursionError):
+        pass
+    label = 'timeout' if category == 'run_timeout' else category
+    return ErrorEvent(code='danso_' + label, message=(
+        f'Worker failed: category={category}, exit_code={code}{counts}. '
+        'Reported usage may omit failed requests; not a total attempt count. No automatic replay.'))
 
 
 class DansoRuntime:
@@ -179,9 +232,10 @@ class DansoSession:
                 if self._interrupted:
                     events.append(ErrorEvent(code='danso_cancelled', message='Worker interrupted; journal retained. No automatic replay.'))
                 elif code != 0:
-                    label = 'timeout' if code == 124 else 'failed'
-                    events.append(ErrorEvent(code='danso_' + label, message='Worker did not complete; inspect its private journal. No automatic replay.'))
+                    events.append(_failure(stderr, code))
                 else:
+                    if any(line.startswith(b'DANSO_ERROR=') for line in stderr.splitlines()):
+                        raise ValueError('failure diagnostic on successful exit')
                     text = stdout.decode('utf-8').strip()
                     usage = _usage(stderr.decode('utf-8'))
                     if not text:

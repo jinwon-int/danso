@@ -84,6 +84,7 @@ impl Provider for Anthropic {
             .json(&body)
             .send()
             .await
+            .map_err(classify_transport)
             .context("provider request failed")?;
         ensure!(
             response.status().is_success(),
@@ -93,7 +94,7 @@ impl Provider for Anthropic {
         // Bounded response accumulation, including chunked responses.
         let mut response = response;
         let mut bytes = vec![];
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response.chunk().await.map_err(classify_transport)? {
             ensure!(
                 bytes.len() + chunk.len() <= 1024 * 1024,
                 "provider response exceeds 1 MiB"
@@ -208,4 +209,13 @@ fn assistant(response: &Value, model: &str) -> Result<Value> {
     Ok(
         json!({"role":"assistant", "content":content,"api":"anthropic-messages","provider":"anthropic","model":model,"timestamp":millis(),"stopReason":stop,"usage":{"input":n("input_tokens"),"output":n("output_tokens"),"cacheRead":n("cache_read_input_tokens"),"cacheWrite":n("cache_creation_input_tokens"),"totalTokens":n("input_tokens")+n("output_tokens")+n("cache_read_input_tokens")+n("cache_creation_input_tokens"),"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}),
     )
+}
+
+fn classify_transport(error: reqwest::Error) -> anyhow::Error {
+    let kind = if error.is_timeout() {
+        crate::failure::Kind::ProviderTimeout
+    } else {
+        crate::failure::Kind::Provider
+    };
+    crate::failure::at(kind)(error.into())
 }
