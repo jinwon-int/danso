@@ -15,6 +15,15 @@ PROVIDERS = {
     'glm': ('ZAI_API_KEY', 'DANSO_GLM_BASE_URL'),
 }
 EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
+# Fixed allowlist for result.json failure_stage. Never populated from
+# exception text, provider output, or any other runtime string.
+FAILURE_STAGES = (
+    'first_run_execution',
+    'first_run_validation',
+    'resume_execution',
+    'resume_validation',
+    'final_stress_validation',
+)
 
 BROKEN = '#!/bin/bash\nprintf "%s\\n" "$(($1 - $2))"\n'
 FIXED = BROKEN.replace('$1 - $2', '$1 + $2')
@@ -115,7 +124,10 @@ def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None
     env = {'PATH': '/usr/bin:/bin', 'HOME': str(home)}
     env.update({k: provider_env[k] for k in (key_name, base_name) if k in provider_env})
     summaries = []
+    accepted = 0
+    stage = None
     try:
+        stage = 'first_run_execution'
         first_bytes = None
         for index, prompt in enumerate(prompts, 1):
             command = [str(binary), '--cwd', str(repo), '--session', str(session),
@@ -126,11 +138,13 @@ def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None
                 command[1:1] = ['--compact-at-bytes', str(compact_at_bytes)]
             if reasoning_effort is not None:
                 command[1:1] = ['--reasoning-effort', reasoning_effort]
+            stage = 'first_run_execution' if index == 1 else 'resume_execution'
             # Danso supervises its workers; allow its own timeout to finish first.
             result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=315 if compact_at_bytes else 195)
             save(root / f'run-{index}.stdout', result.stdout)
             save(root / f'run-{index}.stderr', result.stderr)
             require(result.returncode == 0, f'run {index} failed (exit {result.returncode})')
+            stage = 'first_run_validation' if index == 1 else 'resume_validation'
             require(bool(result.stdout.strip()), 'empty final answer')
             summaries.append(usage(result.stderr))
             transcript = read_regular(session)
@@ -161,6 +175,8 @@ def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None
                 require(summaries[-1]['requests'] == 1, 'resume usage includes extra responses')
                 require(all(read_regular(repo / name) == body for name, body in snapshot.items()),
                         'resume changed workspace')
+            accepted += 1
+        stage = 'final_stress_validation'
         compactions = sum(e.get('customType') == 'danso.compaction.v1' for e in entries)
         if compact_at_bytes is not None:
             require(compactions >= 2, 'expected multiple compactions')
@@ -169,7 +185,10 @@ def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None
              'runs': summaries, 'cost': 'unknown; costUsd=0 is a compatibility placeholder'}, indent=2) + '\n')
         return root
     except Exception:
-        save(root / 'result.json', json.dumps({'status': 'failed', 'completed_runs': len(summaries)}) + '\n')
+        failure = {'status': 'failed', 'completed_runs': accepted}
+        if stage in FAILURE_STAGES:
+            failure['failure_stage'] = stage
+        save(root / 'result.json', json.dumps(failure) + '\n')
         raise
 
 
