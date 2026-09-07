@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Subscription adapter: synthetic Codex credentials, loopback SSE, real Danso tools."""
 import base64
+import copy
 import socket
 import json
 import os
@@ -17,6 +18,20 @@ def token(exp=None, account='fixture-account'):
 
 def sse(value):
     return ('event: response.completed\ndata: ' + json.dumps({'type': 'response.completed', 'response': value}) + '\n\n').encode()
+
+
+def item_events(value):
+    return b''.join(('data: ' + json.dumps({'type': 'response.output_item.done',
+                       'output_index': i, 'item': item}) + '\n\n').encode()
+                    for i, item in enumerate(value['output']))
+
+
+def streamed_items(value, omit_output=False):
+    terminal = copy.deepcopy(value)
+    terminal['output'] = []
+    if omit_output:
+        del terminal['output']
+    return item_events(value) + sse(terminal)
 
 
 class ChatGPT(Fixture):
@@ -72,6 +87,46 @@ class ChatGPT(Fixture):
         self.assertEqual(self.auth.read_bytes(), original)
         self.assert_private(p)
         self.assertIn('openai-codex', p.stdout + p.stderr)
+
+    def test_streamed_items_survive_empty_terminal_tools_and_resume(self):
+        self.exercise_streamed_items(False)
+
+    def test_streamed_items_survive_omitted_terminal_output(self):
+        self.exercise_streamed_items(True)
+
+    def exercise_streamed_items(self, omit_output):
+        values = [response('openai', [('write', {'path': 'streamed', 'content': 'ok'})]),
+                  response('openai', text='done'), response('openai', text='resumed')]
+        self.responses = [(200, streamed_items(v, omit_output)) for v in values]
+        p = self.invoke()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual((self.repo / 'streamed').read_text(), 'ok')
+        p = self.invoke()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.requests), 3)
+        for item in values[0]['output'] + values[1]['output']:
+            self.assertIn(item, self.requests[2]['input'])
+        self.assert_private(p)
+
+    def test_streamed_item_conflicts_never_execute_tools(self):
+        value = response('openai', [('write', {'path': 'unsafe-stream', 'content': 'bad'})])
+        terminal = copy.deepcopy(value)
+        terminal['output'] = []
+        events = item_events(value)
+        gap = ('data: ' + json.dumps({'type': 'response.output_item.done',
+               'output_index': 2, 'item': value['output'][1]}) + '\n\n').encode()
+        conflict = copy.deepcopy(value)
+        conflict['output'][1]['arguments'] = '{"path":"other","content":"bad"}'
+        for i, data in enumerate([events + events + sse(terminal), gap + sse(terminal),
+                                  events + sse(conflict), events]):
+            with self.subTest(i=i):
+                self.session = self.root / f'item-failure{i}.jsonl'
+                self.responses = [(200, data)]
+                p = self.invoke()
+                self.assertNotEqual(p.returncode, 0)
+                self.assertFalse((self.repo / 'unsafe-stream').exists())
+                self.assertFalse((self.repo / 'other').exists())
+                self.assert_private(p)
 
     def test_invalid_credentials_fail_before_dispatch(self):
         for changes in ({'auth_mode': 'apikey'}, {'OPENAI_API_KEY': 'SECRET'}, {'tokens': {}},
