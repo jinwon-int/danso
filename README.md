@@ -72,6 +72,10 @@ See [issues](https://github.com/jinwon-int/danso/issues) for the v0 slice.
 
 ## Development checks
 
+For frozen Danso/Pi comparison plans and honest paired result accounting, see
+[harness evaluation](docs/harness-evaluation.md). The offline tool does not run
+agents or claim a measured performance advantage.
+
 Inside a Danso coding worker, run `python3 scripts/dev_check.py --profile worker`
 for the Python subset. On the host, run `python3 scripts/dev_check.py --profile host`
 for all required Rust and sandbox integration checks. Worker success does not
