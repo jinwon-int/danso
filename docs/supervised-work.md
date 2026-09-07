@@ -1,123 +1,120 @@
 # Supervised first use on a small real task
 
-This is a practical walkthrough for a human supervisor running Danso once on a
-small, low-impact coding task. It assumes a built binary
-(`cargo build --release --locked` on the host), `/usr/bin/bwrap` available, and
-that you will stay present for the whole run. It does not cover deployment,
-unattended operation, or fleet use, and completing it does not prove that Danso
-is ready to run without supervision.
+Use this workflow for one small change in trusted code, with a supervisor
+available to inspect the result. It does not deploy anything or establish
+unattended readiness. Building Danso requires the toolchain described in the
+[README](../README.md#build-and-run); running it requires functioning bubblewrap.
 
-## 1. Choose one bounded, low-impact task
+## Define acceptance first
 
-Pick a single change that is small enough to review line by line and cheap to
-discard, for example:
+Choose a small bug fix, regression test, or documentation update. Write down
+the files in scope, expected behavior, checks to run, and what must stay
+unchanged. For a bug fix, require a regression test that fails before the fix
+and passes afterward. Include these criteria in the task prompt.
 
-- fix one failing unit test,
-- add one missing input validation with a test,
-- update one stale comment or doc paragraph.
+## Prepare the binary and an isolated worktree
 
-Before starting, write down the acceptance criteria in one or two sentences,
-for example: "the new test fails before the change and passes after it; no
-other test changes." If you cannot state the acceptance criteria before
-running, the task is not bounded enough yet.
-
-## 2. Prepare an isolated worktree and a session outside the workspace
-
-Run against a dedicated branch in an isolated worktree so the main checkout is
-untouched:
+Replace both `/path/to/...` placeholders below. Build in the trusted Danso
+checkout and keep its absolute binary path before changing directories:
 
 ```sh
-cd /path/to/your-project            # PLACEHOLDER: target repository
-git worktree add ../project-supervised-danso -b danso-supervised-trial
+cd /path/to/danso
+cargo build --release --locked
+DANSO_BIN="$(pwd -P)/target/release/danso"
+"$DANSO_BIN" --help
+
+cd /path/to/your-project
+git worktree add -b danso-supervised-trial ../project-supervised-danso
 cd ../project-supervised-danso
-mkdir -p "$HOME/.danso/sessions"    # outside the workspace, parent must exist
 ```
 
-The `--session` path must be outside the workspace and its parent directory
-must already exist.
+Choose unused branch and worktree names. Check the target repository's
+instructions and source before allowing `--trust-project`; this flag enables
+project instruction/skill loading for the invocation, not additional tool access.
+Keep the default sandbox and do not pass `--unsafe-no-sandbox`.
 
-## 3. Choose the provider and model explicitly
-
-This example uses the GLM adapter. `ZAI_API_KEY` must be supplied externally
-through your existing credential mechanism; Danso performs no credential
-discovery. Pick a concrete tool-capable GLM model available to your account —
-the model is always explicit and never inferred from a name:
+Create a fresh session directory outside the target workspace. The following
+assumes `$HOME/.danso/sessions` is outside that workspace; choose another
+external parent if necessary. Preserve this directory as run evidence.
 
 ```sh
-export ZAI_API_KEY='...'            # PLACEHOLDER: your external credential mechanism
-MODEL=YOUR_GLM_MODEL                # PLACEHOLDER: choose a supported model
+mkdir -p "$HOME/.danso/sessions"
+SESSION_DIR="$(mktemp -d "$HOME/.danso/sessions/supervised.XXXXXX")"
+SESSION_PATH="$SESSION_DIR/session.jsonl"
 ```
 
-Keep the default bubblewrap sandbox. Do not pass `--unsafe-no-sandbox`.
-`--trust-project` only allows reading the project's `AGENTS.md` and skill
-metadata for this invocation; it is not a general permission grant.
+A new task uses a new session path; reusing an existing path resumes its
+conversation. Do not accidentally attach an unrelated task to an old session.
 
-## 4. Run with explicit finite budgets
+## Run one bounded task
 
-Set turn and time budgets so the run cannot loop indefinitely
-(`--max-turns` defaults to 16; per-request timeout defaults to 60 seconds):
+Supply `ZAI_API_KEY` externally through your existing credential mechanism.
+Do not put credentials in the prompt or repository. Replace the model and task
+placeholders before running; use a tool-capable GLM model your account supports.
 
 ```sh
-target/release/danso \
+# ZAI_API_KEY is already supplied in the environment.
+MODEL=YOUR_GLM_MODEL
+TASK='REPLACE with the bounded task, allowed files, and acceptance criteria.'
+"$DANSO_BIN" \
   --provider glm --model "$MODEL" \
   --cwd . --trust-project \
-  --session "$HOME/.danso/sessions/supervised-trial.jsonl" \
-  --max-turns 8 \
-  --timeout-seconds 300 \
-  --tool-timeout-seconds 30 \
-  -p 'Add input validation for VALUE in module X with a unit test. Acceptance: the new test fails before the change, passes after, and no other test changes.'
+  --session "$SESSION_PATH" \
+  --max-turns 32 --timeout-seconds 600 \
+  --provider-timeout-seconds 120 --tool-timeout-seconds 30 \
+  -p -- "$TASK"
 ```
 
-See `--help` for every documented option, including `--provider`,
-`--reasoning-effort`, `--provider-timeout-seconds` and
-`--compact-at-bytes`. Without `-p`/`--print`, output is JSONL.
+These are finite request and time budgets, not a monetary cost limit or a
+completion guarantee. `-p` prints the final answer; default output is JSONL.
+See [provider options](providers.md) for model-specific reasoning settings.
+Record elapsed time, usage, the final report, and the original journal. A final
+success message alone does not establish that acceptance criteria were met.
 
-## 5. Inspect the result yourself
-
-Review the working tree and the journal — never trust the summary line alone:
+## Inspect and validate before merging
 
 ```sh
-git -C . status
-git -C . diff
-head -n 5 "$HOME/.danso/sessions/supervised-trial.jsonl"
+git status --short
+git diff --stat
+git diff
 ```
 
-Re-run the acceptance criteria you wrote in step 1 against the actual diff.
+Read new untracked files listed by `git status` too: ordinary `git diff` does
+not show their contents. Check every changed file against the prewritten
+scope and acceptance criteria, including tests and documentation.
 
-## 6. Run the checks in order: worker subset, then the full host gate
-
-A worker-subset PASS is a subset only; it does not replace the host gate:
+When the target is Danso itself, use its two check profiles:
 
 ```sh
-# Inside a Danso coding worker (Python subset only):
+# Inside the coding worker: Python subset only.
 python3 scripts/dev_check.py --profile worker
 
-# On the host, before merging, run the full gate (never a fallback subset):
-cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked && cargo build --locked
+# On the host: full required gate, including Rust and sandbox integration.
 python3 scripts/dev_check.py --profile host
 ```
 
-Repos without Danso's own scripts: substitute your project's real test suite
-and treat its exit status as the gate.
+The host needs Cargo/rustfmt/clippy and bubblewrap. A worker PASS is only a
+subset; it does not cover Rust or the full integration gate. For another
+project, use that project's documented checks and record anything omitted.
+Inspect both exit status and actual test results, including the per-selector
+receipt counts when available. Reproduce the original bug with the new test
+before treating the fix as verified.
 
-## 7. Require independent review before merging
+Require an independent reviewer to examine the diff, test evidence, and
+remaining limitations before merging. A reviewer may be another person or a
+separate review agent; the author must not be the sole reviewer. Merge remains
+a separate decision after required repository checks and approvals. This guide
+does not automate merge or deployment.
 
-Another person reviews the `git diff` and the acceptance criteria before
-merge. Do not automate the merge or any deployment in this workflow, and do
-not add automation for it.
+## Interrupted or unresolved operations
 
-## Interrupted tools and unresolved operations
+If a tool's effect is uncertain, stop. Do not automatically retry or replay it,
+or edit the journal to manufacture a settled state. Inspect workspace effects
+and preserve the original journal. For an unresolved operation, start a new
+session only after deciding what completed, and include that explicit context
+in the new task. A completed, fully settled session can resume normally.
+See the [session and recovery contract](v0.md#session-and-recovery).
 
-If a run is interrupted while a tool call is uncertain, do not automatically
-replay it. Danso preserves the durable operation order and fails closed on an
-unresolved call; recovery is a manual decision described in the
-[v0 contract](v0.md#session-and-recovery). Inspect the journal, decide whether the effect
-happened, and resolve it by hand before continuing the session.
-
-## Scope of this guide
-
-Following these steps neither deploys anything nor demonstrates unattended
-readiness. Live provider acceptance is validated separately via the
-[opt-in live acceptance workflow](live-acceptance.md); this guide's example run
-is a supervised trial, not such acceptance.
+This supervised task workflow is separate from the narrow, opt-in
+[live provider acceptance check](live-acceptance.md). Passing either does not
+prove general coding quality or unattended readiness.
