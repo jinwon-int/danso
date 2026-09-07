@@ -413,6 +413,12 @@ pub(super) async fn access(path: &Path, base: &str, timeout: u64) -> Result<(Str
         "ChatGPT refresh changed account"
     );
     v["last_refresh"] = json!(chrono::Utc::now().to_rfc3339());
+    // The exchange yielded to other processes: re-check ownership before any
+    // refreshed token is installed or used for inference. Keep pending on drift.
+    ensure!(
+        !dir.exists("auth.json")?,
+        "Codex auth.json reappeared during refresh; reauthentication into a new isolated store required"
+    );
     dir.replace(&v)?;
     dir.rename_new(
         PENDING,

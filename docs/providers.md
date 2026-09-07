@@ -230,8 +230,11 @@ original as `codex-auth-imported-<uuid>.json`, and installs the managed file wit
 no overwrite. Both credentials are preserved locally; the original `auth.json`
 name is retired so Codex no longer discovers it. Re-running adoption never
 overwrites an existing managed store. The `danso-auth.json` basename is reserved
-for adopted stores; a moved managed file is rejected. If `auth.json` reappears,
-Danso stops until ownership is resolved. This prevents normal shared-file use,
+for adopted stores; a moved managed file is rejected. If `auth.json` is detected at inspection or after a refresh exchange,
+Danso stops until ownership is resolved. The post-exchange check runs before
+installing or using refreshed credentials; the pending marker remains on drift.
+These checks cannot make a non-cooperating external writer obey the lock, so
+the quiescent isolated-home precondition remains necessary. This prevents normal shared-file use,
 not a malicious process running as the same OS user.
 
 Each managed inspection and renewal reads under `.danso-auth.lock`. A concurrent

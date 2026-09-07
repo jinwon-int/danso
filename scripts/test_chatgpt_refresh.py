@@ -186,6 +186,23 @@ class Refresh(Fixture):
         self.assertNotEqual(self.invoke().returncode, 0)
         self.assertEqual(self.requests, [])
 
+    def test_codex_source_reappearance_during_refresh_blocks_install_and_inference(self):
+        self.adopted()
+        original_managed = self.managed.read_bytes()
+        def recreate(_):
+            self.source.write_text(json.dumps(self.original))
+            self.source.chmod(0o600)
+            return self.fresh()
+        self.responses = [(200, recreate)]
+        p = self.invoke()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.paths, ['/codex/oauth/token'])
+        self.assertEqual(self.managed.read_bytes(), original_managed)
+        self.assertTrue((self.directory / '.danso-refresh-pending').exists())
+        self.assertNotEqual(self.invoke().returncode, 0)
+        self.assertEqual(len(self.requests), 1)
+        self.assert_private(p.stdout + p.stderr)
+
     def test_refresh_timeout_preserves_pending_and_does_not_retry(self):
         self.adopted()
         release = threading.Event()
