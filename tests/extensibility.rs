@@ -338,3 +338,75 @@ async fn execution_context_has_an_independent_bounded_budget() {
         }
     }
 }
+
+struct BoundarySink {
+    path: std::path::PathBuf,
+    states: Vec<String>,
+    fail_start: bool,
+}
+impl EventSink for BoundarySink {
+    fn emit(&mut self, event: Event<'_>) -> Result<()> {
+        let state = match event {
+            Event::ToolStarted(_) => "started",
+            Event::ToolSettled { is_error } => {
+                assert!(!is_error);
+                "settled"
+            }
+            _ => return Ok(()),
+        };
+        let bytes = fs::read_to_string(&self.path)?;
+        let last: Value = serde_json::from_str(bytes.lines().last().unwrap())?;
+        assert_eq!(last["data"]["state"], state);
+        self.states.push(state.into());
+        if self.fail_start && state == "started" {
+            bail!("progress channel failed");
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn progress_follows_durable_markers_and_cannot_authorize_effects() {
+    for fail_start in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry.register(ProbeTool(calls.clone())).unwrap();
+        let executor = TestExecutor {
+            registry,
+            session_path: path.clone(),
+            preflight_fails: false,
+        };
+        let mut provider = provider(vec![
+            tool_message("p1"),
+            json!({"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}),
+        ]);
+        let mut sink = BoundarySink {
+            path,
+            states: vec![],
+            fail_start,
+        };
+        let outcome = runtime::run(
+            input(),
+            &mut provider,
+            &executor,
+            &mut session,
+            &mut sink,
+            &mut Usage::default(),
+        )
+        .await;
+        if fail_start {
+            assert!(outcome.is_err());
+            assert!(calls.borrow().is_empty());
+            assert_eq!(sink.states, ["started"]);
+            assert!(session.check_recovery().is_err());
+        } else {
+            outcome.unwrap();
+            assert_eq!(calls.borrow().len(), 1);
+            assert_eq!(sink.states, ["started", "settled"]);
+            session.check_recovery().unwrap();
+        }
+    }
+}

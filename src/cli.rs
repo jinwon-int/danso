@@ -29,6 +29,9 @@ pub struct Args {
     /// Final answer only; equivalent to --mode text.
     #[arg(short = 'p', long)]
     pub print: bool,
+    /// Select JSONL output with body-free durable tool progress notifications.
+    #[arg(long, conflicts_with = "print")]
+    pub progress_jsonl: bool,
     /// Allow reading project AGENTS.md and skill metadata for this invocation.
     #[arg(long)]
     pub trust_project: bool,
@@ -68,7 +71,9 @@ impl Args {
         }
     }
     pub fn output_mode(&self) -> danso::output::Mode {
-        if self.print || matches!(self.mode, Mode::Text) {
+        if self.progress_jsonl {
+            danso::output::Mode::Json
+        } else if self.print || matches!(self.mode, Mode::Text) {
             danso::output::Mode::Text
         } else {
             danso::output::Mode::Json

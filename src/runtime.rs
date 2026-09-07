@@ -213,6 +213,8 @@ pub async fn run(
             session
                 .record_operation(&call.id, OperationState::Started)
                 .map_err(at(Kind::Session))?;
+            sink.emit(Event::ToolStarted(&call.name))
+                .map_err(at(Kind::Output))?;
             let outcome = match executor.execute(&call).await {
                 Ok(result) => result,
                 Err(e) => crate::contracts::ToolOutcome {
@@ -230,6 +232,10 @@ pub async fn run(
             session
                 .record_operation(&call.id, OperationState::Settled)
                 .map_err(at(Kind::Session))?;
+            sink.emit(Event::ToolSettled {
+                is_error: outcome.is_error,
+            })
+            .map_err(at(Kind::Output))?;
             messages.push(result);
         }
     }

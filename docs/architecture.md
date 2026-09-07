@@ -150,6 +150,7 @@ python3 scripts/test_dev_check.py
 python3 scripts/test_worker_checks.py
 python3 scripts/test_dev_check_host.py
 python3 scripts/test_ccc_node.py
+python3 scripts/test_progress.py
 python3 scripts/test_harness_eval.py
 ```
 
