@@ -48,6 +48,7 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
         self.seen = []; self.reply_status = 200; self.delay = 0; self.streaming = False
         self.payload = json.dumps(response()).encode()
+        self.trailing = b''
         self.server = await asyncio.start_server(self.upstream, '127.0.0.1', 0)
         self.endpoint = ('127.0.0.1', self.server.sockets[0].getsockname()[1])
         self.gates = []
@@ -74,6 +75,7 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
             else:
                 writer.write((f'HTTP/1.1 {self.reply_status} Result\r\nContent-Type: application/json\r\n'
                               f'Content-Length: {len(self.payload)}\r\n\r\n').encode()+self.payload)
+            writer.write(self.trailing)
             await writer.drain()
         except (OSError, asyncio.IncompleteReadError):
             pass
@@ -209,6 +211,56 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
         frame=b'data: '+json.dumps({'type':'response.completed','response':response()}).encode()+b'\n\n'
         self.assertIsNone(e.usage(frame+frame,'text/event-stream',200))
         self.assertIsNone(e.usage(frame[:-1],'text/event-stream',200))
+
+    async def test_empty_and_rejected_only_jobs_remain_incomplete(self):
+        gate = await self.gate()
+        self.assertFalse(gate.summary()['complete'])
+        self.assertIsNone(gate.summary()['total_tokens'])
+        self.assertEqual((await self.call(gate, token='wrong'))[0], 400)
+        await gate.close()
+        summary = json.loads((gate.evidence/'summary.json').read_text())
+        self.assertFalse(summary['complete'])
+        self.assertIsNone(summary['total_tokens'])
+
+    async def test_concurrent_close_survives_cancelled_waiter(self):
+        gate = await self.gate(); self.delay = 2
+        caller = asyncio.create_task(self.call(gate))
+        for _ in range(100):
+            if self.seen: break
+            await asyncio.sleep(.01)
+        self.assertEqual(len(self.seen), 1)
+        first = asyncio.create_task(gate.close())
+        second = asyncio.create_task(gate.close())
+        await asyncio.sleep(0)
+        first.cancel()
+        await asyncio.wait_for(second, 1)
+        await asyncio.gather(first, caller, return_exceptions=True)
+        await gate.close()
+        self.assertEqual(gate.fd, -1)
+        self.assertFalse(gate.tasks)
+        self.assertTrue((gate.evidence/'summary.json').is_file())
+
+    async def test_malformed_status_and_trailing_response_bytes_rejected(self):
+        for status, trailing, streaming in [('0200', b'', False),
+                                             (200, b'GARBAGE', False),
+                                             (200, b'GARBAGE', True)]:
+            gate = await self.gate()
+            self.reply_status, self.trailing, self.streaming = status, trailing, streaming
+            self.assertEqual((await self.call(gate))[0], 502)
+            self.assertFalse(gate.summary()['complete'])
+            self.assertIsNone(gate.summary()['total_tokens'])
+
+    async def test_start_failure_closes_journal_and_prevents_restart(self):
+        gate = e.DispatchGate(self.endpoint, self.root/'failed', model='gpt-6-astra')
+        fd = gate.fd
+        with patch.object(e.asyncio, 'start_server', side_effect=OSError('fixture')):
+            with self.assertRaises(OSError):
+                await gate.start()
+        self.assertEqual(gate.fd, -1)
+        with self.assertRaises(OSError): os.fstat(fd)
+        with self.assertRaises(ValueError): await gate.start()
+        await gate.close()
+        self.assertFalse(gate.summary()['complete'])
 
     async def test_real_danso_cli_uses_gate(self):
         gate=await self.gate()

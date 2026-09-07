@@ -250,11 +250,13 @@ Token totals are known only for a valid completed response with integer
 input and is not added again. Missing/error/malformed/truncated usage stays null
 for the whole run, even if another call succeeded. HTTP errors consume budget.
 `complete` describes dispatch accounting, not task success or acceptance success.
+Empty and rejected-only jobs remain incomplete with unknown usage.
 
 Both JSON and SSE responses are supported. This rehearsal implementation buffers
 up to 8 MiB before forwarding; it is not a token-arrival latency instrument.
 It requires bounded Content-Length or plain chunked upstream framing, no trailers,
-chunk extensions or compressed responses. Incoming requests require Content-Length;
+chunk extensions or compressed responses. The fixture must close the response
+connection within the deadline, with no trailing bytes after its framed body. Incoming requests require Content-Length;
 duplicate headers and unsupported framing fail closed. There are at most eight
 active handlers, a creation-relative job deadline, a per-request deadline and
 bounded connection cleanup. Client credentials/headers are not relayed upstream.

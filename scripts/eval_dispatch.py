@@ -139,6 +139,7 @@ class DispatchGate:
         self.server = None
         self.closed = False
         self.journal_ok = True
+        self.close_task = None
 
     def record(self, row):
         if row['state'] == 'started':
@@ -158,7 +159,11 @@ class DispatchGate:
 
     async def start(self):
         require(self.server is None and not self.closed)
-        self.server = await asyncio.start_server(self.admit, '127.0.0.1', 0, limit=HEADER_CAP)
+        try:
+            self.server = await asyncio.start_server(self.admit, '127.0.0.1', 0, limit=HEADER_CAP)
+        except BaseException:
+            await self.close()
+            raise
         self.port = self.server.sockets[0].getsockname()[1]
         return self
 
@@ -201,13 +206,14 @@ class DispatchGate:
             await writer.drain()
             line, fields = await headers(reader)
             protocol, status, _ = line.split(' ', 2)
-            require(protocol in ('HTTP/1.0', 'HTTP/1.1') and status.isdecimal())
+            require(protocol in ('HTTP/1.0', 'HTTP/1.1') and re.fullmatch(r'[0-9]{3}', status) is not None)
             status = int(status)
             require(200 <= status <= 599)
             content_type = fields.get('content-type', '')
             require(content_type.split(';')[0] in ('application/json', 'text/event-stream'))
             require(fields.get('content-encoding', 'identity') == 'identity')
             result = await body(reader, fields, response=True)
+            require(await reader.read(1) == b'')  # fixture must close; deadline still applies
             return status, content_type, result
         finally:
             await close_writer(writer)
@@ -261,7 +267,7 @@ class DispatchGate:
             await close_writer(writer)
 
     def summary(self):
-        settled = self.journal_ok and all(r['state'] == 'settled' for r in self.rows)
+        settled = bool(self.rows) and self.journal_ok and all(r['state'] == 'settled' for r in self.rows)
         return {'schema': 'danso.eval.dispatch.v1', 'reserved_attempts': len(self.rows),
                 'dispatch_attempts': sum(r['dispatch_attempted'] for r in self.rows),
                 'rejected_budget': self.rejected, 'complete': settled, 'journal_ok': self.journal_ok,
@@ -269,6 +275,11 @@ class DispatchGate:
                 if settled and all(r['total_tokens'] is not None for r in self.rows) else None}
 
     async def close(self):
+        if self.close_task is None:
+            self.close_task = asyncio.create_task(self._close())
+        await asyncio.shield(self.close_task)
+
+    async def _close(self):
         if self.fd < 0:
             return
         self.closed = True
