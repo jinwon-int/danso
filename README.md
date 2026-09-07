@@ -32,6 +32,12 @@ scenario, offline verification and authorized execution command.
 Choose GPT or GLM with `--provider openai` / `--provider glm`; see
 [provider configuration and examples](docs/providers.md).
 
+## Supervised first use
+
+For a guided single-run walkthrough on one small real task — bounded scope,
+predefined acceptance, isolated worktree, explicit budgets and review — see
+[supervised first use](docs/supervised-work.md).
+
 ## Long tasks
 
 Opt in to automatic context checkpoints with `--compact-at-bytes 196608`.

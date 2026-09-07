@@ -246,6 +246,7 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
     async def test_weak_state_and_symlink_resume_rejected(self):
         weak = self.root / 'weak'
         weak.mkdir(mode=0o755)
+        weak.chmod(0o755)  # mkdir mode is masked by umask (077 would yield 0700).
         with self.assertRaises(ValueError):
             DansoRuntime(binary=fixture.BIN, state_directory=weak, provider='glm',
                          model='fixture', environment=self.env('glm'))

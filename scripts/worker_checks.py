@@ -205,7 +205,7 @@ def main(argv=None):
                 result = compare_counts(parse_json(raw), parse_json(args.compare_counts))
             else:
                 result = compare_partial_counts(parse_json(raw), parse_json(args.compare_partial_counts))
-        except (ValueError, TypeError, RecursionError):
+        except (ValueError, TypeError, RecursionError, OSError):
             parser.error('invalid receipt or claimed counts')
         print(json.dumps(result), flush=True)
         return 0 if result['counts_match'] and result['checks_successful'] else 1

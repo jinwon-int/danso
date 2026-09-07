@@ -214,6 +214,26 @@ class PartialReports(unittest.TestCase):
                     json.dumps(self.receipt())[:-1] + ',"version":1}'):
             self.assertEqual(self.invoke('{"z":1}', raw=raw), (2, ''))
 
+    def test_stdin_read_error_is_invalid_input(self):
+        class FailingStdin:
+            def read(self, size):
+                raise OSError('synthetic stdin failure')
+        for mode in ('--compare-partial-counts', '--compare-counts'):
+            for claims in ('{"z":1}', '{"z":1,"a":2,"m":3}'):
+                with self.subTest(mode=mode, claims=claims):
+                    out, err = io.StringIO(), io.StringIO()
+                    with patch.object(checks, 'run_suites',
+                                      side_effect=AssertionError('comparison ran tests')), \
+                            patch.object(checks.sys, 'stdin', FailingStdin()), \
+                            contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        with self.assertRaises(SystemExit) as caught:
+                            checks.main([mode, claims])
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertEqual(out.getvalue(), '')
+                    self.assertIn('invalid receipt or claimed counts', err.getvalue())
+                    self.assertNotIn('OSError', err.getvalue())
+                    self.assertNotIn('synthetic', err.getvalue())
+
     def test_strict_comparison_unchanged(self):
         self.assertEqual(self.invoke('{"z":1}', mode='--compare-counts'), (2, ''))
         code, out = self.invoke('{"z":1,"a":2,"m":3}', mode='--compare-counts')
