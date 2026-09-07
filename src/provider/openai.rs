@@ -5,7 +5,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
 pub struct OpenAi {
-    http: Http,
+    http: Option<Http>,
+    chatgpt: Option<super::chatgpt::ChatGpt>,
     model: String,
     effort: Option<String>,
 }
@@ -21,7 +22,26 @@ impl OpenAi {
         timeout_seconds: u64,
     ) -> Result<Self> {
         Ok(Self {
-            http: Http::new(base, "responses", &key, timeout_seconds)?,
+            http: Some(Http::new(base, "responses", &key, timeout_seconds)?),
+            chatgpt: None,
+            model,
+            effort,
+        })
+    }
+    pub fn new_chatgpt(
+        model: String,
+        auth_file: &std::path::Path,
+        base: &str,
+        effort: Option<String>,
+        timeout_seconds: u64,
+    ) -> Result<Self> {
+        Ok(Self {
+            http: None,
+            chatgpt: Some(super::chatgpt::ChatGpt::new(
+                auth_file,
+                base,
+                timeout_seconds,
+            )?),
             model,
             effort,
         })
@@ -40,6 +60,10 @@ impl OpenAi {
         if let Some(effort) = &self.effort {
             body["reasoning"] = json!({"effort":effort});
         }
+        if self.chatgpt.is_some() {
+            body.as_object_mut().unwrap().remove("max_output_tokens");
+            body["stream"] = json!(true);
+        }
         Ok(body)
     }
 }
@@ -52,7 +76,21 @@ impl Provider for OpenAi {
     }
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
         let body = self.body(&request)?;
-        let response = self.http.post(&body, usage).await?;
+        let response = match &self.chatgpt {
+            Some(auth) => auth.post(&body, usage).await?,
+            None => {
+                self.http
+                    .as_ref()
+                    .context("missing OpenAI transport")?
+                    .post(&body, usage)
+                    .await?
+            }
+        };
+        let (provider, api) = if self.chatgpt.is_some() {
+            ("openai-codex", "openai-codex-responses")
+        } else {
+            ("openai", "openai-responses")
+        };
         let t = wire::tokens(
             &response["usage"],
             "input_tokens",
@@ -61,7 +99,7 @@ impl Provider for OpenAi {
         )?;
         let model = response["model"].as_str().unwrap_or(&self.model);
         usage.add(
-            "openai",
+            provider,
             model,
             crate::usage::TokenUsage {
                 input: t.input,
@@ -78,7 +116,7 @@ impl Provider for OpenAi {
             .as_array()
             .context("missing OpenAI output")?;
         let content = output_content(output)?;
-        let mut message = wire::message(content, "openai", "openai-responses", model, &t)?;
+        let mut message = wire::message(content, provider, api, model, &t)?;
         message["dansoOpenAIOutput"] = json!(output);
         Ok(message)
     }
@@ -143,7 +181,7 @@ fn history(messages: &[Value]) -> Result<Vec<Value>> {
                     ensure!(output_content(output)? == *blocks, "saved OpenAI output disagrees with transcript");
                     input.extend(output.iter().cloned());
                 } else {
-                    ensure!(m["api"] != "openai-responses", "OpenAI session lacks preserved output");
+                    ensure!(m["api"] != "openai-responses" && m["api"] != "openai-codex-responses", "OpenAI session lacks preserved output");
                     for b in blocks {
                         if b["type"] == "text" { input.push(json!({"role":"assistant","content":b["text"]})); }
                         else { input.push(json!({"type":"function_call","call_id":b["id"],"name":b["name"],

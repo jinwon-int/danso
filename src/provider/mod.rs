@@ -1,5 +1,6 @@
 //! Adapters translate Pi-compatible history to one provider's wire protocol.
 pub mod anthropic;
+mod chatgpt;
 pub mod glm;
 mod http;
 pub mod openai;

@@ -3,7 +3,7 @@
 Select the service with `--provider`; `--model` is always explicit. The original
 Anthropic path remains the default. These adapters use the same runtime,
 four builtin tools, sandbox, budgets, usage output and durable operation gates.
-All three paths are tested against local HTTP fixtures. Real account/model
+The original three paths are tested against local HTTP fixtures. Real account/model
 acceptance remains pending; no API access is inferred from a model name.
 
 | Provider | Wire API | Credential environment variable | Base URL environment variable | Default base (suffix appended) |
@@ -12,8 +12,9 @@ acceptance remains pending; no API access is inferred from a model name.
 | `openai` | OpenAI Responses | `OPENAI_API_KEY` | `DANSO_OPENAI_BASE_URL` | `https://api.openai.com/v1` (`/responses`) |
 | `glm` | Z.AI Chat Completions | `ZAI_API_KEY` | `DANSO_GLM_BASE_URL` | `https://api.z.ai/api/paas/v4` (`/chat/completions`) |
 
-Supply credentials through your existing environment mechanism. Danso does not
-read Codex/Claude login files, reuse plan credentials, or infer OAuth flows.
+Supply credentials through your existing environment mechanism. The original API-key adapters do not read login files. The separate opt-in
+`openai-codex` adapter below reads an explicitly selected Codex file; no adapter
+automatically discovers credentials or infers OAuth flows.
 Changing a base URL authorizes that destination to receive the corresponding
 key and task content. Use an API base, not the complete method URL. GPT/GLM bases
 reject URL credentials, query strings and fragments; only HTTPS or literal
@@ -141,3 +142,63 @@ on resume; sessions do not persist runtime timeout configuration.
 Example for a bounded GLM experiment: add `--provider-timeout-seconds 120
 --timeout-seconds 600` to the normal invocation. This enables comparison, not
 a claim that extending the timeout fixes service latency or task completion.
+
+## ChatGPT subscription (initial read-only credential adapter)
+
+`--provider openai-codex` keeps Danso's runtime, four tools, journal and execution
+backend. It does not invoke Codex or Pi to perform tasks. No additional runtime
+package is required. Initial login uses the official Codex device flow; the
+operator must provide `DANSO_CHATGPT_AUTH_FILE` explicitly. No API-key fallback,
+credential discovery, token printing, writes, automatic refresh or retries occur.
+This initial adapter is not an unattended long-running authentication solution.
+Token refresh management and Telegram configuration are follow-up work.
+
+```sh
+# Existing isolated Codex login completed by the operator; use its auth.json.
+export DANSO_CHATGPT_AUTH_FILE=/private/codex-login/auth.json
+target/debug/danso --provider openai-codex --model gpt-6-astra \
+  --reasoning-effort medium --cwd /path/to/repo --trust-project \
+  --session /outside/repo/session.jsonl -p 'Explain this repository'
+```
+
+The file must be a regular, single-link, current-user-owned file up to 64 KiB;
+its immediate parent and file must be owner-only. All path components reject
+symlinks. The adapter reads only the explicitly selected file. Its access token
+must contain an account ID matching the saved account and an expiry more than
+60 seconds in the future. Decoding JWT metadata is not signature validation;
+the service authenticates the bearer. An expired token stops before model
+requests: renew using Codex login in that isolated home and retry explicitly.
+Authentication is re-read before every model request; a changed account stops
+an in-progress run. No refresh token is sent anywhere. Keep auth outside the
+workspace; host-mode tools retain the invoking user's host permissions.
+
+Requests go to `https://chatgpt.com/backend-api/codex/responses`, using the
+subscription access token and account header, with `store:false` and SSE.
+`DANSO_CHATGPT_BASE_URL` permits that exact production base or literal-loopback
+HTTP test fixtures only; no arbitrary HTTPS token destinations. An explicit
+loopback override authorizes the local fixture to receive credentials/content.
+Never use a real login in fixture tests. Ordinary `OPENAI_API_KEY` and
+`DANSO_OPENAI_BASE_URL` are ignored for this adapter.
+
+The complete stream is bounded to 1 MiB and the normal provider timeout. Only
+one completed terminal response is accepted. Failed, incomplete, truncated,
+unknown or duplicate terminal events fail before any returned tool executes.
+The existing OpenAI output and opaque-reasoning validation still applies.
+No streamed delta is executed. Usage reports `openai-codex` and
+`openai-codex-responses`; terminal usage must be valid. The service's subscription
+request does not use the Platform adapter's `max_output_tokens:4096`; this
+adapter enforces byte, request deadline and run/turn limits, not a 4096-token
+server output cap. Token-based dispatch evaluation must account for this
+separately. Subscription model access/quality has not been verified by these
+synthetic tests; an authenticated login alone proves neither inference access
+nor availability of a particular model.
+
+Implementation evidence (public source, not a general Platform API guarantee):
+- OpenAI authentication: https://learn.chatgpt.com/docs/auth
+- Codex file schema and auth management at
+  https://github.com/openai/codex/tree/5ecb3afd1bf405149e2159bfda50093b0c1b5fab/codex-rs/login/src/auth
+- Pi subscription transport reference at
+  https://github.com/earendil-works/pi/blob/9767ba275f3e9a5ee0f5c5342249b629ab1b2282/packages/ai/src/api/openai-codex-responses.ts
+
+Offline gate: `python3 scripts/test_chatgpt.py` (fake tokens, loopback SSE,
+real native host tool execution and resume; no live requests).
