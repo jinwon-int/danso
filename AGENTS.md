@@ -44,3 +44,5 @@ module boundary; `app.rs` is the composition root and `runtime.rs` is agent poli
 - Include `python3 scripts/test_host_execution.py` for default host execution, lifecycle cleanup, and mock-provider resume. Retain explicit bubblewrap isolation regression coverage.
 
 - Include `python3 scripts/test_chatgpt.py` for explicit file authentication and terminal SSE subscription-provider regressions. Synthetic credentials and loopback only.
+
+- Include `python3 scripts/test_chatgpt_refresh.py` for explicit credential adoption and managed refresh failure/concurrency gates. Never use real credentials in tests.

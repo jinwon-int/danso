@@ -1,6 +1,8 @@
 //! Adapters translate Pi-compatible history to one provider's wire protocol.
 pub mod anthropic;
 mod chatgpt;
+mod chatgpt_auth;
+pub use chatgpt_auth::adopt as adopt_chatgpt_auth;
 pub mod glm;
 mod http;
 pub mod openai;

@@ -1,17 +1,9 @@
-//! Opt-in read-only Codex file credentials and bounded terminal SSE responses.
-//! No credential discovery, refresh, retry, or delegated agent execution.
+//! Explicit file credentials (read-only or adopted managed store) and bounded SSE.
+//! No credential discovery, model-request retry, or delegated agent execution.
 use super::http::Http;
 use anyhow::{Context, Result, bail, ensure};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
-use std::{
-    ffi::CString,
-    fs::File,
-    io::Read,
-    os::fd::{AsRawFd, FromRawFd},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
-    path::{Component, Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 pub struct ChatGpt {
     path: PathBuf,
@@ -33,7 +25,7 @@ impl ChatGpt {
                     && url.fragment().is_none()),
             "ChatGPT endpoint must be the Codex service or literal loopback HTTP fixture"
         );
-        let (token, account) = credentials(path)?;
+        let (token, account) = super::chatgpt_auth::inspect(path)?;
         Http::new(base, "responses", &token, timeout)?;
         Ok(Self {
             path: path.into(),
@@ -43,7 +35,8 @@ impl ChatGpt {
         })
     }
     pub async fn post(&self, body: &Value, usage: &mut crate::usage::Usage) -> Result<Value> {
-        let (token, account) = credentials(&self.path)?;
+        let (token, account) =
+            super::chatgpt_auth::access(&self.path, &self.base, self.timeout).await?;
         ensure!(
             account == self.account,
             "ChatGPT account changed during run; start a new run"
@@ -70,98 +63,6 @@ impl ChatGpt {
             .await?;
         terminal_response(&data)
     }
-}
-
-fn private_file(path: &Path) -> Result<File> {
-    ensure!(path.is_absolute(), "ChatGPT auth path must be absolute");
-    let mut dir = File::open("/")?;
-    let parts: Vec<_> = path.components().collect();
-    ensure!(parts.len() > 2, "invalid ChatGPT auth path");
-    for (index, part) in parts.iter().enumerate().skip(1) {
-        let Component::Normal(name) = part else {
-            bail!("ChatGPT auth path must be normalized")
-        };
-        let name = CString::new(name.as_bytes())
-            .map_err(|_| anyhow::anyhow!("invalid ChatGPT auth path"))?;
-        let last = index == parts.len() - 1;
-        let flags = libc::O_RDONLY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | if last { 0 } else { libc::O_DIRECTORY };
-        // Walk relative to pinned directory descriptors; no path component follows symlinks.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
-        ensure!(fd >= 0, "cannot open ChatGPT auth path safely");
-        let next = unsafe { File::from_raw_fd(fd) };
-        let meta = next.metadata()?;
-        if last || index == parts.len() - 2 {
-            ensure!(
-                meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
-                "ChatGPT auth file and parent must be owner-only and owned by current user"
-            );
-        }
-        if last {
-            ensure!(
-                meta.is_file() && meta.nlink() == 1 && meta.len() <= 64 * 1024,
-                "ChatGPT auth must be a private regular file up to 64 KiB"
-            );
-            return Ok(next);
-        }
-        dir = next;
-    }
-    bail!("invalid ChatGPT auth path")
-}
-
-fn credentials(path: &Path) -> Result<(String, String)> {
-    let mut file = private_file(path)?;
-    let before = file.metadata()?;
-    let mut bytes = Vec::new();
-    (&mut file)
-        .take(64 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .context("cannot read ChatGPT auth")?;
-    let after = file.metadata()?;
-    ensure!(
-        bytes.len() <= 64 * 1024
-            && before.len() == after.len()
-            && before.mtime_nsec() == after.mtime_nsec()
-            && before.mtime() == after.mtime(),
-        "ChatGPT auth changed while reading"
-    );
-    let v: Value =
-        serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid ChatGPT auth JSON"))?;
-    ensure!(
-        (v["auth_mode"].is_null() || v["auth_mode"] == "chatgpt") && v["OPENAI_API_KEY"].is_null(),
-        "ChatGPT file authentication required; API keys are not subscription credentials"
-    );
-    let token = v["tokens"]["access_token"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .context("missing ChatGPT access token")?;
-    let account = v["tokens"]["account_id"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .context("missing ChatGPT account ID")?;
-    let parts: Vec<_> = token.split('.').collect();
-    ensure!(parts.len() == 3, "invalid ChatGPT access token format");
-    let payload = URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .map_err(|_| anyhow::anyhow!("invalid ChatGPT token metadata"))?;
-    let claims: Value = serde_json::from_slice(&payload)
-        .map_err(|_| anyhow::anyhow!("invalid ChatGPT token metadata"))?;
-    // Metadata is not signature verification: the service authenticates the bearer.
-    ensure!(
-        claims["https://api.openai.com/auth"]["chatgpt_account_id"] == account,
-        "ChatGPT account metadata mismatch"
-    );
-    let exp = claims["exp"]
-        .as_i64()
-        .context("missing ChatGPT token expiry")?;
-    ensure!(
-        exp > chrono::Utc::now().timestamp().saturating_add(60),
-        "ChatGPT authentication expired or expires within 60 seconds; renew using Codex login then retry explicitly"
-    );
-    Ok((token.into(), account.into()))
 }
 
 fn completed_prefix(data: &[u8]) -> Result<Option<usize>> {
