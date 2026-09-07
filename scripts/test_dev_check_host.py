@@ -3,9 +3,50 @@
 from pathlib import Path
 import shutil
 import json
+import os
+import subprocess
+import sys
 import unittest
 
 import test_e2e as e2e
+import test_dev_check as profile_tests
+
+
+class PipedOutput(unittest.TestCase):
+    SCRIPT = Path(__file__).with_name('dev_check.py')
+    DRIVER = '''
+import importlib.util
+import sys
+spec = importlib.util.spec_from_file_location('candidate', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+child = "import sys; print('child-stdout', flush=True); print('child-stderr', file=sys.stderr, flush=True); sys.exit(int(sys.argv[1]))"
+module.commands = lambda profile: [[sys.executable, '-c', child, sys.argv[2]]]
+raise SystemExit(module.main(sys.argv[3:]))
+'''
+
+    def test_real_children_keep_piped_streams_and_banner_order(self):
+        # StringIO cannot reveal a buffered parent banner overtaken by a child
+        # writing to the inherited pipe. Use real children, but never Cargo/API.
+        for profile, structured in profile_tests.OutputContract.MODES:
+            for child_exit in (0, 9):
+                with self.subTest(profile=profile, structured=structured, child_exit=child_exit):
+                    command = [sys.executable, '-I', '-B', '-c', self.DRIVER,
+                               str(self.SCRIPT), str(child_exit), '--profile', profile]
+                    if structured:
+                        command.append('--json')
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=10,
+                                            env={'PATH': os.defpath})
+                    stdout = '' if structured else profile_tests.OutputContract.BANNERS[profile]
+                    stdout += 'child-stdout\n'
+                    stderr = 'child-stderr\n'
+                    if child_exit:
+                        stderr += 'FAIL: development check stopped; no remaining checks were run.\n'
+                    elif not structured:
+                        stdout += f'PASS: {profile} checks only.\n'
+                    self.assertEqual(result.returncode, 1 if child_exit else 0, result.stderr)
+                    self.assertEqual(result.stdout, stdout)
+                    self.assertEqual(result.stderr, stderr)
 
 
 class WorkerSandbox(unittest.TestCase):

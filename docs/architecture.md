@@ -201,6 +201,30 @@ unit tests only. The real-sandbox case lives in `test_dev_check_host.py`, which
 both the host profile and CI execute explicitly. Broad unittest discovery still
 includes host-only modules; it is not a worker check.
 
+`test_dev_check.OutputContract` checks the wrapper's existing non-`--list`
+behavior with synthetic child checks. Plain worker/host modes preserve their
+stdout banner and final PASS line; worker `--json` adds neither stdout nor stderr
+on success. Child stdout and stderr stay on their original streams. A nonzero
+child exit or start failure returns 1, emits the fixed stderr diagnostic without
+raw exception text, and stops the remaining checks, including after a prior
+check succeeded. Host `--json` rejects with exit 2 and no stdout or check effects.
+The contract is part of both development profiles and CI, and can run alone:
+
+```sh
+cd scripts && python3 -m unittest test_dev_check.OutputContract -v
+```
+
+The host-only `test_dev_check_host.PipedOutput` complements these mocks with
+real Python children and captured OS pipes on success and nonzero exit. It checks
+that a flushed plain-mode banner arrives before child output; an in-memory
+stream cannot expose this buffering regression. The child environment excludes
+ambient credentials and Python unbuffered-output settings. No Cargo or provider
+is invoked by these synthetic children.
+
+These output checks do not assess generated-test coverage, documentation quality,
+or model efficiency. Do not infer whole-task acceptance from their PASS or alter
+a measured candidate to make it pass.
+
 Bash tools start with `pipefail`: `failing_check | tail` returns a failure even
 when `tail` succeeds. This preserves pipeline failure status without enabling
 `errexit` or stopping later commands. `failing_check; echo done`, explicit
