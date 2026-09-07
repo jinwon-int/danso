@@ -201,3 +201,68 @@ pub fn discover(cwd: &Path, home: &Path, trusted: bool) -> Result<ContextFiles> 
     out.add("</available_skills>\nRead the skill file before using its instructions.\n")?;
     Ok(out)
 }
+
+/// Read only an explicitly selected private file. Pin every parent and the file
+/// descriptor: pathname checks alone allow symlink swaps before open. This does
+/// not grant tool read access or enable project instruction discovery.
+pub fn private_system_context(path: &Path, cwd: &Path) -> Result<String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    use std::path::Component;
+    ensure!(
+        path.is_absolute() && !path.starts_with(cwd),
+        "system context must be absolute and outside workspace"
+    );
+    let parts: Vec<_> = path.components().collect();
+    ensure!(
+        parts.len() > 1
+            && parts[0] == Component::RootDir
+            && parts[1..].iter().all(|p| matches!(p, Component::Normal(_))),
+        "invalid system context path"
+    );
+    let mut file = fs::File::open("/")?;
+    for (i, part) in parts[1..].iter().enumerate() {
+        let name = CString::new(part.as_os_str().as_bytes())?;
+        let final_part = i == parts.len() - 2;
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if final_part {
+                libc::O_NONBLOCK
+            } else {
+                libc::O_DIRECTORY
+            };
+        let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+        ensure!(fd >= 0, "system context unavailable");
+        file = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    let info = file.metadata()?;
+    ensure!(
+        info.is_file()
+            && info.uid() == unsafe { libc::geteuid() }
+            && info.mode() & 0o777 == 0o600
+            && info.nlink() == 1
+            && info.len() <= 32768,
+        "system context requires an owner-only bounded regular file"
+    );
+    let mut value = String::new();
+    (&mut file)
+        .take(32769)
+        .read_to_string(&mut value)
+        .map_err(|_| anyhow::anyhow!("system context must be valid UTF-8"))?;
+    let after = file.metadata()?;
+    ensure!(
+        info.len() == after.len()
+            && info.mtime() == after.mtime()
+            && info.mtime_nsec() == after.mtime_nsec()
+            && info.ctime() == after.ctime()
+            && info.ctime_nsec() == after.ctime_nsec(),
+        "system context changed while reading"
+    );
+    ensure!(
+        !value.trim().is_empty() && value.len() <= 32768,
+        "invalid system context size"
+    );
+    Ok(value)
+}
