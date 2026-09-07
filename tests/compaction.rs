@@ -90,6 +90,7 @@ async fn checkpoint_persistence_failure_prevents_next_provider_request() {
     let mut provider = Summarizer { calls: 0 };
     let error = runtime::run(
         RunInput {
+            no_tools: false,
             prompt: "continue",
             context: "",
             execution_context: "",

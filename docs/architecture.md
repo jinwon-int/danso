@@ -373,3 +373,14 @@ history or directly copied into the journal. Model responses can still quote
 memory. The flag does not enable project trust or mount this file for tools.
 Host tools retain normal user filesystem permissions; this is not a sandbox.
 No memory extraction, storage backend, or automatic recall search is added.
+
+## Tool-free extraction calls
+
+`--no-tools` advertises an empty tool list and rejects any tool call returned by
+the provider before journaling the assistant call or starting an operation.
+Executor preflight is skipped because no tool can run. Session recovery, provider
+validation, time/request limits and usage accounting still apply. This flag is
+run-local and must be supplied on every invocation. It does not suppress context
+discovery: isolated callers should use an empty HOME/workspace and omit
+`--trust-project`. Private extraction inputs can use `--system-context-file`
+without putting their contents in command arguments.

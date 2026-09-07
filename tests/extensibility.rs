@@ -117,6 +117,7 @@ fn provider(replies: Vec<Value>) -> ScriptedProvider {
 }
 fn input() -> RunInput<'static> {
     RunInput {
+        no_tools: false,
         prompt: "use the probe",
         context: "",
         execution_context: "",
@@ -318,6 +319,7 @@ async fn execution_context_has_an_independent_bounded_budget() {
         let execution = "e".repeat(execution_bytes);
         let result = runtime::run(
             RunInput {
+                no_tools: false,
                 context: &project,
                 execution_context: &execution,
                 ..input()
@@ -407,6 +409,53 @@ async fn progress_follows_durable_markers_and_cannot_authorize_effects() {
             assert_eq!(calls.borrow().len(), 1);
             assert_eq!(sink.states, ["started", "settled"]);
             session.check_recovery().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_tools_skips_executor_but_rejects_unsolicited_calls_before_persistence() {
+    for malicious in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+        let calls = Rc::new(RefCell::new(vec![]));
+        let mut registry = Registry::default();
+        registry.register(ProbeTool(calls.clone())).unwrap();
+        let executor = TestExecutor {
+            registry,
+            session_path: path,
+            preflight_fails: true,
+        };
+        let reply = if malicious {
+            tool_message("forbidden")
+        } else {
+            json!({"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"})
+        };
+        let mut provider = provider(vec![reply]);
+        let mut sink = RecordingSink::default();
+        let mut usage = Usage::default();
+        let mut request = input();
+        request.no_tools = true;
+        let result = runtime::run(
+            request,
+            &mut provider,
+            &executor,
+            &mut session,
+            &mut sink,
+            &mut usage,
+        )
+        .await;
+        assert_eq!(result.is_err(), malicious);
+        assert_eq!(provider.requests[0]["tools"], json!([]));
+        assert!(calls.borrow().is_empty());
+        assert!(session.tool_call_ids().unwrap().is_empty());
+        session.check_recovery().unwrap();
+        if malicious {
+            assert_eq!(sink.messages.len(), 1);
+            assert!(sink.final_answers.is_empty());
+        } else {
+            assert_eq!(sink.final_answers.len(), 1);
         }
     }
 }
