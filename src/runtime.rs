@@ -10,6 +10,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
 pub struct RunInput<'a> {
+    pub no_tools: bool,
     pub prompt: &'a str,
     pub context: &'a str,
     pub execution_context: &'a str,
@@ -62,8 +63,12 @@ pub async fn run(
     provider
         .validate_history(&messages)
         .map_err(at(Kind::Provider))?;
-    executor.preflight().await.map_err(at(Kind::Sandbox))?;
-    let definitions = executor.definitions();
+    let definitions = if input.no_tools {
+        Vec::new()
+    } else {
+        executor.preflight().await.map_err(at(Kind::Sandbox))?;
+        executor.definitions()
+    };
     let names = definitions
         .iter()
         .map(|d| d.name.as_str())
@@ -175,6 +180,10 @@ pub async fn run(
                 "provider must return an assistant message"
             );
             let calls = tool_calls(&message)?;
+            ensure!(
+                !input.no_tools || calls.is_empty(),
+                "tools are disabled for this invocation"
+            );
             ensure!(
                 !calls.is_empty()
                     || message["stopReason"] == "stop"

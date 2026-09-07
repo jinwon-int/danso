@@ -87,6 +87,7 @@ async fn provider_sizing_failure_keeps_category_at_every_compaction_boundary() {
         };
         let error = runtime::run(
             RunInput {
+                no_tools: false,
                 prompt: "continue",
                 context: "",
                 execution_context: "",

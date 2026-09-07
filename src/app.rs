@@ -20,6 +20,7 @@ pub struct RunConfig {
     pub provider: String,
     pub reasoning_effort: Option<String>,
     pub trust_project: bool,
+    pub no_tools: bool,
     pub system_context_file: Option<PathBuf>,
     pub unsafe_no_sandbox: bool,
     pub max_turns: u32,
@@ -172,6 +173,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     let mut session = session;
     runtime::run(
         RunInput {
+            no_tools: args.no_tools,
             prompt: &args.prompt,
             context: &ctx.prompt,
             execution_context: &execution_context,

@@ -35,6 +35,9 @@ pub struct Args {
     /// Allow reading project AGENTS.md and skill metadata for this invocation.
     #[arg(long)]
     pub trust_project: bool,
+    /// Disable all tool advertising and execution for this invocation.
+    #[arg(long)]
+    pub no_tools: bool,
     /// Explicit private UTF-8 system context (at most 32768 bytes), refreshed each run.
     #[arg(long)]
     pub system_context_file: Option<PathBuf>,
@@ -68,6 +71,7 @@ impl Args {
             provider: self.provider.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             trust_project: self.trust_project,
+            no_tools: self.no_tools,
             system_context_file: self.system_context_file.clone(),
             unsafe_no_sandbox: self.sandbox == "host",
             max_turns: self.max_turns,

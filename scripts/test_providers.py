@@ -109,6 +109,19 @@ class Fixture(unittest.TestCase):
 
 
 class Providers(Fixture):
+    def test_no_tools_rejects_unsolicited_side_effect_and_remains_resumable(self):
+        self.responses.append((200, response('openai', actions=[('bash', {'command':'touch forbidden'})])))
+        failed = self.run_cli('openai', '--no-tools')
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertFalse((self.repo / 'forbidden').exists())
+        self.assertEqual(self.requests[0]['tools'], [])
+        self.assertNotIn('toolCall', self.session.read_text())
+        self.responses.append((200, response('openai', text='EXTRACTED')))
+        success = self.run_cli('openai', '--no-tools')
+        self.assertEqual(success.returncode, 0, success.stderr)
+        self.assertEqual(success.stdout.strip(), 'EXTRACTED')
+        self.assertEqual(self.requests[1]['tools'], [])
+
     def test_roundtrip_resume_reasoning_auth_usage_and_sandbox(self):
         for provider in ('openai', 'glm'):
             with self.subTest(provider=provider):
