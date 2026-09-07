@@ -36,3 +36,4 @@ jobs:
           python3 scripts/test_progress.py
           python3 scripts/test_harness_eval.py
           python3 scripts/test_eval_case.py
+          python3 scripts/test_eval_dispatch.py
