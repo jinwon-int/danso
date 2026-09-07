@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+from pathlib import Path
 import subprocess
 import sys
 import unittest
@@ -75,14 +76,17 @@ class OutputContract(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         expected_cwd = dev_check.ROOT / 'scripts' if profile == 'worker' else dev_check.ROOT
 
-        def child(command, *, cwd):
-            invoked.append((command, cwd))
+        def child(command, *, cwd, **kwargs):
+            invoked.append((command, Path(cwd)))
             index = len(invoked)
             if failure == 'start' and index == fail_at:
                 raise OSError('synthetic-private-marker')
             print(f'child-{index}-stdout')
             print(f'child-{index}-stderr', file=sys.stderr)
-            return subprocess.CompletedProcess(command, 9 if failure == 'exit' and index == fail_at else 0)
+            result = subprocess.CompletedProcess(command, 9 if failure == 'exit' and index == fail_at else 0)
+            if kwargs.get('check') and result.returncode:
+                raise subprocess.CalledProcessError(result.returncode, command)
+            return result
 
         argv = ['--profile', profile] + (['--json'] if structured else [])
         with patch.object(dev_check, 'commands', return_value=planned), \

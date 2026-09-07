@@ -214,9 +214,16 @@ The contract is part of both development profiles and CI, and can run alone:
 cd scripts && python3 -m unittest test_dev_check.OutputContract -v
 ```
 
-These tests do not execute a real child process or assess generated-test coverage,
-documentation quality, or model efficiency. Do not infer whole-task acceptance
-from their PASS or alter a measured candidate to make it pass.
+The host-only `test_dev_check_host.PipedOutput` complements these mocks with
+real Python children and captured OS pipes on success and nonzero exit. It checks
+that a flushed plain-mode banner arrives before child output; an in-memory
+stream cannot expose this buffering regression. The child environment excludes
+ambient credentials and Python unbuffered-output settings. No Cargo or provider
+is invoked by these synthetic children.
+
+These output checks do not assess generated-test coverage, documentation quality,
+or model efficiency. Do not infer whole-task acceptance from their PASS or alter
+a measured candidate to make it pass.
 
 Bash tools start with `pipefail`: `failing_check | tail` returns a failure even
 when `tail` succeeds. This preserves pipeline failure status without enabling
