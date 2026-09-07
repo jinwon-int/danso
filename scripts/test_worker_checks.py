@@ -4,6 +4,7 @@ import contextlib
 import copy
 import io
 import json
+import types
 import unittest
 from unittest.mock import patch
 
@@ -296,6 +297,35 @@ class JournalReceipts(unittest.TestCase):
     def test_no_marker_is_explicit_empty_result(self):
         for raw in (b'', b'\n', self.raw({'type': 'custom', 'data': 'DANSO_CHECK_RESULTS=bad'})):
             self.assertEqual(self.invoke(raw), (1, '{"version": 1, "receipts": []}\n'))
+
+    def test_stdin_buffer_read_error_is_invalid_journal(self):
+        class FailingBuffer:
+            def __init__(self):
+                self.sizes = []
+
+            def read(self, size):
+                self.sizes.append(size)
+                raise OSError('private buffered-reader failure marker')
+
+        for limit in (16, checks.JOURNAL_LIMIT):
+            buffer = FailingBuffer()
+            stdin = types.SimpleNamespace(buffer=buffer)
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(checks, 'JOURNAL_LIMIT', limit), \
+                    patch.object(checks, 'run_suites',
+                                 side_effect=AssertionError('extraction ran tests')), \
+                    patch.object(checks.sys, 'stdin', stdin), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as caught:
+                    checks.main(['--extract-receipts'])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertEqual(out.getvalue(), '')
+            self.assertIn('invalid journal or worker receipt', err.getvalue())
+            self.assertNotIn('private', err.getvalue())
+            self.assertNotIn('OSError', err.getvalue())
+            self.assertNotIn('Traceback', err.getvalue())
+            # the bounded read is requested exactly once, at the patched limit + 1
+            self.assertEqual(buffer.sizes, [limit + 1])
 
     def test_bad_tail_never_emits_partial_output(self):
         valid = self.raw(self.entry())
