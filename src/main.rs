@@ -21,6 +21,31 @@ async fn interrupted() -> i32 {
 // The tool worker must not initialize Tokio: RLIMIT_AS intentionally leaves
 // room for a shell, not a multithreaded async runtime with many thread stacks.
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("auth-adopt") {
+        #[derive(clap::Parser)]
+        #[command(
+            name = "danso auth-adopt",
+            about = "Transfer a quiescent isolated Codex auth.json to Danso-managed refresh. No network calls."
+        )]
+        struct Adopt {
+            #[arg(long)]
+            source: std::path::PathBuf,
+        }
+        let args = Adopt::parse_from(std::env::args_os().skip(1));
+        match danso::provider::adopt_chatgpt_auth(&args.source) {
+            Ok(path) => println!(
+                "Adopted ChatGPT credentials; set DANSO_CHATGPT_AUTH_FILE={}",
+                path.display()
+            ),
+            Err(_) => {
+                eprintln!(
+                    "ChatGPT auth adoption failed; inspect private recovery artifacts, do not retry blindly"
+                );
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("__supervise") {
         let result = std::env::args()
             .nth(2)

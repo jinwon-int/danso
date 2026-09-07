@@ -143,15 +143,15 @@ Example for a bounded GLM experiment: add `--provider-timeout-seconds 120
 --timeout-seconds 600` to the normal invocation. This enables comparison, not
 a claim that extending the timeout fixes service latency or task completion.
 
-## ChatGPT subscription (initial read-only credential adapter)
+## ChatGPT subscription
 
 `--provider openai-codex` keeps Danso's runtime, four tools, journal and execution
 backend. It does not invoke Codex or Pi to perform tasks. No additional runtime
 package is required. Initial login uses the official Codex device flow; the
-operator must provide `DANSO_CHATGPT_AUTH_FILE` explicitly. No API-key fallback,
-credential discovery, token printing, writes, automatic refresh or retries occur.
-This initial adapter is not an unattended long-running authentication solution.
-Token refresh management and Telegram configuration are follow-up work.
+operator must provide `DANSO_CHATGPT_AUTH_FILE` explicitly. The ordinary Codex file path stays read-only with no refresh. Explicitly adopted
+Danso stores support bounded renewal as described below. No API-key fallback,
+credential discovery, token printing or model-request retry occurs. Telegram
+authentication selection remains a separate integration step.
 
 ```sh
 # Existing isolated Codex login completed by the operator; use its auth.json.
@@ -163,13 +163,14 @@ target/debug/danso --provider openai-codex --model gpt-6-astra \
 
 The file must be a regular, single-link, current-user-owned file up to 64 KiB;
 its immediate parent and file must be owner-only. All path components reject
-symlinks. The adapter reads only the explicitly selected file. Its access token
+symlinks. The adapter reads only the explicitly selected credential source (and managed
+store coordination files when explicitly adopted). For read-only mode its access token
 must contain an account ID matching the saved account and an expiry more than
 60 seconds in the future. Decoding JWT metadata is not signature validation;
 the service authenticates the bearer. An expired token stops before model
 requests: renew using Codex login in that isolated home and retry explicitly.
 Authentication is re-read before every model request; a changed account stops
-an in-progress run. No refresh token is sent anywhere. Keep auth outside the
+an in-progress run. Read-only mode sends no refresh token. Keep auth outside the
 workspace; host-mode tools retain the invoking user's host permissions.
 
 Requests go to `https://chatgpt.com/backend-api/codex/responses`, using the
@@ -205,3 +206,71 @@ Implementation evidence (public source, not a general Platform API guarantee):
 
 Offline gate: `python3 scripts/test_chatgpt.py` (fake tokens, loopback SSE,
 real native host tool execution and resume; no live requests).
+
+
+### Optional managed token renewal
+
+A dedicated isolated Codex login can be transferred to Danso with an explicit
+local command. Stop every Codex CLI, IDE or app-server process using that login
+home first. The command cannot revoke tokens already cached in another process;
+quiescence is an operator precondition. Do not adopt a shared interactive login.
+No login, token exchange or inference occurs during adoption.
+
+```sh
+# SOURCE is the isolated login's auth.json, not the normal shared Codex home.
+target/debug/danso auth-adopt --source /private/isolated-codex/auth.json
+export DANSO_CHATGPT_AUTH_FILE=/private/isolated-codex/danso-auth.json
+# The usual --provider openai-codex run now uses managed renewal.
+```
+
+Adoption requires the private owner-only directory rules above, a file with
+exact0600 permissions, and a refresh token. Managed store files and locks also
+require exact0600 permissions. Under an exclusive lock it stages `danso-auth.json`, parks the
+original as `codex-auth-imported-<uuid>.json`, and installs the managed file with
+no overwrite. Both credentials are preserved locally; the original `auth.json`
+name is retired so Codex no longer discovers it. Re-running adoption never
+overwrites an existing managed store. The `danso-auth.json` basename is reserved
+for adopted stores; a moved managed file is rejected. If `auth.json` reappears,
+Danso stops until ownership is resolved. This prevents normal shared-file use,
+not a malicious process running as the same OS user.
+
+Each managed inspection and renewal reads under `.danso-auth.lock`. A concurrent
+process fails with a body-free busy message rather than observing in-flight
+credentials or rotating the token again. The caller may retry the run explicitly;
+no provider request is automatically retried. Credentials with at most 60 seconds
+remaining are renewed before the next model request. Fresh credentials do not
+trigger auth traffic. Revoked tokens receiving HTTP401 during inference are not
+blindly refreshed and replayed; explicit reauthentication is required.
+
+The refresh endpoint is fixed to `https://auth.openai.com/oauth/token`. Loopback
+fixtures use `<DANSO_CHATGPT_BASE_URL>/oauth/token`; arbitrary issuers and redirects
+are forbidden. JSON refresh responses are bounded to64KiB; request/connect
+limits follow `--provider-timeout-seconds` (connect max10seconds), within the
+existing whole-run deadline. Auth exchange and model inference are separate
+bounded requests; the per-request timeout is not a combined two-request budget.
+Model usage counters exclude auth exchanges. A refreshed access token must retain
+the same account and a usable expiry. A missing rotated refresh token preserves
+the previous token, matching the official Codex refresh response contract; an
+explicitly malformed token is rejected.
+
+Before dispatching a refresh, `.danso-refresh-pending` is written and fsynced.
+Transport errors, HTTP failures, invalid replies, account mismatch, cancellation
+or local save errors leave it in place. Later runs then fail closed without
+reusing the potentially consumed refresh token. The adapter does not infer that
+a failed HTTP request is safe to repeat. Successful renewal writes/fsyncs the new
+generation, parks the previous generation as `danso-auth-archive-<uuid>.json`,
+installs the new file, then parks the pending marker as a completion receipt.
+Files stay0600 under both permissive/restrictive umasks; path traversal uses
+pinned directory descriptors and rejects symlinks/hardlinked files.
+
+Replacement uses two no-overwrite renames, with a possible missing-current-file
+gap on crash; it never exposes a partly written current file. A crash or fsync
+failure can therefore stop the store. Original, staged and archived artifacts
+are retained; there is no automatic repair, rollback, deletion or archive prune.
+If adoption or renewal is interrupted, preserve the entire private directory
+and inspect paths/permissions only. Reauthenticate into a **new isolated login
+home**, then adopt that new home and explicitly select it. Do not restore an old
+refresh token or delete a pending marker to force another exchange. Recovery
+from an ambiguous remote rotation requires fresh authentication, not a guessed
+local rollback. Operational adoption and rollout are separate from synthetic
+fixture tests and require the operator-authorized scope.
