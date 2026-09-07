@@ -4,7 +4,7 @@ use cli::Args;
 use danso::{
     app,
     failure::{self, Kind},
-    output::{PrintSink, report_usage},
+    output::{PrintSink, ProgressSink, report_usage},
     tools,
     usage::Usage,
 };
@@ -53,7 +53,7 @@ fn main() {
         .expect("runtime");
     let mut usage = Usage::default();
     let config = args.config();
-    let mut sink = PrintSink(args.output_mode());
+    let mut sink = ProgressSink::new(PrintSink(args.output_mode()), args.progress_jsonl);
     let code = runtime.block_on(async {
         tokio::select! {
             code = interrupted() => { eprintln!("run interrupted"); failure::report(Kind::Interrupted, code); code },

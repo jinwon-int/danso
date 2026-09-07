@@ -38,6 +38,8 @@ For a guided single-run walkthrough on one small real task — bounded scope,
 predefined acceptance, isolated worktree, explicit budgets and review — see
 [supervised first use](docs/supervised-work.md).
 
+For Telegram/client tool lifecycle updates, see [durable progress](docs/progress.md).
+
 ## Long tasks
 
 Opt in to automatic context checkpoints with `--compact-at-bytes 196608`.

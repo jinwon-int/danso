@@ -68,6 +68,11 @@ pub enum Event<'a> {
     Message(&'a Value),
     Compaction(&'a Value),
     FinalAnswer(&'a Value),
+    /// Emitted only after the corresponding operation marker is durable.
+    ToolStarted(&'a str),
+    ToolSettled {
+        is_error: bool,
+    },
 }
 
 /// An output adapter can render text, JSONL, or collect events in a test.

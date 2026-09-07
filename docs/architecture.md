@@ -150,6 +150,7 @@ python3 scripts/test_dev_check.py
 python3 scripts/test_worker_checks.py
 python3 scripts/test_dev_check_host.py
 python3 scripts/test_ccc_node.py
+python3 scripts/test_progress.py
 ```
 
 The real-bubblewrap E2E suite continues to cover CLI behavior and the actual
