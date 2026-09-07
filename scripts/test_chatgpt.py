@@ -26,9 +26,11 @@ def item_events(value):
                     for i, item in enumerate(value['output']))
 
 
-def streamed_items(value):
+def streamed_items(value, omit_output=False):
     terminal = copy.deepcopy(value)
     terminal['output'] = []
+    if omit_output:
+        del terminal['output']
     return item_events(value) + sse(terminal)
 
 
@@ -87,9 +89,15 @@ class ChatGPT(Fixture):
         self.assertIn('openai-codex', p.stdout + p.stderr)
 
     def test_streamed_items_survive_empty_terminal_tools_and_resume(self):
+        self.exercise_streamed_items(False)
+
+    def test_streamed_items_survive_omitted_terminal_output(self):
+        self.exercise_streamed_items(True)
+
+    def exercise_streamed_items(self, omit_output):
         values = [response('openai', [('write', {'path': 'streamed', 'content': 'ok'})]),
                   response('openai', text='done'), response('openai', text='resumed')]
-        self.responses = [(200, streamed_items(v)) for v in values]
+        self.responses = [(200, streamed_items(v, omit_output)) for v in values]
         p = self.invoke()
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual((self.repo / 'streamed').read_text(), 'ok')

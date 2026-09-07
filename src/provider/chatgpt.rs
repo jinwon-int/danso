@@ -136,6 +136,9 @@ fn parse_events(data: &[u8]) -> Result<Option<Value>> {
                     "ChatGPT response did not complete"
                 );
                 let mut response = v["response"].clone();
+                if response.get("output").is_none() {
+                    response["output"] = Value::Array(Vec::new());
+                }
                 let output = response["output"]
                     .as_array_mut()
                     .context("missing ChatGPT terminal output")?;
