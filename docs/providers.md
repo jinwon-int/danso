@@ -180,9 +180,12 @@ loopback override authorizes the local fixture to receive credentials/content.
 Never use a real login in fixture tests. Ordinary `OPENAI_API_KEY` and
 `DANSO_OPENAI_BASE_URL` are ignored for this adapter.
 
-The complete stream is bounded to 1 MiB and the normal provider timeout. Only
-one completed terminal response is accepted. Failed, incomplete, truncated,
-unknown or duplicate terminal events fail before any returned tool executes.
+Bytes through the terminal event are bounded to 1 MiB and the normal provider
+timeout. The first validated `response.completed` or `response.done` response
+ends the request, without waiting for the SSE connection to close. Failed,
+incomplete, truncated or unknown events before completion fail before any
+returned tool executes. Duplicate terminal events already in the received
+buffer fail; future bytes after a terminal response are not consumed.
 The existing OpenAI output and opaque-reasoning validation still applies.
 No streamed delta is executed. Usage reports `openai-codex` and
 `openai-codex-responses`; terminal usage must be valid. The service's subscription

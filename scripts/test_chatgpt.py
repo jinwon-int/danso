@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Subscription adapter: synthetic Codex credentials, loopback SSE, real Danso tools."""
 import base64
+import socket
 import json
 import os
 import time
@@ -127,7 +128,7 @@ class ChatGPT(Fixture):
 
     def test_stream_failures_never_execute_partial_tools(self):
         good = sse(response('openai', [('write', {'path': 'unsafe', 'content': 'bad'})]))
-        cases = [good[:-2], b'data: [DONE]\n\n', good + good,
+        cases = [good[:-2], b'data: [DONE]\n\n',
                  b'data: {"type":"response.failed","error":"REFRESH_SECRET"}\n\n',
                  b'data: {"type":"future.event"}\n\n',
                  b'event: response.failed\n' + good,
@@ -151,6 +152,70 @@ class ChatGPT(Fixture):
             self.assertNotEqual(p.returncode, 0)
             self.assertEqual(len(self.requests), before + 1)
             self.assert_private(p)
+
+    def test_terminal_alias_and_incomplete_alias_rejected(self):
+        self.responses = [(200, sse(response('openai')).replace(b'response.completed', b'response.done'))]
+        p = self.invoke()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.session = self.root / 'incomplete-alias.jsonl'
+        failed = response('openai', [('write', {'path': 'unsafe', 'content': 'bad'})])
+        failed['status'] = 'incomplete'
+        self.responses = [(200, sse(failed).replace(b'response.completed', b'response.done'))]
+        self.assertNotEqual(self.invoke().returncode, 0)
+        self.assertFalse((self.repo / 'unsafe').exists())
+
+    def test_account_change_between_requests_stops_run(self):
+        def rotate(_body):
+            self.set_auth(tokens={'access_token': token(account='other'), 'account_id': 'other'})
+            return sse(response('openai', [('read', {'path': 'existing'})]))
+        (self.repo / 'existing').write_text('ok')
+        self.responses = [(200, rotate)]
+        p = self.invoke()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn('account changed', p.stderr)
+
+    def test_terminal_response_does_not_wait_for_connection_close(self):
+        import threading
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen()
+        release = threading.Event()
+        errors = []
+        def serve():
+            try:
+                conn, _ = listener.accept()
+                with conn:
+                    conn.settimeout(5)
+                    stream = conn.makefile('rb')
+                    length = 0
+                    while True:
+                        line = stream.readline()
+                        if line == b'\r\n':
+                            break
+                        if line.lower().startswith(b'content-length:'):
+                            length = int(line.split(b':', 1)[1])
+                    stream.read(length)
+                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n')
+                    # Split the terminal frame delimiter across HTTP chunks.
+                    data = sse(response('openai', text='complete'))
+                    for part in (data[:-2], data[-2:-1], data[-1:]):
+                        conn.sendall(f'{len(part):x}\r\n'.encode() + part + b'\r\n')
+                    release.wait(5)  # Deliberately never send EOF or final HTTP chunk.
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            env = self.env('')
+            env['DANSO_CHATGPT_BASE_URL'] = f'http://127.0.0.1:{listener.getsockname()[1]}/codex'
+            p = self.run_cli('openai-codex', '--provider-timeout-seconds', '1', env=env)
+            self.assertEqual(p.returncode, 0, p.stderr)
+        finally:
+            release.set()
+            thread.join(6)
+            listener.close()
+        self.assertEqual(errors, [])
 
     def test_crlf_comments_and_done(self):
         self.responses = [(200, b': heartbeat\r\n\r\n' + sse(response('openai')).replace(b'\n', b'\r\n') + b'data: [DONE]\r\n\r\n')]

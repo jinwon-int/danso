@@ -69,6 +69,16 @@ impl Http {
         usage: &mut crate::usage::Usage,
         headers: reqwest::header::HeaderMap,
     ) -> Result<Vec<u8>> {
+        self.post_until(body, usage, headers, |_| Ok(None)).await
+    }
+    /// Stop at a validated application-level terminal event without waiting for EOF.
+    pub async fn post_until(
+        &self,
+        body: &Value,
+        usage: &mut crate::usage::Usage,
+        headers: reqwest::header::HeaderMap,
+        terminal: impl Fn(&[u8]) -> Result<Option<usize>>,
+    ) -> Result<Vec<u8>> {
         let bytes = serde_json::to_vec(body)?;
         ensure!(
             bytes.len() <= 512 * 1024,
@@ -110,6 +120,11 @@ impl Http {
                 "provider response exceeds 1 MiB"
             );
             bytes.extend_from_slice(&chunk);
+            if let Some(end) = terminal(&bytes)? {
+                ensure!(end <= bytes.len(), "invalid terminal response boundary");
+                bytes.truncate(end);
+                return Ok(bytes);
+            }
         }
         Ok(bytes)
     }

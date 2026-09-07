@@ -66,7 +66,7 @@ impl ChatGpt {
             reqwest::header::HeaderValue::from_static("text/event-stream"),
         );
         let data = Http::new(&self.base, "responses", &token, self.timeout)?
-            .post_bytes(body, usage, headers)
+            .post_until(body, usage, headers, completed_prefix)
             .await?;
         terminal_response(&data)
     }
@@ -164,7 +164,24 @@ fn credentials(path: &Path) -> Result<(String, String)> {
     Ok((token.into(), account.into()))
 }
 
+fn completed_prefix(data: &[u8]) -> Result<Option<usize>> {
+    // A UTF-8 character or SSE frame may be split across arbitrary HTTP chunks.
+    let lf = data.windows(2).rposition(|w| w == b"\n\n").map(|i| i + 2);
+    let crlf = data
+        .windows(4)
+        .rposition(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4);
+    let Some(end) = lf.max(crlf) else {
+        return Ok(None);
+    };
+    Ok(parse_events(&data[..end])?.map(|_| end))
+}
+
 fn terminal_response(data: &[u8]) -> Result<Value> {
+    parse_events(data)?.context("ChatGPT SSE ended without completed response")
+}
+
+fn parse_events(data: &[u8]) -> Result<Option<Value>> {
     let text =
         std::str::from_utf8(data).map_err(|_| anyhow::anyhow!("invalid ChatGPT SSE encoding"))?;
     let normalized = text.replace("\r\n", "\n");
@@ -208,7 +225,7 @@ fn terminal_response(data: &[u8]) -> Result<Value> {
             "ChatGPT SSE event type mismatch"
         );
         match kind {
-            "response.completed" => {
+            "response.completed" | "response.done" => {
                 ensure!(
                     v["response"].is_object()
                         && v["response"]["status"] == "completed"
@@ -241,5 +258,31 @@ fn terminal_response(data: &[u8]) -> Result<Value> {
             _ => bail!("unsupported ChatGPT SSE event"),
         }
     }
-    terminal.context("ChatGPT SSE ended without completed response")
+    Ok(terminal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn duplicate_terminal_in_buffer_fails() {
+        let frame =
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+        let mut data = frame.to_vec();
+        data.extend_from_slice(frame);
+        assert!(terminal_response(&data).is_err());
+    }
+    #[test]
+    fn partial_utf8_and_frame_wait_for_delimiter() {
+        assert!(
+            completed_prefix(b"data: {\"text\":\"\xf0\x9f")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            completed_prefix(b"data: {\"type\":\"response.completed\"}")
+                .unwrap()
+                .is_none()
+        );
+    }
 }
