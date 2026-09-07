@@ -1,7 +1,7 @@
 {
   "schema": "danso.eval.case.v1",
   "id": "csv_totals",
-  "prompt": "Fix totals.py. Stdin is a JSON string containing CSV with columns category,amount. Print a JSON object mapping each category to the sum of its integer amounts. Handle CSV quoting, duplicate categories, negative amounts, and empty data. Use only the standard library.",
+  "prompt": "Fix totals.py. Stdin is a JSON string containing CSV with columns category,amount. Print a JSON object mapping each category to the sum of its integer amounts. Handle CSV quoting, duplicate categories, negative amounts, and empty data. Use only the standard library. The acceptance environment permits only a single process: do not create subprocesses or threads.",
   "files": {
     "totals.py": "import json, sys\nrows = json.load(sys.stdin).splitlines()[1:]\nprint(json.dumps(dict((r.split(\",\")[0], int(r.split(\",\")[1])) for r in rows)))\n"
   },

@@ -174,8 +174,14 @@ then executes the Python CLI in a read-only bubblewrap workspace with networking
 capabilities and inherited environment disabled. Expected results remain in the
 host process; candidate code cannot alter the oracle or its output decision.
 Each check starts a fresh process with a 3-second wall bound, 64-KiB output caps,
-CPU/address-space/file limits, and process-group cleanup. Bubblewrap's PID
-namespace owns descendants; these are not aggregate cgroup memory/disk quotas.
+CPU/address-space/file limits, and process-group cleanup. A sealed seccomp filter
+denies fork/vfork/clone/clone3 (including threads) for these explicitly single-process
+CLI tasks. It rejects unsupported syscall architectures and x32 calls. Linux x86-64
+and AArch64 are supported; missing seccomp support fails sandbox preflight.
+Bubblewrap is fixed to the root-owned, non-group/world-writable regular file
+`/usr/bin/bwrap`; ambient PATH cannot substitute another executable. Reports
+record its digest and the process-filter digest. These restrictions apply to
+acceptance code, not to the future agent harness tool process supervisor.
 Sandbox preflight failure is an infrastructure error, not a failed model task.
 
 Exit codes are 0 (all checks pass), 1 (a behavioral check fails), 2 (input,

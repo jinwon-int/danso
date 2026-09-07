@@ -106,6 +106,42 @@ class Cases(unittest.TestCase):
             os.environ.pop('EVAL_TEST_SECRET')
         self.assertEqual((state, code, out), ('exited', 0, b'ok\n'))
 
+    def test_path_shim_cannot_replace_system_bubblewrap(self):
+        workspace = self.root / 'work'; workspace.mkdir()
+        shim = self.root / 'bwrap'
+        marker = self.root / 'shim-ran'
+        shim.write_text(f'#!/bin/sh\ntouch {marker}\nexit 0\n')
+        shim.chmod(0o700)
+        (workspace / 'probe.py').write_text('print("real-sandbox")\n')
+        old = os.environ.get('PATH')
+        os.environ['PATH'] = str(self.root) + ':/usr/bin:/bin'
+        try:
+            command = e.sandbox_command(workspace, 'probe.py')
+            self.assertEqual(command[0], '/usr/bin/bwrap')
+            state, code, out, _ = asyncio.run(e.execute(command, b''))
+        finally:
+            if old is None: os.environ.pop('PATH')
+            else: os.environ['PATH'] = old
+        self.assertFalse(marker.exists())
+        self.assertEqual((state, code, out), ('exited', 0, b'real-sandbox\n'))
+
+    def test_process_and_thread_creation_are_denied_by_kernel(self):
+        workspace = self.root / 'work'; workspace.mkdir()
+        (workspace / 'probe.py').write_text(
+            'import os,subprocess,threading\n'
+            'try:\n pid=os.fork()\n'
+            'except PermissionError: pass\n'
+            'else:\n os._exit(9)\n'
+            'try:\n subprocess.run(["/usr/bin/true"], check=True)\n'
+            'except PermissionError: pass\n'
+            'else: raise Exception("subprocess permitted")\n'
+            'try:\n threading.Thread(target=lambda:None).start()\n'
+            'except RuntimeError: pass\n'
+            'else: raise Exception("thread permitted")\n'
+            'print("creation-denied")\n')
+        state, code, out, err = asyncio.run(e.execute(e.sandbox_command(workspace, 'probe.py'), b''))
+        self.assertEqual((state, code, out), ('exited', 0, b'creation-denied\n'), err)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -3,13 +3,15 @@
 import argparse
 import asyncio
 import hashlib
+import fcntl
 import json
 import os
 from pathlib import Path, PurePosixPath
 import resource
-import shutil
+import platform
 import signal
 import stat
+import struct
 import sys
 
 from harness_eval import digest, read_json, rendered, require
@@ -133,9 +135,10 @@ def limits():
 
 
 def sandbox_command(workspace, entrypoint):
-    binary = shutil.which('bwrap')
-    require(binary is not None)
-    command = [binary, '--unshare-all', '--die-with-parent', '--new-session',
+    binary = Path('/usr/bin/bwrap')
+    info = binary.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022)
+    command = [str(binary), '--unshare-all', '--die-with-parent', '--new-session',
                '--cap-drop', 'ALL', '--clearenv']
     for path in ('/usr', '/bin', '/lib', '/lib64'):
         if Path(path).exists():
@@ -146,12 +149,39 @@ def sandbox_command(workspace, entrypoint):
     return command
 
 
+def process_filter():
+    # Single-process Python tasks need no fork/clone/thread creation. A kernel
+    # filter inherited across exec closes the root-user RLIMIT_NPROC exemption.
+    architectures = {'x86_64': (0xc000003e, (56, 57, 58, 435)),
+                     'aarch64': (0xc00000b7, (220, 435))}
+    require(sys.byteorder == 'little' and platform.machine() in architectures)
+    arch, calls = architectures[platform.machine()]
+    instructions = [(0x20, 0, 0, 4), (0x15, 1, 0, arch), (0x06, 0, 0, 0x80000000),
+                    (0x20, 0, 0, 0)]
+    # Reject x32 syscall numbers as well as unsupported audit architectures.
+    instructions += [(0x35, 0, 1, 0x40000000), (0x06, 0, 0, 0x80000000)]
+    for call in calls:
+        instructions += [(0x15, 0, 1, call), (0x06, 0, 0, 0x00050001)]
+    instructions += [(0x06, 0, 0, 0x7fff0000)]
+    return b''.join(struct.pack('<HBBI', *item) for item in instructions)
+
+
 async def execute(command, input_bytes):
     output = [bytearray(), bytearray()]
-    process = await asyncio.create_subprocess_exec(
-        *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE, env={'PATH': '/usr/bin:/bin'},
-        start_new_session=True, preexec_fn=limits)
+    fd = os.memfd_create('eval-process-filter', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    try:
+        os.write(fd, process_filter())
+        os.lseek(fd, 0, os.SEEK_SET)
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
+                    fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+        split = command.index('--')
+        command = command[:split] + ['--seccomp', str(fd)] + command[split:]
+        process = await asyncio.create_subprocess_exec(
+            *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, env={'PATH': '/usr/bin:/bin'}, pass_fds=(fd,),
+            start_new_session=True, preexec_fn=limits)
+    finally:
+        os.close(fd)
     status = 'exited'
 
     async def drain(stream, destination):
@@ -221,7 +251,9 @@ def accept(case, workspace, evidence):
                         'stderr_sha256': hashlib.sha256(err).hexdigest()})
     report = {'schema': 'danso.eval.acceptance.v1', 'case': descriptor(case),
               'candidate_sha256': digest(files), 'passed': all(r['passed'] for r in results),
-              'checks': results, 'python_sha256': hashlib.sha256(Path('/usr/bin/python3').read_bytes()).hexdigest()}
+              'checks': results, 'python_sha256': hashlib.sha256(Path('/usr/bin/python3').read_bytes()).hexdigest(),
+              'bwrap_sha256': hashlib.sha256(read_bytes('/usr/bin/bwrap')).hexdigest(),
+              'process_filter_sha256': hashlib.sha256(process_filter()).hexdigest()}
     write_new(evidence / 'acceptance.json', rendered(report).encode())
     return report
 
