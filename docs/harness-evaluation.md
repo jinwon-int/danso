@@ -126,7 +126,10 @@ The digests and receipts are caller claims, not cryptographic attestations of
 execution. This tool validates internal consistency, not the authenticity of
 measurements. All source evidence must remain available for independent audit.
 Inputs are bounded regular JSON files (8 MiB each); duplicate keys and symlinked
-path components are rejected. Output goes to stdout; use owner-only storage for
+path components are rejected. Plans whose actual rendered JSON would exceed
+that same reader limit are rejected before emitting output, even if their case
+and repetition counts fit the individual schema limits.
+Output goes to stdout; use owner-only storage for
 real evaluation artifacts.
 
 ## Verification

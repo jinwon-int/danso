@@ -98,6 +98,24 @@ class Evaluation(unittest.TestCase):
         with self.assertRaises(ValueError):
             ev.summarize(plan, [])
 
+    def test_large_generated_plan_fails_before_emitting_unreadable_output(self):
+        source = spec()
+        source['repetitions'] = 10
+        for i, harness in enumerate(source['harnesses']):
+            harness['id'] = str(i) + 'h' * 79
+        source['cases'] = [{**source['cases'][0], 'id': f'{i:04d}' + 'x' * 76}
+                           for i in range(1000)]
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'spec.json'; path.write_text(json.dumps(source))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(ev.main(['plan', str(path)]), 2)
+            self.assertEqual(output.getvalue(), '')
+            source['cases'] = source['cases'][:500]
+            plan = ev.make_plan(source)
+            path.write_text(ev.rendered(plan))
+            self.assertEqual(ev.read_json(path), plan)
+
     def test_invalid_success_and_numeric_metrics_rejected(self):
         plan = ev.make_plan(spec())
         for key, value in [('acceptance_passed', False), ('exit_code', 1)]:

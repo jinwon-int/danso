@@ -25,6 +25,10 @@ def digest(value):
                                      allow_nan=False).encode()).hexdigest()
 
 
+def rendered(value):
+    return json.dumps(value, indent=2, allow_nan=False) + '\n'
+
+
 def object_keys(value, keys):
     require(type(value) is dict and set(value) == set(keys))
 
@@ -85,7 +89,10 @@ def make_plan(spec):
                 jobs.append({'id': f'{pair}:{harness["id"]}', 'pair': pair,
                              'harness': harness['id'], 'case': case['id'], 'repeat': repeat + 1})
     payload = {'schema': 'danso.eval.plan.v1', 'spec': spec, 'jobs': jobs}
-    return {**payload, 'sha256': digest(payload)}
+    plan = {**payload, 'sha256': digest(payload)}
+    # Every emitted plan must fit the same reader used by the report command.
+    require(len(rendered(plan).encode()) <= LIMIT)
+    return plan
 
 
 def stats(values):
@@ -203,7 +210,7 @@ def main(argv=None):
     try:
         result = make_plan(read_json(args.spec)) if args.command == 'plan' else \
             summarize(read_json(args.plan), read_json(args.receipts))
-        print(json.dumps(result, indent=2, allow_nan=False))
+        sys.stdout.write(rendered(result))
         return 0
     except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
         print('Invalid or unreadable evaluation input; no agents were executed.', file=sys.stderr)
