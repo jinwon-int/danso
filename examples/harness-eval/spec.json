@@ -1,0 +1,40 @@
+{
+  "schema": "danso.eval.spec.v1",
+  "conditions": {
+    "provider": "openai",
+    "model": "gpt-6-astra",
+    "effort": "medium",
+    "request_limit": 32,
+    "wall_seconds": 300,
+    "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cache_policy": "record observed cache; no guaranteed cold cache",
+    "budget_enforcement": "EXAMPLE ONLY: no executor or enforcement configured"
+  },
+  "harnesses": [
+    {
+      "id": "danso",
+      "revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "config_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "id": "pi",
+      "revision": "cccccccccccccccccccccccccccccccccccccccc",
+      "config_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ],
+  "cases": [
+    {
+      "id": "edit",
+      "prompt_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "input_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "acceptance_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "id": "resume",
+      "prompt_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "input_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "acceptance_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  ],
+  "repetitions": 2
+}

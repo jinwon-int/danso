@@ -21,6 +21,7 @@ module boundary; `app.rs` is the composition root and `runtime.rs` is agent poli
   `python3 scripts/test_compaction.py`, `python3 scripts/test_providers.py`, and `python3 scripts/test_live_acceptance.py`
   before a PR. Also run `python3 scripts/test_dev_check.py` and `python3 scripts/test_dev_check_host.py` and `python3 scripts/test_ccc_node.py`.
   Include `python3 scripts/test_progress.py` for real CLI progress timing/privacy.
+  Include `python3 scripts/test_harness_eval.py` for offline paired-evaluation accounting.
 - Inside a Danso worker, use `python3 scripts/dev_check.py --profile worker`
   for the Python subset; Rust and nested sandbox integration are host checks.
   Report omitted checks explicitly. On the host, `python3 scripts/dev_check.py --profile host` runs the full required gate list; it never falls back to a subset.
