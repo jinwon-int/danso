@@ -35,7 +35,7 @@ flowchart TD
 | `tools/mod.rs` | One registry for definitions and worker dispatch | Agent-loop policy |
 | `tools/{read,bash,edit,write}.rs` | Each builtin's definition and implementation | Provider selection or session writes |
 | `tools/files.rs` | Shared file-write rules | Registry or runtime selection |
-| `tools/runner.rs` | Worker isolation, environment clearing, resource/time/output limits | Tool implementation details |
+| `tools/runner.rs`, `tools/supervisor.rs` | Selected execution backend, descendant lifecycle, environment clearing, resource/time/output limits | Tool implementation details |
 | `session.rs` | Pi v3 persistence, locking, linear history, recovery validation | Provider I/O or replaying effects |
 | `context.rs` | Trust-aware discovery, execution context and context budgets | Model requests or tool execution |
 | `failure.rs` | Typed failure categories and body-free CLI error records | Inferring causes from provider text or authorizing retries |
@@ -351,3 +351,7 @@ receipt authentication, or permission to resume. A tool can print fabricated
 markers and an edited journal can contain fabricated results. Keep the original
 run evidence; normal runtime recovery remains the authority for resuming a
 session. Bounded checkpoint excerpts cannot replace the original receipt.
+
+The CLI defaults to host execution; see [execution modes](execution.md) for
+permissions and Linux supervisor requirements. Existing isolation suites select
+bubblewrap explicitly. `test_host_execution.py` is also required by the host gate.

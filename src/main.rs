@@ -21,6 +21,21 @@ async fn interrupted() -> i32 {
 // The tool worker must not initialize Tokio: RLIMIT_AS intentionally leaves
 // room for a shell, not a multithreaded async runtime with many thread stacks.
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("__supervise") {
+        let result = std::env::args()
+            .nth(2)
+            .and_then(|p| p.parse::<libc::pid_t>().ok())
+            .filter(|p| *p > 0)
+            .ok_or_else(|| anyhow::anyhow!("missing supervisor parent"))
+            .and_then(tools::supervisor::run);
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if std::env::args().nth(1).as_deref() == Some("__tool") {
         let result = (|| {
             let mut input = String::new();

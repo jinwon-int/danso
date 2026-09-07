@@ -42,6 +42,7 @@ def response(provider, actions=(), text='done', reasoning=True):
 
 
 class Fixture(unittest.TestCase):
+    execution_args = ['--sandbox', 'bubblewrap']
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='danso-providers-')
         self.root = Path(self.tmp.name)
@@ -95,7 +96,7 @@ class Fixture(unittest.TestCase):
                 f'DANSO_{prefix}_BASE_URL': f'http://127.0.0.1:{self.server.server_port}/api'}
 
     def run_cli(self, provider, *extra, env=None):
-        return subprocess.run([str(BIN), '--cwd', str(self.repo), '--session', str(self.session),
+        return subprocess.run([str(BIN), *self.execution_args, '--cwd', str(self.repo), '--session', str(self.session),
                                '--provider', provider, '--model', 'fixture', *extra, '-p', 'do task'],
                               capture_output=True, text=True, timeout=15, env=env or self.env(provider))
 

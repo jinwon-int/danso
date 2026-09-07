@@ -130,7 +130,7 @@ def run(binary, model, provider_env, provider='anthropic', reasoning_effort=None
         stage = 'first_run_execution'
         first_bytes = None
         for index, prompt in enumerate(prompts, 1):
-            command = [str(binary), '--cwd', str(repo), '--session', str(session),
+            command = [str(binary), '--sandbox', 'bubblewrap', '--cwd', str(repo), '--session', str(session),
                        '--provider', provider, '--model', model, '--max-turns', '24' if compact_at_bytes else '8',
                        '--timeout-seconds', '300' if compact_at_bytes else '180',
                        '--tool-timeout-seconds', '10', '-p', '--', prompt]

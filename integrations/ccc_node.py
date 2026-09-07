@@ -203,7 +203,7 @@ class DansoSession:
                 yield ErrorEvent(code='danso_input', message='Invalid worker input.')
                 return
             r = self.runtime
-            command = [r.binary, '--cwd', str(self.cwd), '--session', str(r.root / (self.session_id + '.jsonl')),
+            command = [r.binary, '--sandbox', 'bubblewrap', '--cwd', str(self.cwd), '--session', str(r.root / (self.session_id + '.jsonl')),
                        '--provider', r.provider, '--model', r.model, '--max-turns', str(r.max_turns),
                        '--timeout-seconds', str(r.timeout), '--provider-timeout-seconds', str(r.provider_timeout),
                        '-p']

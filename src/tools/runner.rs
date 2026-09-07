@@ -24,6 +24,7 @@ impl Runner {
         let mut cmd;
         if self.unsafe_no_sandbox {
             cmd = Command::new(exe);
+            cmd.arg("__supervise").arg(std::process::id().to_string());
         } else {
             cmd = Command::new("/usr/bin/bwrap");
             cmd.args([
@@ -59,17 +60,19 @@ impl Runner {
                 "/danso-worker",
             ]);
         }
-        cmd.arg("__tool")
-            .current_dir(&self.cwd)
+        if !self.unsafe_no_sandbox {
+            cmd.arg("__tool");
+        }
+        cmd.current_dir(&self.cwd)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", "/tmp");
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(!self.unsafe_no_sandbox);
         // RLIMIT_AS is a virtual-memory cap, not an RSS claim. Sequential tools
-        // cap concurrent bash at one. The bubblewrap PID namespace reaps descendants.
+        // cap concurrent bash at one. Host mode uses a subreaper; bubblewrap a PID namespace.
         unsafe {
             cmd.pre_exec(|| {
                 for (resource, limit) in [
@@ -96,7 +99,18 @@ impl Runner {
         let mut child = self
             .command()?
             .spawn()
-            .context("sandbox/tool launch failed (requires bubblewrap and user namespaces)")?;
+            .context("tool launch failed for selected execution backend")?;
+        let mut cleanup = if self.unsafe_no_sandbox {
+            match HostCleanup::new(child.id().expect("new child PID")) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    child.kill().await.ok();
+                    return Err(error.into());
+                }
+            }
+        } else {
+            HostCleanup(None)
+        };
         let mut stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -114,6 +128,7 @@ impl Runner {
             let (_, (out, err)) =
                 tokio::try_join!(async { send.await.map_err(anyhow::Error::from) }, drain)?;
             let status = child.wait().await?;
+            cleanup.0 = None;
             Ok::<_, anyhow::Error>((
                 format!(
                     "{}{}",
@@ -126,14 +141,62 @@ impl Runner {
         match tokio::time::timeout(self.timeout, work).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => {
-                child.kill().await.ok();
+                if self.unsafe_no_sandbox {
+                    cleanup.stop();
+                    if child.wait().await.is_ok() {
+                        cleanup.0 = None;
+                    }
+                } else {
+                    child.kill().await.ok();
+                }
                 Err(error)
             }
             Err(_) => {
-                child.kill().await.ok();
+                if self.unsafe_no_sandbox {
+                    cleanup.stop();
+                    if child.wait().await.is_ok() {
+                        cleanup.0 = None;
+                    }
+                } else {
+                    child.kill().await.ok();
+                }
                 bail!("tool timed out");
             }
         }
+    }
+}
+
+// A pidfd pins identity even if Tokio reaps a child before future cancellation.
+struct HostCleanup(Option<std::os::fd::OwnedFd>);
+impl HostCleanup {
+    fn new(pid: u32) -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(Some(unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(fd as i32)
+        })))
+    }
+    fn stop(&self) {
+        use std::os::fd::AsRawFd;
+        if let Some(fd) = &self.0 {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    libc::SIGTERM,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+    }
+}
+impl Drop for HostCleanup {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -152,7 +215,15 @@ async fn bounded_output(mut reader: impl tokio::io::AsyncRead + Unpin) -> Result
 
 impl ToolExecutor for Runner {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        super::builtins().definitions()
+        let mut definitions = super::builtins().definitions();
+        if self.unsafe_no_sandbox {
+            for definition in &mut definitions {
+                if definition.name == "bash" {
+                    definition.description = "Run Bash with pipefail in the workspace using current-user host permissions. Filesystem and network are not sandboxed. Check actual test results.".into();
+                }
+            }
+        }
+        definitions
     }
     async fn preflight(&self) -> Result<()> {
         let (_, failed) = self

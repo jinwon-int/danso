@@ -5,6 +5,7 @@ mod edit;
 mod files;
 mod read;
 mod runner;
+pub mod supervisor;
 mod write;
 
 use crate::contracts::ToolDefinition;
