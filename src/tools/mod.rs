@@ -11,6 +11,7 @@ mod write;
 use crate::contracts::ToolDefinition;
 use anyhow::{Context, Result, ensure};
 pub use runner::Runner;
+pub(crate) use runner::SYSTEM_MOUNTS;
 use serde_json::Value;
 
 pub const OUTPUT_LIMIT: usize = 64 * 1024;

@@ -40,6 +40,56 @@ class Host(unittest.TestCase):
         description = next(d['description'] for d in self.requests[0]['tools'] if d['name']=='bash')
         self.assertIn('not sandboxed', description)
 
+    def test_explicit_system_memory_refreshes_without_project_trust_or_journal_copy(self):
+        context = self.root / 'memory.md'
+        context.write_text('MEMORY_SENTINEL_FIRST')
+        context.chmod(0o600)
+        (self.repo / 'AGENTS.md').write_text('UNTRUSTED_PROJECT_SENTINEL')
+        for value in ('MEMORY_SENTINEL_FIRST', 'MEMORY_SENTINEL_SECOND'):
+            context.write_text(value)
+            self.final()
+            result = self.run_cli('--system-context-file', str(context))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(value, self.requests[-1]['system'])
+            self.assertNotIn('UNTRUSTED_PROJECT_SENTINEL', self.requests[-1]['system'])
+            self.assertNotIn(value, self.session.read_text() + result.stdout + result.stderr)
+        self.assertNotIn('MEMORY_SENTINEL_FIRST', self.requests[-1]['system'])
+
+    def test_explicit_system_memory_rejects_unsafe_inputs_before_provider_or_journal(self):
+        private = self.root / 'private'; private.mkdir()
+        context = private / 'memory.md'; context.write_text('PRIVATE_SENTINEL')
+        context.chmod(0o600)
+        symlink = self.root / 'linked'; symlink.symlink_to(private, target_is_directory=True)
+        link = self.root / 'memory-link'; link.symlink_to(context)
+        fifo = self.root / 'fifo'; os.mkfifo(fifo, 0o600)
+        for path in (link, symlink / 'memory.md', fifo, private, self.repo / 'AGENTS.md'):
+            result = self.run_cli('--system-context-file', str(path))
+            self.assertEqual(result.returncode, 2, result.stderr)
+        for data, mode in ((b'PRIVATE_SENTINEL', 0o644), (b'x'*32769, 0o600),
+                           (b'\xff', 0o600), (b'  ', 0o600)):
+            context.write_bytes(data); context.chmod(mode)
+            self.assertEqual(self.run_cli('--system-context-file', str(context)).returncode, 2)
+        context.write_text('PRIVATE_SENTINEL'); os.link(context, self.root/'hardlink')
+        self.assertEqual(self.run_cli('--system-context-file', str(context)).returncode, 2)
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.session.exists())
+
+    def test_system_context_rejects_tool_mounts_and_discovery_duplicates(self):
+        for path in ('/usr/local/private-memory.md', '/bin/memory.md', '/lib/memory.md', '/lib64/memory.md'):
+            result = self.run_cli('--system-context-file', path)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('overlaps a tool mount', result.stderr)
+        agents = self.home / '.pi' / 'agent' / 'AGENTS.md'
+        agents.parent.mkdir(parents=True)
+        agents.write_text('DISCOVERED_PRIVATE_SENTINEL')
+        agents.chmod(0o600)
+        result = self.run_cli('--trust-project', '--system-context-file', str(agents))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('overlaps a tool mount', result.stderr)
+        self.assertNotIn('DISCOVERED_PRIVATE_SENTINEL', result.stderr)
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.session.exists())
+
     def detached(self, tail):
         # setsid escapes a process-group-only implementation. PIDs and a delayed
         # marker prove termination and actual reaping, not merely closed pipes.

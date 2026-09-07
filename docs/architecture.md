@@ -355,3 +355,21 @@ session. Bounded checkpoint excerpts cannot replace the original receipt.
 The CLI defaults to host execution; see [execution modes](execution.md) for
 permissions and Linux supervisor requirements. Existing isolation suites select
 bubblewrap explicitly. `test_host_execution.py` is also required by the host gate.
+
+## Explicit caller memory
+
+`--system-context-file /absolute/private/memory.md` reads an owner-owned 0600,
+single-link UTF-8 regular file outside the workspace, capped at 32768 bytes.
+Every parent and file is opened without following symlinks. Files beneath the
+executor's shared system mounts (/usr, /bin, /lib, /lib64), and files already
+selected by project/skill discovery, are rejected. Invalid input fails
+before journal creation or provider dispatch. The caller controls audience
+routing and refreshes the file before each invocation; no new dependency is
+introduced. Combined discovered and explicit context retains the 65536-byte cap.
+
+The snapshot is reference data in the run-local system context. It remains
+present after compaction and is reread on resume; it is not appended to user
+history or directly copied into the journal. Model responses can still quote
+memory. The flag does not enable project trust or mount this file for tools.
+Host tools retain normal user filesystem permissions; this is not a sandbox.
+No memory extraction, storage backend, or automatic recall search is added.

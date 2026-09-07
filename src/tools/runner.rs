@@ -11,6 +11,8 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
 };
+pub(crate) const SYSTEM_MOUNTS: [&str; 4] = ["/usr", "/bin", "/lib", "/lib64"];
+
 pub struct Runner {
     pub cwd: PathBuf,
     pub readable: Vec<PathBuf>,
@@ -35,7 +37,7 @@ impl Runner {
                 "ALL",
                 "--clearenv",
             ]);
-            for dir in ["/usr", "/bin", "/lib", "/lib64"] {
+            for dir in SYSTEM_MOUNTS {
                 if Path::new(dir).exists() {
                     cmd.arg("--ro-bind").arg(dir).arg(dir);
                 }

@@ -123,6 +123,23 @@ class Compaction(fixture.Fixture):
         self.responses.extend([(200, serve)] * 50)
         return state
 
+    def test_explicit_memory_survives_compaction_without_journal_copy_or_tool_mount(self):
+        memory = self.root / 'private-memory.md'
+        memory.write_text('CCC_MEMORY_SENTINEL')
+        memory.chmod(0o600)
+        state = self.queue_task('glm', rounds=2)
+        result = self.run_cli('glm', '--system-context-file', str(memory))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreater(state['summaries'], 0)
+        for body in state['action_requests']:
+            self.assertIn('CCC_MEMORY_SENTINEL', body['messages'][0]['content'])
+        self.assertNotIn('CCC_MEMORY_SENTINEL', self.session.read_text())
+        self.responses = [(200, reply('glm', [('bash', {'command': f'cat {memory}'})])),
+                          (200, reply('glm'))]
+        result = self.run_cli('glm', '--system-context-file', str(memory))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('CCC_MEMORY_SENTINEL', self.session.read_text())
+
     def test_multiple_compactions_and_resume_for_all_providers(self):
         for provider in ('anthropic', 'openai', 'glm'):
             with self.subTest(provider=provider):
