@@ -9,7 +9,7 @@ Not a port of [piri](https://github.com/jinwon-int/piri), [earendil-works/pi](ht
 ## Build and run
 
 The first v0 implementation is a Linux headless loop with Anthropic Messages, OpenAI Responses and Z.AI GLM
-Chat Completions adapters, default bubblewrap isolation, durable sessions, and bounded context.
+Chat Completions adapters, default host execution with optional bubblewrap isolation, durable sessions, and bounded context.
 
 ```sh
 cargo build --release --locked
@@ -20,7 +20,12 @@ target/release/danso --cwd /path/to/repo --trust-project \
   --model YOUR_ANTHROPIC_MODEL -p 'Explain this repository'
 ```
 
-Requires Rust 1.98.1 to build and `/usr/bin/bwrap` with user namespaces to run.
+Requires Rust 1.98.1 to build. Running the binary requires Linux 5.3+ with
+procfs/pidfd support and `/bin/bash`; no bubblewrap, Python, Node or Docker is
+needed for the default CLI. Tools use the current user’s filesystem/network
+permissions. Environment clearing is not protection from readable host credentials.
+Use `--sandbox bubblewrap` to require `/usr/bin/bwrap` and usable user namespaces;
+isolation failure never falls back to host execution. See [execution modes](docs/execution.md).
 Without `-p`, stdout is JSONL. Reuse the session path to continue a completed
 linear conversation. An uncertain interrupted tool requires manual recovery.
 

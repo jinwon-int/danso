@@ -65,7 +65,7 @@ class Acceptance(unittest.TestCase):
         self.tmp.cleanup()
 
     def command(self, *extra):
-        return [str(BIN), '--cwd', str(self.repo), '--session', str(self.session),
+        return [str(BIN), '--sandbox', 'bubblewrap', '--cwd', str(self.repo), '--session', str(self.session),
                 '--model', 'fixture-model', *extra, 'do the task']
 
     def run_cli(self, *extra):

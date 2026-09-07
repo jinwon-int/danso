@@ -31,7 +31,7 @@ cd ../project-supervised-danso
 Choose unused branch and worktree names. Check the target repository's
 instructions and source before allowing `--trust-project`; this flag enables
 project instruction/skill loading for the invocation, not additional tool access.
-Keep the default sandbox and do not pass `--unsafe-no-sandbox`.
+Explicitly select `--sandbox bubblewrap` for this isolated workflow.
 
 Create a fresh session directory outside the target workspace. The following
 assumes `$HOME/.danso/sessions` is outside that workspace; choose another
@@ -57,7 +57,7 @@ placeholders before running; use a tool-capable GLM model your account supports.
 MODEL=YOUR_GLM_MODEL
 TASK='REPLACE with the bounded task, allowed files, and acceptance criteria.'
 "$DANSO_BIN" \
-  --provider glm --model "$MODEL" \
+  --sandbox bubblewrap --provider glm --model "$MODEL" \
   --cwd . --trust-project \
   --session "$SESSION_PATH" \
   --max-turns 32 --timeout-seconds 600 \

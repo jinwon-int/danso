@@ -378,7 +378,7 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
         from integrations.ccc_node import _failure
         self.assertEqual(process.returncode, 2)
         self.assertEqual(_failure(stderr, process.returncode).code, 'danso_configuration')
-        process = await asyncio.create_subprocess_exec(str(fixture.BIN), '--cwd', str(self.repo),
+        process = await asyncio.create_subprocess_exec(str(fixture.BIN), '--sandbox', 'bubblewrap', '--cwd', str(self.repo),
                     '--session', str(self.runtime.root / 'invalid.jsonl'), '--provider', 'glm',
                     '--model', 'fixture', '--compact-at-bytes', '1', '-p', 'hello',
                     env=self.env('glm'), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)

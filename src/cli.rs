@@ -35,8 +35,11 @@ pub struct Args {
     /// Allow reading project AGENTS.md and skill metadata for this invocation.
     #[arg(long)]
     pub trust_project: bool,
-    /// Explicit opt-out from Linux bubblewrap isolation. For controlled tests only.
-    #[arg(long)]
+    /// Execution backend: host uses current-user permissions; bubblewrap isolates tools.
+    #[arg(long, default_value = "host", value_parser = ["host", "bubblewrap"])]
+    pub sandbox: String,
+    /// Deprecated alias for host execution. Cannot be combined with --sandbox.
+    #[arg(long, conflicts_with = "sandbox")]
     pub unsafe_no_sandbox: bool,
     #[arg(long, default_value_t = 16)]
     pub max_turns: u32,
@@ -62,7 +65,7 @@ impl Args {
             provider: self.provider.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             trust_project: self.trust_project,
-            unsafe_no_sandbox: self.unsafe_no_sandbox,
+            unsafe_no_sandbox: self.sandbox == "host",
             max_turns: self.max_turns,
             compact_at_bytes: self.compact_at_bytes,
             timeout_seconds: self.timeout_seconds,
