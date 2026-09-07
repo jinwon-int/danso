@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -54,6 +55,81 @@ class Profiles(unittest.TestCase):
                     self.assertEqual(run.call_count, 1)
                     self.assertNotIn('private-marker', output.getvalue())
                     self.assertNotIn('PASS', output.getvalue())
+
+
+class OutputContract(unittest.TestCase):
+    """Wrapper output is a contract independent of a check's own diagnostics."""
+
+    MODES = (('worker', False), ('worker', True), ('host', False))
+    BANNERS = {
+        'worker': 'WORKER SUBSET ONLY: Python safety/failure-report/profile unit tests. '
+                  'Rust and sandbox integration checks are NOT run; host checks remain required.\n',
+        'host': 'HOST CHECKS: Rust toolchain and functioning bubblewrap required. No fallback or live calls.\n',
+    }
+
+    def check_output(self, profile, structured, failure=None, fail_at=1):
+        # Two synthetic checks let every mode exercise failure after partial
+        # progress without running Cargo, a provider, or another test process.
+        planned = [['check-one'], ['check-two']]
+        invoked = []
+        stdout, stderr = io.StringIO(), io.StringIO()
+        expected_cwd = dev_check.ROOT / 'scripts' if profile == 'worker' else dev_check.ROOT
+
+        def child(command, *, cwd):
+            invoked.append((command, cwd))
+            index = len(invoked)
+            if failure == 'start' and index == fail_at:
+                raise OSError('synthetic-private-marker')
+            print(f'child-{index}-stdout')
+            print(f'child-{index}-stderr', file=sys.stderr)
+            return subprocess.CompletedProcess(command, 9 if failure == 'exit' and index == fail_at else 0)
+
+        argv = ['--profile', profile] + (['--json'] if structured else [])
+        with patch.object(dev_check, 'commands', return_value=planned), \
+                patch.object(dev_check.subprocess, 'run', side_effect=child), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = dev_check.main(argv)
+
+        count = fail_at if failure else 2
+        self.assertEqual(invoked, [(command + (['--json'] if structured else []), expected_cwd)
+                                   for command in [['check-one'], ['check-two']][:count]])
+        self.assertEqual(planned, [['check-one'], ['check-two']])
+        emitted = count - (1 if failure == 'start' else 0)
+        expected_stdout = '' if structured else self.BANNERS[profile]
+        expected_stdout += ''.join(f'child-{i}-stdout\n' for i in range(1, emitted + 1))
+        expected_stderr = ''.join(f'child-{i}-stderr\n' for i in range(1, emitted + 1))
+        if failure:
+            expected_stderr += ('FAIL: check could not start; verify the required host toolchain/environment.\n'
+                                if failure == 'start' else
+                                'FAIL: development check stopped; no remaining checks were run.\n')
+        elif not structured:
+            expected_stdout += f'PASS: {profile} checks only.\n'
+        self.assertEqual(code, 1 if failure else 0)
+        self.assertEqual(stdout.getvalue(), expected_stdout)
+        self.assertEqual(stderr.getvalue(), expected_stderr)
+
+    def test_success_preserves_both_child_streams_and_wrapper_output(self):
+        for profile, structured in self.MODES:
+            with self.subTest(profile=profile, structured=structured):
+                self.check_output(profile, structured)
+
+    def test_failure_preserves_streams_status_and_stops_remaining_checks(self):
+        for profile, structured in self.MODES:
+            for failure in ('exit', 'start'):
+                for fail_at in (1, 2):
+                    with self.subTest(profile=profile, structured=structured, failure=failure, fail_at=fail_at):
+                        self.check_output(profile, structured, failure, fail_at)
+
+    def test_host_json_rejection_has_no_stdout_or_check_effects(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(dev_check.subprocess, 'run') as run, \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                self.assertRaises(SystemExit) as raised:
+            dev_check.main(['--profile', 'host', '--json'])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(stdout.getvalue(), '')
+        self.assertIn('error: --json supports the worker profile only\n', stderr.getvalue())
+        run.assert_not_called()
 
 
 class PlanOutput(unittest.TestCase):
