@@ -60,6 +60,53 @@ class Progress(unittest.TestCase):
         rows = [r for r in map(json.loads, p.stdout.splitlines()) if r['type'] == 'danso_progress']
         self.assertFalse(rows[-1]['success'])
 
+    def test_closed_stdout_after_start_returns_output_error_without_replay(self):
+        self.tool('bash', {'command': 'sleep 1; touch executed-after-progress'})
+        process = subprocess.Popen(self.command('--progress-jsonl'), env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        pending = b''
+        try:
+            started = False
+            while not started:
+                self.assertTrue(selector.select(5), 'progress did not arrive')
+                chunk = process.stdout.read1(65536)
+                self.assertTrue(chunk, 'CLI exited before progress')
+                pending += chunk
+                while b'\n' in pending:
+                    line, pending = pending.split(b'\n', 1)
+                    row = json.loads(line)
+                    started |= (row.get('type') == 'danso_progress'
+                                and row.get('phase') == 'started')
+            process.stdout.close()
+            process.wait(timeout=10)
+            error = process.stderr.read().decode()
+            self.assertEqual(process.returncode, 3, error)
+            self.assertNotIn('panicked', error)
+            diagnostics = [json.loads(line.split('=', 1)[1]) for line in error.splitlines()
+                           if line.startswith('DANSO_ERROR=')]
+            self.assertEqual(diagnostics[0]['category'], 'output')
+            self.assertIn('DANSO_USAGE=', error)
+            self.assertTrue((self.repo / 'executed-after-progress').exists())
+            rows = list(map(json.loads, self.session.read_text().splitlines()))
+            states = [row['data']['state'] for row in rows
+                      if row.get('customType') == 'danso.operation.v1']
+            self.assertEqual(states, ['started'])
+            before = self.session.read_bytes()
+            requests = len(self.requests)
+            resume = self.run_cli('--progress-jsonl')
+            self.assertNotEqual(resume.returncode, 0)
+            self.assertEqual(len(self.requests), requests, 'uncertain effect was replayed')
+            self.assertEqual(self.session.read_bytes(), before)
+        finally:
+            selector.close()
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdout.close()
+            process.stderr.close()
+
     def test_progress_is_opt_in_and_cannot_mix_with_print(self):
         self.tool('read', {'path': 'absent'})
         p = self.run_cli()

@@ -72,22 +72,24 @@ pub enum Mode {
 pub struct PrintSink(pub Mode);
 impl EventSink for PrintSink {
     fn emit(&mut self, event: Event<'_>) -> Result<()> {
+        let mut stdout = std::io::stdout().lock();
         match (self.0, event) {
             (
                 Mode::Json,
                 Event::Session(entry) | Event::Message(entry) | Event::Compaction(entry),
-            ) => println!("{entry}"),
+            ) => writeln!(stdout, "{entry}")?,
             (Mode::Text, Event::FinalAnswer(message)) => {
                 if let Some(blocks) = message["content"].as_array() {
                     for block in blocks {
                         if let Some(text) = block["text"].as_str() {
-                            println!("{text}");
+                            writeln!(stdout, "{text}")?;
                         }
                     }
                 }
             }
             _ => {}
         }
+        stdout.flush()?;
         Ok(())
     }
 }
