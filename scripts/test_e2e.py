@@ -239,6 +239,44 @@ class Acceptance(unittest.TestCase):
         self.assertIn('64 KiB', self.results()[0]['content'][0]['text'])
         self.assertIn('timed out', self.results()[1]['content'][0]['text'])
 
+    def test_write_creates_nested_utf8_file_with_exact_host_bytes(self):
+        content = 'héllo 한글 😀\nsecond line\n'
+        self.tool('write', {'path': 'nested/deeper/dir/파일.txt', 'content': content})
+        p = self.run_cli()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        receipt = self.results()[0]
+        self.assertFalse(receipt['isError'], receipt)
+        target = self.repo / 'nested' / 'deeper' / 'dir' / '파일.txt'
+        self.assertTrue(target.is_file())
+        self.assertEqual(target.read_bytes(), content.encode('utf-8'))
+
+    def test_write_exactly_256kib_ascii_succeeds(self):
+        content = 'a' * (256 * 1024)
+        self.tool('write', {'path': 'big.txt', 'content': content})
+        p = self.run_cli()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        receipt = self.results()[0]
+        self.assertFalse(receipt['isError'], receipt)
+        self.assertEqual((self.repo / 'big.txt').read_bytes(),
+                         b'a' * (256 * 1024))
+
+    def test_write_unicode_over_byte_limit_is_rejected_without_side_effects(self):
+        # 257 KiB of bytes via 2-byte characters: below the 256 KiB character
+        # count a naive length check would allow, but over the byte budget.
+        content = 'é' * (257 * 1024 // 2)
+        self.assertLess(len(content), 256 * 1024)
+        self.assertGreater(len(content.encode('utf-8')), 256 * 1024)
+        target = self.repo / 'existing.txt'
+        target.write_text('PRE_EXISTING')
+        self.session = self.root / 'over-limit.jsonl'  # fresh session: large payload stays within history limits
+        self.tool('write', {'path': 'existing.txt', 'content': content})
+        p = self.run_cli()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        receipt = self.results()[0]
+        self.assertTrue(receipt['isError'], receipt)
+        self.assertIn('byte budget', str(receipt['content']))
+        self.assertEqual(target.read_text(), 'PRE_EXISTING')
+
     def test_provider_error_and_config_error_contract(self):
         self.responses.append((429, {'error': 'do-not-print-provider-body'}))
         p = self.run_cli('-p')
