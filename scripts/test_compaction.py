@@ -47,10 +47,23 @@ class Compaction(fixture.Fixture):
         return super().env(provider)
 
     def run_cli(self, provider, *extra, env=None):
-        return subprocess.run([str(fixture.BIN), '--cwd', str(self.repo), '--session', str(self.session),
+        return subprocess.run([str(fixture.BIN), '--sandbox', 'bubblewrap', '--cwd', str(self.repo), '--session', str(self.session),
                                '--provider', provider, '--model', 'fixture', '--compact-at-bytes', '8192',
                                '--max-turns', '32', *extra, '-p', 'ORIGINAL_GOAL finish without repeated effects'],
                               capture_output=True, text=True, timeout=25, env=env or self.env(provider))
+
+    def test_compaction_executor_retains_isolation(self):
+        outside = self.root / 'outside-marker'
+        outside.write_text('COMPACTION_HOST_LEAK')
+        self.responses = [(200, reply('glm', [('bash', {'command': f'cat {outside}'})])),
+                          (200, reply('glm'))]
+        result = self.run_cli('glm')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outputs = [entry['message'] for entry in self.records()
+                   if entry.get('message', {}).get('role') == 'toolResult']
+        self.assertEqual(len(outputs), 1)
+        self.assertTrue(outputs[0]['isError'], outputs)
+        self.assertNotIn('COMPACTION_HOST_LEAK', str(outputs))
 
     def test_working_directory_context_preserves_full_project_budget(self):
         agents = self.home / '.pi' / 'agent' / 'AGENTS.md'
@@ -516,7 +529,7 @@ class Compaction(fixture.Fixture):
                     return normal
                 self.responses[:] = [(200, serve)] * 50
                 if mode in ('budget', 'format_budget'):
-                    p = subprocess.run([str(fixture.BIN), '--cwd', str(self.repo), '--session', str(self.session),
+                    p = subprocess.run([str(fixture.BIN), '--sandbox', 'bubblewrap', '--cwd', str(self.repo), '--session', str(self.session),
                                         '--provider', 'glm', '--model', 'fixture', '--compact-at-bytes', '8192',
                                         '--max-turns', '3', '-p', 'ORIGINAL_GOAL'], env=self.env('glm'),
                                        capture_output=True, text=True, timeout=20)
@@ -532,7 +545,7 @@ class Compaction(fixture.Fixture):
     def test_summary_calls_consume_turn_budget_and_preserve_source(self):
         state = self.queue_task('glm', rounds=3)
         # The overridden run avoids duplicate clap flags.
-        p = subprocess.run([str(fixture.BIN), '--cwd', str(self.repo), '--session', str(self.session),
+        p = subprocess.run([str(fixture.BIN), '--sandbox', 'bubblewrap', '--cwd', str(self.repo), '--session', str(self.session),
                             '--provider', 'glm', '--model', 'fixture', '--compact-at-bytes', '8192',
                             '--max-turns', '2', '-p', 'ORIGINAL_GOAL'], env=self.env('glm'),
                            capture_output=True, text=True, timeout=20)
@@ -578,7 +591,7 @@ class Compaction(fixture.Fixture):
         self.assertGreater(len(fragments), 1)
 
     def test_unshrinkable_latest_request_fails_before_summary(self):
-        p = subprocess.run([str(fixture.BIN), '--cwd', str(self.repo), '--session', str(self.session),
+        p = subprocess.run([str(fixture.BIN), '--sandbox', 'bubblewrap', '--cwd', str(self.repo), '--session', str(self.session),
                             '--provider', 'glm', '--model', 'fixture', '--compact-at-bytes', '8192',
                             '-p', 'x' * 10000], env=self.env('glm'), capture_output=True, text=True, timeout=10)
         self.assertEqual(p.returncode, 2, p.stderr)
@@ -595,7 +608,7 @@ class Compaction(fixture.Fixture):
             return reply('glm', text=json.dumps(SUMMARY))
         self.responses.extend([(200, reply('glm', [('bash', {'command': "echo done >> effects.txt; printf '%09000d' 0"})])),
                                (200, blocked)])
-        p = subprocess.Popen([str(fixture.BIN), '--cwd', str(self.repo), '--session', str(self.session),
+        p = subprocess.Popen([str(fixture.BIN), '--sandbox', 'bubblewrap', '--cwd', str(self.repo), '--session', str(self.session),
                               '--provider', 'glm', '--model', 'fixture', '--compact-at-bytes', '8192',
                               '-p', 'continue'], env=self.env('glm'), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:

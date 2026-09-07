@@ -266,7 +266,7 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
         gate=await self.gate()
         workspace=self.root/'workspace';workspace.mkdir()
         binary=Path(os.environ.get('DANSO_BIN','target/debug/danso')).resolve()
-        process=await asyncio.create_subprocess_exec(str(binary),'--provider','openai','--model','gpt-6-astra',
+        process=await asyncio.create_subprocess_exec(str(binary),'--sandbox','bubblewrap','--provider','openai','--model','gpt-6-astra',
             '--reasoning-effort','medium','--cwd',str(workspace),'--session',str(self.root/'session.jsonl'),'-p','do task',
             env={'PATH':'/usr/bin:/bin','HOME':str(self.root),'OPENAI_API_KEY':gate.token,
                  'DANSO_OPENAI_BASE_URL':f'http://127.0.0.1:{gate.port}/v1'},
