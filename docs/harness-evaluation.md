@@ -203,3 +203,83 @@ Use the existing PR #27 planner/reporter only with genuine execution receipts.
 Run `python3 scripts/test_eval_case.py` on a host with bubblewrap. Tests prove
 all seeded defects fail, corrected solutions pass, and timeout/output/privacy/
 path/permission gates work. They are included in CI and the full host checks.
+
+
+## Common dispatch gate (loopback rehearsal)
+
+`scripts/eval_dispatch.py` adds `DispatchGate`, a bounded HTTP Responses gateway
+for the next paired-runner component. It forwards only to an explicitly supplied
+`127.0.0.1` fixture port and has no live-provider credential or HTTPS transport.
+It does not launch a harness, prevent a process from bypassing the gateway, enforce
+aggregate harness process/disk quotas, or produce paired job receipts. The outer
+supervisor must provide those guarantees before a live comparison is meaningful.
+Do not point it at an operational local proxy as a substitute for an authorized run.
+
+```python
+gate = DispatchGate(("127.0.0.1", fake_provider_port), fresh_evidence_path,
+                    model="gpt-6-astra", effort="medium", request_limit=4)
+try:
+    await gate.start()
+    # Configure the owned client with http://127.0.0.1:{gate.port}/v1
+    # and gate.token through its private environment/config; never print it.
+    ...
+finally:
+    await gate.close()
+```
+
+Admission fixes model, reasoning effort, output-token limit and `store=false`.
+Only four named function tools are allowed; hosted tools, server-side conversation
+references, background requests and unsupported fields are rejected before dispatch.
+The gateway has no retry loop. Every admitted client retry or summarization POST
+reserves a new slot, under the same budget as all concurrent requests. A failed
+connection also consumes its reserved slot conservatively. Requests rejected by
+budget are counted separately and never reach the fixture. One gateway/evidence
+root belongs to exactly one job and cannot be reopened or replayed.
+
+A private JSONL journal is fsynced before upstream connection/dispatch. It records
+request hashes, sequence, status and token totals, never task/response bodies or
+authentication values. A `started` record has unknown `dispatch_attempted`: a crash
+at that point must not be interpreted as proof nothing happened. Terminal records
+and the in-process summary distinguish reservation from initiation of a socket
+write. A dispatch attempt is not proof the server accepted or billed it. Journal
+failure poisons the gate and makes the summary incomplete. Cancellation preserves
+unsettled reservations; it does not retry them. Keep incomplete evidence directories.
+
+Token totals are known only for a valid completed response with integer
+`input_tokens + output_tokens == total_tokens`. Cached input is already part of
+input and is not added again. Missing/error/malformed/truncated usage stays null
+for the whole run, even if another call succeeded. HTTP errors consume budget.
+`complete` describes dispatch accounting, not task success or acceptance success.
+Empty and rejected-only jobs remain incomplete with unknown usage.
+
+Both JSON and SSE responses are supported. This rehearsal implementation buffers
+up to 8 MiB before forwarding; it is not a token-arrival latency instrument.
+It requires bounded Content-Length or plain chunked upstream framing, no trailers,
+chunk extensions or compressed responses. The fixture must close the response
+connection within the deadline, with no trailing bytes after its framed body. Incoming requests require Content-Length;
+duplicate headers and unsupported framing fail closed. There are at most eight
+active handlers, a creation-relative job deadline, a per-request deadline and
+bounded connection cleanup. Client credentials/headers are not relayed upstream.
+Loopback transport is not process/network isolation for either harness.
+
+Sources: [official Responses streaming guide](https://developers.openai.com/api/docs/guides/streaming-responses)
+(`stream=true`, typed SSE events and `response.completed`) and the
+[Responses API reference](https://developers.openai.com/api/reference/resources/responses).
+The documented supported usage shape is validated conservatively; unsupported
+shapes yield unknown totals rather than inferred billing.
+
+Default CI/host validation includes `scripts/test_eval_dispatch.py`: actual HTTP
+concurrency/retries, policy/auth rejection, two-job separation, durable failure,
+timeout/close/size/framing behavior, usage accounting, and a real Danso CLI through
+the gate to a fake provider. A separately built Pi is optional infrastructure:
+
+```sh
+PI_EVAL_CLI=/absolute/pinned/pi/dist/bundle/cli.js python3 scripts/test_eval_dispatch_pi.py
+```
+
+That explicit interop test starts the real Pi CLI with isolated configuration,
+forces the same model/effort/output limit, and completes a streamed fixture response.
+It is not silently included or skipped in the default CI count. Record its pinned
+source/build provenance separately. Neither test calls a real model or measures
+model quality. Pair scheduling, CLI provenance verification, outer process/egress
+supervision and final receipt integration remain the next execution bundle.
