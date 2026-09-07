@@ -1,0 +1,28 @@
+{
+  "schema": "danso.eval.case.v1",
+  "id": "paths",
+  "prompt": "Fix app/resolve.py. Stdin is a JSON string naming a configuration file relative to the working directory. Read its JSON \"data\" field, resolve that path relative to the configuration file directory, read the target UTF-8 text, and print it as a JSON string. Preserve the CLI and support spaces and parent-directory components. Use only the standard library. The acceptance environment permits only a single process: do not create subprocesses or threads.",
+  "files": {
+    "app/resolve.py": "import json, sys\nfrom pathlib import Path\nconfig = Path(json.load(sys.stdin))\nprint(json.dumps(Path(json.loads(config.read_text())[\"data\"]).read_text()))\n",
+    "config/prod.json": "{\"data\":\"../data/source.txt\"}\n",
+    "config/space name.json": "{\"data\":\"../data/with spaces.txt\"}\n",
+    "data/source.txt": "production\n",
+    "data/with spaces.txt": "other\n",
+    "root.json": "{\"data\":\"data/source.txt\"}\n"
+  },
+  "entrypoint": "app/resolve.py",
+  "checks": [
+    {
+      "input": "config/prod.json",
+      "expected": "production\n"
+    },
+    {
+      "input": "config/space name.json",
+      "expected": "other\n"
+    },
+    {
+      "input": "root.json",
+      "expected": "production\n"
+    }
+  ]
+}

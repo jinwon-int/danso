@@ -142,3 +142,64 @@ Tests cover schedule integrity, missing/duplicate attempts, mixed outcomes,
 unknown measurements, budget overruns, matched pair accounting and bounded
 input handling. They run without an installed Pi or live credentials and are
 part of the host and GitHub CI checks. They are not model-quality evaluations.
+
+
+## Concrete task corpus and acceptance executor
+
+`examples/harness-eval/cases/` now contains three small, real coding tasks:
+ASCII slug normalization, quoted CSV integer aggregation, and resolving data
+paths relative to configuration files. Each original implementation fails at
+least one behavioral check. These cover short fixes only; they do not establish
+long-context, resumption, or repository-scale performance.
+
+```sh
+python3 scripts/eval_case.py catalog
+python3 scripts/eval_case.py prepare paths /private/experiment/workspace
+# Run the separately supervised harness on that workspace using the case prompt.
+python3 scripts/eval_case.py accept paths /private/experiment/workspace /private/experiment/acceptance-001
+```
+
+`catalog` produces real case digests suitable for `spec.cases`. The input digest
+is SHA-256 of the UTF-8-file mapping serialized using `harness_eval.digest`:
+JSON sorted keys, compact separators, default ASCII escaping, no trailing newline.
+Prompt digests cover the exact UTF-8 string bytes. Acceptance digests bind the
+entrypoint, vectors, runner source and limits; they must be regenerated when
+those change. The task prompt and oracle stay outside the prepared workspace.
+Tests are public benchmark vectors, not secret test security or a guarantee
+against benchmark contamination.
+
+The acceptance executor snapshots the stopped candidate into a fresh private
+attempt directory, rejects symlinks/special files and caps file count/bytes,
+then executes the Python CLI in a read-only bubblewrap workspace with networking,
+capabilities and inherited environment disabled. Expected results remain in the
+host process; candidate code cannot alter the oracle or its output decision.
+Each check starts a fresh process with a 3-second wall bound, 64-KiB output caps,
+CPU/address-space/file limits, and process-group cleanup. A sealed seccomp filter
+denies fork/vfork/clone/clone3 (including threads) for these explicitly single-process
+CLI tasks. It rejects unsupported syscall architectures and x32 calls. Linux x86-64
+and AArch64 are supported; missing seccomp support fails sandbox preflight.
+Bubblewrap is fixed to the root-owned, non-group/world-writable regular file
+`/usr/bin/bwrap`; ambient PATH cannot substitute another executable. Reports
+record its digest and the process-filter digest. These restrictions apply to
+acceptance code, not to the future agent harness tool process supervisor.
+Sandbox preflight failure is an infrastructure error, not a failed model task.
+
+Exit codes are 0 (all checks pass), 1 (a behavioral check fails), 2 (input,
+snapshot or infrastructure failure). Reports include the candidate digest,
+check states and stdout/stderr hashes. Logs and immutable input copies remain
+in the owner-only evidence directory; rerunning into an existing destination
+is rejected. Interrupted attempts may be incomplete and must be retained and
+classified by the experiment supervisor, never silently retried. Stop the
+candidate harness before snapshotting; this is not a concurrent live-workspace
+snapshot or a sandbox for a hostile local host user.
+
+This is an **acceptance execution component**, not yet the paired live harness
+runner. The next component must launch pinned Danso/Pi builds, supply matching
+prompts/settings, enforce provider dispatch budgets including retries, and
+produce job receipts linked to these acceptance artifacts. `accept` does not
+call a model, calculate performance metrics or generate harness success claims.
+Use the existing PR #27 planner/reporter only with genuine execution receipts.
+
+Run `python3 scripts/test_eval_case.py` on a host with bubblewrap. Tests prove
+all seeded defects fail, corrected solutions pass, and timeout/output/privacy/
+path/permission gates work. They are included in CI and the full host checks.

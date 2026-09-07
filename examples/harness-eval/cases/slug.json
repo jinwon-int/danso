@@ -1,0 +1,31 @@
+{
+  "schema": "danso.eval.case.v1",
+  "id": "slug",
+  "prompt": "Fix slug.py. Read one JSON string from stdin and print its slug as a JSON string. Strip leading/trailing whitespace, lowercase, replace each run of characters outside ASCII a-z and 0-9 with one hyphen, and remove leading/trailing hyphens. Keep the standard-library-only CLI. Do not change the interface. The acceptance environment permits only a single process: do not create subprocesses or threads.",
+  "files": {
+    "slug.py": "import json, sys\nvalue = json.load(sys.stdin)\nprint(json.dumps(value.lower().replace(\" \", \"-\")))\n"
+  },
+  "entrypoint": "slug.py",
+  "checks": [
+    {
+      "input": " Hello, WORLD! ",
+      "expected": "hello-world"
+    },
+    {
+      "input": "a___b   c",
+      "expected": "a-b-c"
+    },
+    {
+      "input": "---",
+      "expected": ""
+    },
+    {
+      "input": "Café 42",
+      "expected": "caf-42"
+    },
+    {
+      "input": "abc123",
+      "expected": "abc123"
+    }
+  ]
+}

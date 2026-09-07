@@ -36,3 +36,5 @@ module boundary; `app.rs` is the composition root and `runtime.rs` is agent poli
 - Worker checks emit DANSO_CHECK_RESULTS with per-selector counts; use those
   counts in reports. A combined worker total is not any one module count.
   Run `python3 scripts/test_worker_checks.py` as part of host validation.
+
+- Include `python3 scripts/test_eval_case.py` for the host-only evaluation corpus and isolated acceptance executor. It requires bubblewrap; do not put it in the worker subset.
