@@ -360,7 +360,9 @@ bubblewrap explicitly. `test_host_execution.py` is also required by the host gat
 
 `--system-context-file /absolute/private/memory.md` reads an owner-owned 0600,
 single-link UTF-8 regular file outside the workspace, capped at 32768 bytes.
-Every parent and file is opened without following symlinks. Invalid input fails
+Every parent and file is opened without following symlinks. Files beneath the
+executor's shared system mounts (/usr, /bin, /lib, /lib64), and files already
+selected by project/skill discovery, are rejected. Invalid input fails
 before journal creation or provider dispatch. The caller controls audience
 routing and refreshes the file before each invocation; no new dependency is
 introduced. Combined discovered and explicit context retains the 65536-byte cap.

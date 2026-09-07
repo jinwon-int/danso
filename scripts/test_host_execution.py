@@ -74,6 +74,22 @@ class Host(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertFalse(self.session.exists())
 
+    def test_system_context_rejects_tool_mounts_and_discovery_duplicates(self):
+        for path in ('/usr/local/private-memory.md', '/bin/memory.md', '/lib/memory.md', '/lib64/memory.md'):
+            result = self.run_cli('--system-context-file', path)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('overlaps a tool mount', result.stderr)
+        agents = self.home / '.pi' / 'agent' / 'AGENTS.md'
+        agents.parent.mkdir(parents=True)
+        agents.write_text('DISCOVERED_PRIVATE_SENTINEL')
+        agents.chmod(0o600)
+        result = self.run_cli('--trust-project', '--system-context-file', str(agents))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('overlaps a tool mount', result.stderr)
+        self.assertNotIn('DISCOVERED_PRIVATE_SENTINEL', result.stderr)
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.session.exists())
+
     def detached(self, tail):
         # setsid escapes a process-group-only implementation. PIDs and a delayed
         # marker prove termination and actual reaping, not merely closed pipes.
