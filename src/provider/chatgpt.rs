@@ -3,6 +3,7 @@
 use super::http::Http;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub struct ChatGpt {
@@ -88,6 +89,7 @@ fn parse_events(data: &[u8]) -> Result<Option<Value>> {
     let normalized = text.replace("\r\n", "\n");
     ensure!(normalized.ends_with("\n\n"), "truncated ChatGPT SSE stream");
     let mut terminal = None;
+    let mut items: BTreeMap<u64, Value> = BTreeMap::new();
     for block in normalized.split("\n\n") {
         let mut event = None;
         let mut payload = Vec::new();
@@ -133,7 +135,42 @@ fn parse_events(data: &[u8]) -> Result<Option<Value>> {
                         && v["response"]["error"].is_null(),
                     "ChatGPT response did not complete"
                 );
-                terminal = Some(v["response"].clone());
+                let mut response = v["response"].clone();
+                let output = response["output"]
+                    .as_array_mut()
+                    .context("missing ChatGPT terminal output")?;
+                if output.is_empty() {
+                    for (expected, (index, item)) in items.iter().enumerate() {
+                        ensure!(
+                            *index == expected as u64,
+                            "incomplete ChatGPT streamed output"
+                        );
+                        output.push(item.clone());
+                    }
+                } else {
+                    for (index, item) in &items {
+                        let index =
+                            usize::try_from(*index).context("invalid ChatGPT output index")?;
+                        ensure!(
+                            output.get(index) == Some(item),
+                            "conflicting ChatGPT terminal output"
+                        );
+                    }
+                }
+                terminal = Some(response);
+            }
+            "response.output_item.done" => {
+                let index = v["output_index"]
+                    .as_u64()
+                    .context("missing ChatGPT output index")?;
+                ensure!(
+                    v["item"].is_object(),
+                    "missing ChatGPT completed output item"
+                );
+                ensure!(
+                    items.insert(index, v["item"].clone()).is_none(),
+                    "duplicate ChatGPT output index"
+                );
             }
             "error" | "response.failed" | "response.incomplete" => {
                 bail!("ChatGPT response failed or incomplete")
@@ -141,7 +178,6 @@ fn parse_events(data: &[u8]) -> Result<Option<Value>> {
             "response.created"
             | "response.in_progress"
             | "response.output_item.added"
-            | "response.output_item.done"
             | "response.content_part.added"
             | "response.content_part.done"
             | "response.output_text.delta"
@@ -168,7 +204,7 @@ mod tests {
     #[test]
     fn duplicate_terminal_in_buffer_fails() {
         let frame =
-            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
         let mut data = frame.to_vec();
         data.extend_from_slice(frame);
         assert!(terminal_response(&data).is_err());

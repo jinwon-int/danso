@@ -187,6 +187,10 @@ ends the request, without waiting for the SSE connection to close. Failed,
 incomplete, truncated or unknown events before completion fail before any
 returned tool executes. Duplicate terminal events already in the received
 buffer fail; future bytes after a terminal response are not consumed.
+Completed `response.output_item.done` items are retained by output index. When
+the terminal response has an empty output list, these complete items supply the
+answer and opaque reasoning history. Missing or duplicate indices fail; if the
+terminal repeats output, it must agree with the completed streamed items.
 The existing OpenAI output and opaque-reasoning validation still applies.
 No streamed delta is executed. Usage reports `openai-codex` and
 `openai-codex-responses`; terminal usage must be valid. The service's subscription
