@@ -19,7 +19,7 @@ pub struct Args {
     #[arg(long)]
     pub model: String,
     /// Wire protocol / service to use. Defaults to the original Anthropic path.
-    #[arg(long, default_value = "anthropic", value_parser = ["anthropic", "openai", "glm"])]
+    #[arg(long, default_value = "anthropic", value_parser = ["anthropic", "openai", "openai-codex", "glm"])]
     pub provider: String,
     /// Optional model-specific reasoning effort for OpenAI / GLM.
     #[arg(long, value_parser = ["none", "minimal", "low", "medium", "high", "xhigh", "max"])]

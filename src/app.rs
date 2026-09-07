@@ -80,54 +80,68 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
             "invalid reasoning effort"
         );
     }
-    let (key_name, base_name, default_base) = match args.provider.as_str() {
-        "anthropic" => (
-            "ANTHROPIC_API_KEY",
-            "DANSO_ANTHROPIC_BASE_URL",
-            "https://api.anthropic.com",
-        ),
-        "openai" => (
-            "OPENAI_API_KEY",
-            "DANSO_OPENAI_BASE_URL",
-            "https://api.openai.com/v1",
-        ),
-        "glm" => (
-            "ZAI_API_KEY",
-            "DANSO_GLM_BASE_URL",
-            "https://api.z.ai/api/paas/v4",
-        ),
-        _ => anyhow::bail!("unsupported provider"),
-    };
-    let key = std::env::var(key_name).with_context(|| format!("{key_name} is required"))?;
-    let base = std::env::var(base_name).unwrap_or_else(|_| default_base.into());
-    let mut provider = match args.provider.as_str() {
-        "anthropic" => {
-            ensure!(
-                args.reasoning_effort.is_none(),
-                "reasoning-effort is unsupported by the Anthropic adapter"
-            );
-            Selected::Anthropic(Anthropic::new_with_timeout(
+    let mut provider = if args.provider == "openai-codex" {
+        let auth = std::env::var_os("DANSO_CHATGPT_AUTH_FILE")
+            .context("DANSO_CHATGPT_AUTH_FILE is required")?;
+        let base = std::env::var("DANSO_CHATGPT_BASE_URL")
+            .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".into());
+        Selected::OpenAi(OpenAi::new_chatgpt(
+            args.model.clone(),
+            std::path::Path::new(&auth),
+            &base,
+            args.reasoning_effort.clone(),
+            args.provider_timeout_seconds,
+        )?)
+    } else {
+        let (key_name, base_name, default_base) = match args.provider.as_str() {
+            "anthropic" => (
+                "ANTHROPIC_API_KEY",
+                "DANSO_ANTHROPIC_BASE_URL",
+                "https://api.anthropic.com",
+            ),
+            "openai" => (
+                "OPENAI_API_KEY",
+                "DANSO_OPENAI_BASE_URL",
+                "https://api.openai.com/v1",
+            ),
+            "glm" => (
+                "ZAI_API_KEY",
+                "DANSO_GLM_BASE_URL",
+                "https://api.z.ai/api/paas/v4",
+            ),
+            _ => anyhow::bail!("unsupported provider"),
+        };
+        let key = std::env::var(key_name).with_context(|| format!("{key_name} is required"))?;
+        let base = std::env::var(base_name).unwrap_or_else(|_| default_base.into());
+        match args.provider.as_str() {
+            "anthropic" => {
+                ensure!(
+                    args.reasoning_effort.is_none(),
+                    "reasoning-effort is unsupported by the Anthropic adapter"
+                );
+                Selected::Anthropic(Anthropic::new_with_timeout(
+                    args.model.clone(),
+                    key,
+                    &base,
+                    args.provider_timeout_seconds,
+                )?)
+            }
+            "openai" => Selected::OpenAi(OpenAi::new_with_timeout(
                 args.model.clone(),
                 key,
                 &base,
+                args.reasoning_effort.clone(),
                 args.provider_timeout_seconds,
-            )?)
+            )?),
+            "glm" => Selected::Glm(Glm::new_with_timeout(
+                args.model.clone(),
+                key,
+                &base,
+                args.reasoning_effort.clone(),
+                args.provider_timeout_seconds,
+            )?),
+            _ => unreachable!(),
         }
-        "openai" => Selected::OpenAi(OpenAi::new_with_timeout(
-            args.model.clone(),
-            key,
-            &base,
-            args.reasoning_effort.clone(),
-            args.provider_timeout_seconds,
-        )?),
-        "glm" => Selected::Glm(Glm::new_with_timeout(
-            args.model.clone(),
-            key,
-            &base,
-            args.reasoning_effort.clone(),
-            args.provider_timeout_seconds,
-        )?),
-        _ => unreachable!(),
     };
     let execution_context = context::execution_context(&cwd);
     let runner = Runner {

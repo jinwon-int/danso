@@ -58,6 +58,27 @@ impl Http {
         Ok(Self { client, url, key })
     }
     pub async fn post(&self, body: &Value, usage: &mut crate::usage::Usage) -> Result<Value> {
+        let bytes = self
+            .post_bytes(body, usage, reqwest::header::HeaderMap::new())
+            .await?;
+        serde_json::from_slice(&bytes).context("invalid provider JSON")
+    }
+    pub async fn post_bytes(
+        &self,
+        body: &Value,
+        usage: &mut crate::usage::Usage,
+        headers: reqwest::header::HeaderMap,
+    ) -> Result<Vec<u8>> {
+        self.post_until(body, usage, headers, |_| Ok(None)).await
+    }
+    /// Stop at a validated application-level terminal event without waiting for EOF.
+    pub async fn post_until(
+        &self,
+        body: &Value,
+        usage: &mut crate::usage::Usage,
+        headers: reqwest::header::HeaderMap,
+        terminal: impl Fn(&[u8]) -> Result<Option<usize>>,
+    ) -> Result<Vec<u8>> {
         let bytes = serde_json::to_vec(body)?;
         ensure!(
             bytes.len() <= 512 * 1024,
@@ -67,6 +88,7 @@ impl Http {
         let request = self
             .client
             .post(self.url.clone())
+            .headers(headers)
             .header(reqwest::header::AUTHORIZATION, self.key.clone())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(bytes)
@@ -98,8 +120,13 @@ impl Http {
                 "provider response exceeds 1 MiB"
             );
             bytes.extend_from_slice(&chunk);
+            if let Some(end) = terminal(&bytes)? {
+                ensure!(end <= bytes.len(), "invalid terminal response boundary");
+                bytes.truncate(end);
+                return Ok(bytes);
+            }
         }
-        serde_json::from_slice(&bytes).context("invalid provider JSON")
+        Ok(bytes)
     }
 }
 
