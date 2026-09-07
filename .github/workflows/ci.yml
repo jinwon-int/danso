@@ -34,3 +34,4 @@ jobs:
           python3 scripts/test_dev_check_host.py
           python3 scripts/test_ccc_node.py
           python3 scripts/test_harness_eval.py
+          python3 scripts/test_eval_case.py
