@@ -93,9 +93,13 @@ fn interrupted_prepared_commit_recovers_without_partial_state() {
             }
         }
     });
-    std::fs::write(action_dir.join("manifest.json"), format!("{}\n", manifest)).unwrap();
-    // The crash point: the post-image landed.
-    std::fs::write(route.facts_file(), b"changed\n").unwrap();
+    write_private(
+        &action_dir.join("manifest.json"),
+        format!("{}\n", manifest).as_bytes(),
+    );
+    // The crash point: the post-image landed (replace the pre-image file).
+    std::fs::remove_file(route.facts_file()).unwrap();
+    write_private(&route.facts_file(), b"changed\n");
 
     // Any next operation recovers first: prepared + targets at post-image
     // completes forward, so the retry commit starts from a clean state.
