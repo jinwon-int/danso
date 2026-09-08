@@ -133,7 +133,15 @@ fn main() {
             result = tokio::time::timeout(Duration::from_secs(args.timeout_seconds), app::run(&config, &mut sink, &mut usage)) => {
                 match result {
                     Ok(Ok(())) => 0,
-                    Ok(Err(e)) => { let code = if usage.attempted { 3 } else { 2 }; eprintln!("{e:#}"); failure::report(failure::category(&e).unwrap_or(Kind::Configuration), code); code },
+                    Ok(Err(e)) => {
+                        let code = if usage.attempted { 3 } else { 2 };
+                        eprintln!("{e:#}");
+                        failure::report(failure::category(&e).unwrap_or(Kind::Configuration), code);
+                        if let Some(diagnostic) = failure::transport(&e) {
+                            failure::report_transport(diagnostic);
+                        }
+                        code
+                    },
                     Err(_) => { eprintln!("run timed out"); failure::report(Kind::RunTimeout, 124); 124 },
                 }
             }

@@ -22,7 +22,7 @@ runtime = DansoRuntime(
     provider='glm', model='glm-5.3-flash',
     environment={'PATH': '/usr/bin:/bin', 'HOME': '/srv/ccc/danso-home',
                  'ZAI_API_KEY': os.environ['ZAI_API_KEY']},
-    timeout_seconds=180, provider_timeout_seconds=60, max_turns=8,
+    timeout_seconds=300, provider_timeout_seconds=180, max_turns=8,
 )
 session = await runtime.start_or_resume(SessionRequest(
     working_directory='/srv/ccc/tasks/task-001', effort='low'))
@@ -91,6 +91,14 @@ Native CLI failures emit one body-free stderr record, for example:
 ```text
 DANSO_ERROR={"version":1,"category":"request_budget","exit_code":3}
 ```
+
+Typed native HTTP transport failures may add one optional
+`DANSO_TRANSPORT` record with exactly `version`, `phase`, `elapsed_ms`, and
+`request_bytes`. The phase is `connect`, `before_response_headers`, or
+`response_body`; the numeric fields are bounded nonnegative integers. The
+adapter validates this record only for an attempted `provider` or
+`provider_timeout` failure and ignores malformed, duplicate, or absent records
+without changing terminal failure or replay behavior.
 
 Categories are tagged at source boundaries, never inferred from error strings:
 `configuration`, `session`, `sandbox`, `provider`, `provider_timeout`,

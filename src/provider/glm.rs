@@ -11,7 +11,7 @@ pub struct Glm {
 }
 impl Glm {
     pub fn new(model: String, key: String, base: &str, effort: Option<String>) -> Result<Self> {
-        Self::new_with_timeout(model, key, base, effort, 60)
+        Self::new_with_timeout(model, key, base, effort, 180)
     }
     pub fn new_with_timeout(
         model: String,
