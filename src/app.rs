@@ -12,6 +12,23 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::{path::PathBuf, time::Duration};
 
+/// Tool execution backend. This is the single source of truth for isolation:
+/// no caller infers it from a flag default, and adding a variant forces every
+/// match site to be revisited.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Backend {
+    /// Tools run as the current user, with the current user's permissions.
+    Host,
+    /// Tools run inside a bubblewrap namespace; isolation failure never falls
+    /// back to host execution.
+    Bubblewrap,
+}
+impl Backend {
+    pub fn is_host(self) -> bool {
+        self == Backend::Host
+    }
+}
+
 pub struct RunConfig {
     pub prompt: String,
     pub cwd: PathBuf,
@@ -22,7 +39,7 @@ pub struct RunConfig {
     pub trust_project: bool,
     pub no_tools: bool,
     pub system_context_file: Option<PathBuf>,
-    pub unsafe_no_sandbox: bool,
+    pub backend: Backend,
     pub max_turns: u32,
     pub compact_at_bytes: Option<usize>,
     pub timeout_seconds: u64,
@@ -167,7 +184,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     let runner = Runner {
         cwd,
         readable: ctx.readable,
-        unsafe_no_sandbox: args.unsafe_no_sandbox,
+        backend: args.backend,
         timeout: Duration::from_secs(args.tool_timeout_seconds),
     };
     let mut session = session;
