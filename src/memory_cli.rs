@@ -226,8 +226,8 @@ const USER_TEMPLATE: &str = "\
 Never store raw secrets here. -->\n";
 
 fn init(route: &Route) -> anyhow::Result<Option<Value>> {
-    paths::ensure_private_dir(&route.memories_dir())?;
-    paths::ensure_private_dir(&route.state_dir())?;
+    paths::require_private_dir(&route.memories_dir())?;
+    paths::require_private_dir(&route.state_dir())?;
     write_private_if_absent(&route.memories_dir().join("MEMORY.md"), MEMORY_TEMPLATE)?;
     write_private_if_absent(&route.memories_dir().join("USER.md"), USER_TEMPLATE)?;
     write_private_if_absent(&route.scope_lock(), "")?;
