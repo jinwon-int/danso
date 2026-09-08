@@ -122,23 +122,26 @@ fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn skip_mode_tighten(path: &Path) -> bool {
-    // Walking `/tmp/...` used to chmod these to 0700 and take down host DNS
-    // (Family Wiki LOG-20260908-sogyo-1). Do not create them either.
-    path == Path::new("/") || path == Path::new("/tmp")
-}
-
-/// Create a directory (recursively) that is owned by the current user with
-/// mode 0700, and refuse any pre-existing symlink, foreign owner, or wider
-/// mode. Owned intermediates created under a wider umask are tightened.
-/// System prefixes `/` and `/tmp` are traversed but never chmod'd.
+/// Create a directory (recursively) for the memory tree without following
+/// symlinks (ccc `_validate_existing_directory_components` contract):
+/// ancestor components must be root- or self-owned and must not be
+/// group/other-writable unless they carry the sticky bit (so a 1777 /tmp is
+/// a trusted ancestor and is never chmod'd or created); the final component
+/// must be process-owned and is tightened to 0700.
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
     use std::fs::{create_dir, set_permissions};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     ensure!(path.is_absolute(), "memory path must be absolute");
+    let components: Vec<_> = path.components().collect();
+    ensure!(
+        components.len() > 1,
+        "memory path must have a component below the root"
+    );
     let mut current = PathBuf::new();
-    for component in path.components() {
+    let last = components.len() - 1;
+    for (index, component) in components.iter().enumerate() {
         current.push(component);
+        let is_final = index == last;
         match std::fs::symlink_metadata(&current) {
             Ok(meta) => {
                 ensure!(
@@ -146,30 +149,39 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
                     "memory path must be a real directory: {}",
                     current.display()
                 );
-                ensure!(
-                    meta.uid() == euid(),
-                    "memory directory has the wrong owner: {}",
-                    current.display()
-                );
-                if skip_mode_tighten(&current) {
-                    continue;
-                }
-                if meta.mode() & 0o777 != 0o700 {
-                    set_permissions(&current, std::fs::Permissions::from_mode(0o700))?;
-                    let after = std::fs::symlink_metadata(&current)?;
+                if is_final {
                     ensure!(
-                        after.mode() & 0o777 == 0o700,
-                        "memory directory mode could not be tightened: {}",
+                        meta.uid() == euid(),
+                        "memory directory must be owned by the current user: {}",
                         current.display()
                     );
+                    if meta.mode() & 0o777 != 0o700 {
+                        set_permissions(&current, std::fs::Permissions::from_mode(0o700))?;
+                        let after = std::fs::symlink_metadata(&current)?;
+                        ensure!(
+                            after.mode() & 0o777 == 0o700,
+                            "memory directory mode could not be tightened: {}",
+                            current.display()
+                        );
+                    }
+                } else {
+                    ensure!(
+                        meta.uid() == 0 || meta.uid() == euid(),
+                        "memory path has an unsafe owner ancestor: {} (uid={})",
+                        current.display(),
+                        meta.uid()
+                    );
+                    if meta.mode() & 0o022 != 0 {
+                        ensure!(
+                            meta.mode() & 0o1000 != 0,
+                            "memory path has an unsafe writable ancestor: {} ({:04o})",
+                            current.display(),
+                            meta.mode() & 0o777
+                        );
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                ensure!(
-                    !skip_mode_tighten(&current),
-                    "refusing to create system prefix: {}",
-                    current.display()
-                );
                 create_dir(&current)?;
                 set_permissions(&current, std::fs::Permissions::from_mode(0o700))?;
                 let meta = std::fs::symlink_metadata(&current)?;

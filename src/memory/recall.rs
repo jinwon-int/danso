@@ -8,7 +8,9 @@
 //! (k=60). BM25/usage stay out by design decision §4.3.
 
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, FixedOffset, Local, TimeZone, Timelike, Utc,
+};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -511,7 +513,7 @@ fn round6(value: f64) -> f64 {
 /// Why no as-of instant could be estimated (body-free reasons, ccc rule).
 pub type TimeparseError = &'static str;
 
-fn end_of_day(local: DateTime<Local>) -> DateTime<Utc> {
+fn end_of_day(local: DateTime<FixedOffset>) -> DateTime<Utc> {
     local
         .with_hour(23)
         .and_then(|t| t.with_minute(59))
@@ -521,13 +523,14 @@ fn end_of_day(local: DateTime<Local>) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-fn add_months(base: DateTime<Local>, months: i64) -> Option<DateTime<Local>> {
+fn add_months(base: DateTime<FixedOffset>, months: i64) -> Option<DateTime<FixedOffset>> {
+    let offset = *base.offset();
     let total = base.year() as i64 * 12 + base.month() as i64 - 1 + months;
     let year = total.div_euclid(12);
     let month = (total.rem_euclid(12) + 1) as u32;
     let day = base.day();
     let last_day = days_in_month(year as i32, month);
-    Local
+    offset
         .with_ymd_and_hms(
             year as i32,
             month,
@@ -579,7 +582,7 @@ fn boundary_ok(text: &str, start: usize, end: usize) -> bool {
     !is_digit(before) && !is_digit(after)
 }
 
-fn absolute_hits(text: &str, now: DateTime<Local>) -> Vec<AbsoluteHit> {
+fn absolute_hits(text: &str, now: DateTime<FixedOffset>) -> Vec<AbsoluteHit> {
     let mut hits = Vec::new();
 
     // ISO numeric dates: 2026-03-15 / 2026/3/15 / 2026.3.15 (year 19xx/20xx).
@@ -776,7 +779,7 @@ fn month_from_name(name: &str) -> Option<u32> {
 /// `temporal.nl_as_of` so a wrong guess is visible, never silent.
 pub fn estimate_as_of(
     query: &str,
-    now: DateTime<Local>,
+    now: DateTime<FixedOffset>,
 ) -> Result<(DateTime<Utc>, String), TimeparseError> {
     let query = query.trim();
     if query.is_empty() {
@@ -793,16 +796,17 @@ pub fn estimate_as_of(
             return Err("ambiguous-absolute-dates");
         }
         let first = &hits[0];
+        let offset = *now.offset();
         let local = match first.precision {
-            AbsolutePrecision::Day => Local
+            AbsolutePrecision::Day => offset
                 .with_ymd_and_hms(first.year, first.month, first.day, 23, 59, 59)
                 .single(),
-            AbsolutePrecision::Month => Local
+            AbsolutePrecision::Month => offset
                 .with_ymd_and_hms(first.year, first.month, 1, 0, 0, 0)
                 .single()
                 .and_then(|start| add_months(start, 1))
                 .map(|end| end - ChronoDuration::seconds(1)),
-            AbsolutePrecision::Year => Local
+            AbsolutePrecision::Year => offset
                 .with_ymd_and_hms(first.year, 12, 31, 23, 59, 59)
                 .single(),
         };
@@ -862,7 +866,11 @@ pub fn estimate_as_of(
 
 /// Every period resolves to its END instant (docstring rule of the ccc
 /// module): "지난주 시점" asks what was true by the end of last week.
-fn resolve_relative(rule: &str, n: i64, now: DateTime<Local>) -> Option<DateTime<Local>> {
+fn resolve_relative(
+    rule: &str,
+    n: i64,
+    now: DateTime<FixedOffset>,
+) -> Option<DateTime<FixedOffset>> {
     match rule {
         "ko:그제" => Some(now - ChronoDuration::days(2)),
         "ko:어제" | "en:yesterday" => Some(now - ChronoDuration::days(1)),
@@ -876,20 +884,22 @@ fn resolve_relative(rule: &str, n: i64, now: DateTime<Local>) -> Option<DateTime
             Some(start_of_day(monday)? - ChronoDuration::seconds(1))
         }
         "ko:지난달" | "en:lastmonth" => {
-            let first = Local
+            let first = (*now.offset())
                 .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
                 .single()?;
             Some(first - ChronoDuration::seconds(1))
         }
         "ko:작년" | "en:lastyear" => {
-            let first = Local.with_ymd_and_hms(now.year(), 1, 1, 0, 0, 0).single()?;
+            let first = (*now.offset())
+                .with_ymd_and_hms(now.year(), 1, 1, 0, 0, 0)
+                .single()?;
             Some(first - ChronoDuration::seconds(1))
         }
         _ => None,
     }
 }
 
-fn start_of_day(local: DateTime<Local>) -> Option<DateTime<Local>> {
+fn start_of_day(local: DateTime<FixedOffset>) -> Option<DateTime<FixedOffset>> {
     local
         .with_hour(0)
         .and_then(|t| t.with_minute(0))
@@ -933,7 +943,7 @@ pub fn search(route: &Route, options: &SearchOptions) -> Result<Value> {
     let mut as_of_raw: Option<String> = options.as_of.map(str::trim).map(str::to_string);
     let mut nl_as_of: Option<Value> = None;
     if as_of_raw.is_none() {
-        match estimate_as_of(options.query, Local::now()) {
+        match estimate_as_of(options.query, Local::now().fixed_offset()) {
             Ok((instant, rule)) => {
                 as_of_raw = Some(facts::format_timestamp(instant));
                 nl_as_of = Some(json!({ "rule": rule, "iso": as_of_raw.clone().unwrap() }));
@@ -1079,6 +1089,16 @@ pub fn search(route: &Route, options: &SearchOptions) -> Result<Value> {
 mod tests {
     use super::*;
 
+    /// A pinned +09:00 clock so the local-end-of-period rules are
+    /// deterministic on any runner timezone.
+    fn kst(year: i32, month: u32, day: u32, hour: u32) -> DateTime<FixedOffset> {
+        FixedOffset::east_opt(9 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(year, month, day, hour, 0, 0)
+            .single()
+            .unwrap()
+    }
+
     #[test]
     fn tokens_follow_the_ccc_rule() {
         assert_eq!(
@@ -1101,10 +1121,7 @@ mod tests {
 
     #[test]
     fn timeparse_resolves_periods_to_their_end() {
-        let now = Local
-            .with_ymd_and_hms(2026, 9, 8, 10, 0, 0)
-            .single()
-            .unwrap();
+        let now = kst(2026, 9, 8, 10);
         let (instant, rule) = estimate_as_of("어제 회의 결과", now).unwrap();
         assert_eq!(rule, "ko:어제");
         assert_eq!(
@@ -1121,10 +1138,7 @@ mod tests {
 
     #[test]
     fn timeparse_prefers_absolute_and_gives_up_on_conflict() {
-        let now = Local
-            .with_ymd_and_hms(2026, 9, 8, 10, 0, 0)
-            .single()
-            .unwrap();
+        let now = kst(2026, 9, 8, 10);
         let (_, rule) = estimate_as_of("어제 말고 2026-03-15 기준", now).unwrap();
         assert_eq!(rule, "abs:iso-date");
         assert_eq!(
@@ -1140,20 +1154,14 @@ mod tests {
 
     #[test]
     fn korean_ymd_suppresses_the_yearless_variant() {
-        let now = Local
-            .with_ymd_and_hms(2026, 9, 8, 10, 0, 0)
-            .single()
-            .unwrap();
+        let now = kst(2026, 9, 8, 10);
         let (_, rule) = estimate_as_of("2024년 3월 15일 상황", now).unwrap();
         assert_eq!(rule, "abs:ko-ymd");
     }
 
     #[test]
     fn relative_ranges_and_month_ends() {
-        let now = Local
-            .with_ymd_and_hms(2026, 9, 8, 10, 0, 0)
-            .single()
-            .unwrap();
+        let now = kst(2026, 9, 8, 10);
         assert_eq!(
             estimate_as_of("4000일 전", now).unwrap_err(),
             "relative-out-of-range"
