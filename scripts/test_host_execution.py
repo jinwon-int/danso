@@ -118,6 +118,25 @@ class Host(unittest.TestCase):
         self.assertIn('timed out', str(self.results()[0]))
         self.assert_reaped()
 
+    def test_signal_immune_descendants_do_not_stall_the_tool_timeout(self):
+        # The supervisor sends SIGKILL under PR_SET_CHILD_SUBREAPER, so even a
+        # tree that ignores SIGTERM must converge. The post-timeout reap is
+        # bounded, so a regression here shows up as a stalled run rather than a
+        # leaked process.
+        immune = ("setsid /bin/bash -c 'trap \"\" TERM INT HUP; echo $$ > detached.pid; "
+                  "sleep 2; echo leaked > survivor; sleep 20' >/dev/null 2>&1 & sleep 20")
+        self.tool('bash', {'command': immune})
+        started = time.monotonic()
+        p = self.run_cli('--tool-timeout-seconds', '1')
+        elapsed = time.monotonic() - started
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(self.results()[0]['isError'])
+        self.assertIn('timed out', str(self.results()[0]))
+        # Generous, but far below the 5s reap grace and the 300s run timeout:
+        # an unbounded reap would blow through this.
+        self.assertLess(elapsed, 15, f'tool timeout took {elapsed:.2f}s')
+        self.assert_reaped()
+
     def terminate_parent(self, sig):
         self.tool('bash', {'command': self.detached('sleep 20')})
         p = subprocess.Popen(self.command(), env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
