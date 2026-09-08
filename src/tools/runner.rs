@@ -16,7 +16,7 @@ pub(crate) const SYSTEM_MOUNTS: [&str; 4] = ["/usr", "/bin", "/lib", "/lib64"];
 pub struct Runner {
     pub cwd: PathBuf,
     pub readable: Vec<PathBuf>,
-    pub unsafe_no_sandbox: bool,
+    pub backend: crate::app::Backend,
     pub timeout: Duration,
 }
 
@@ -24,7 +24,7 @@ impl Runner {
     fn command(&self) -> Result<Command> {
         let exe = std::env::current_exe()?;
         let mut cmd;
-        if self.unsafe_no_sandbox {
+        if self.backend.is_host() {
             cmd = Command::new(exe);
             cmd.arg("__supervise").arg(std::process::id().to_string());
         } else {
@@ -62,7 +62,7 @@ impl Runner {
                 "/danso-worker",
             ]);
         }
-        if !self.unsafe_no_sandbox {
+        if !self.backend.is_host() {
             cmd.arg("__tool");
         }
         cmd.current_dir(&self.cwd)
@@ -72,7 +72,7 @@ impl Runner {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(!self.unsafe_no_sandbox);
+            .kill_on_drop(!self.backend.is_host());
         // RLIMIT_AS is a virtual-memory cap, not an RSS claim. Sequential tools
         // cap concurrent bash at one. Host mode uses a subreaper; bubblewrap a PID namespace.
         unsafe {
@@ -102,7 +102,7 @@ impl Runner {
             .command()?
             .spawn()
             .context("tool launch failed for selected execution backend")?;
-        let mut cleanup = if self.unsafe_no_sandbox {
+        let mut cleanup = if self.backend.is_host() {
             match HostCleanup::new(child.id().expect("new child PID")) {
                 Ok(guard) => guard,
                 Err(error) => {
@@ -143,7 +143,7 @@ impl Runner {
         match tokio::time::timeout(self.timeout, work).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => {
-                if self.unsafe_no_sandbox {
+                if self.backend.is_host() {
                     cleanup.stop();
                     if child.wait().await.is_ok() {
                         cleanup.0 = None;
@@ -154,7 +154,7 @@ impl Runner {
                 Err(error)
             }
             Err(_) => {
-                if self.unsafe_no_sandbox {
+                if self.backend.is_host() {
                     cleanup.stop();
                     if child.wait().await.is_ok() {
                         cleanup.0 = None;
@@ -218,7 +218,7 @@ async fn bounded_output(mut reader: impl tokio::io::AsyncRead + Unpin) -> Result
 impl ToolExecutor for Runner {
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = super::builtins().definitions();
-        if self.unsafe_no_sandbox {
+        if self.backend.is_host() {
             for definition in &mut definitions {
                 if definition.name == "bash" {
                     definition.description = "Run Bash with pipefail in the workspace using current-user host permissions. Filesystem and network are not sandboxed. Check actual test results.".into();

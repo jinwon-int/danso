@@ -6,6 +6,12 @@ pub enum Mode {
     Text,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+pub enum SandboxArg {
+    Host,
+    Bubblewrap,
+}
+
 #[derive(Parser)]
 #[command(version, about = "Headless worker harness with Pi session interchange")]
 pub struct Args {
@@ -42,9 +48,9 @@ pub struct Args {
     #[arg(long)]
     pub system_context_file: Option<PathBuf>,
     /// Execution backend: host uses current-user permissions; bubblewrap isolates tools.
-    #[arg(long, default_value = "host", value_parser = ["host", "bubblewrap"])]
-    pub sandbox: String,
-    /// Deprecated alias for host execution. Cannot be combined with --sandbox.
+    #[arg(long, default_value = "host", value_enum)]
+    pub sandbox: SandboxArg,
+    /// Deprecated alias for --sandbox host. Cannot be combined with --sandbox.
     #[arg(long, conflicts_with = "sandbox")]
     pub unsafe_no_sandbox: bool,
     #[arg(long, default_value_t = 16)]
@@ -62,6 +68,18 @@ pub struct Args {
 }
 
 impl Args {
+    /// Resolve the execution backend from the flags that select it. The
+    /// deprecated alias is read here rather than inferred from --sandbox's
+    /// default, so changing that default cannot silently invert its meaning.
+    pub fn backend(&self) -> danso::app::Backend {
+        if self.unsafe_no_sandbox {
+            return danso::app::Backend::Host;
+        }
+        match self.sandbox {
+            SandboxArg::Host => danso::app::Backend::Host,
+            SandboxArg::Bubblewrap => danso::app::Backend::Bubblewrap,
+        }
+    }
     pub fn config(&self) -> danso::app::RunConfig {
         danso::app::RunConfig {
             prompt: self.prompt.clone(),
@@ -73,7 +91,7 @@ impl Args {
             trust_project: self.trust_project,
             no_tools: self.no_tools,
             system_context_file: self.system_context_file.clone(),
-            unsafe_no_sandbox: self.sandbox == "host",
+            backend: self.backend(),
             max_turns: self.max_turns,
             compact_at_bytes: self.compact_at_bytes,
             timeout_seconds: self.timeout_seconds,
@@ -89,5 +107,62 @@ impl Args {
         } else {
             danso::output::Mode::Json
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use danso::app::Backend;
+
+    const BASE: [&str; 6] = [
+        "danso",
+        "a prompt",
+        "--session",
+        "/tmp/s.jsonl",
+        "--model",
+        "m",
+    ];
+
+    fn parse(extra: &[&str]) -> Args {
+        let mut argv = BASE.to_vec();
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    fn try_parse(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut argv = BASE.to_vec();
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv)
+    }
+
+    #[test]
+    fn backend_selection_is_explicit() {
+        assert_eq!(parse(&[]).backend(), Backend::Host);
+        assert_eq!(parse(&["--sandbox", "host"]).backend(), Backend::Host);
+        assert_eq!(
+            parse(&["--sandbox", "bubblewrap"]).backend(),
+            Backend::Bubblewrap
+        );
+        assert_eq!(parse(&["--unsafe-no-sandbox"]).backend(), Backend::Host);
+    }
+
+    #[test]
+    fn deprecated_alias_conflicts_with_explicit_sandbox() {
+        assert!(try_parse(&["--unsafe-no-sandbox", "--sandbox", "host"]).is_err());
+        assert!(try_parse(&["--unsafe-no-sandbox", "--sandbox", "bubblewrap"]).is_err());
+    }
+
+    // The regression this guards: --unsafe-no-sandbox used to be inferred from
+    // --sandbox's default rather than read. Under that implementation, flipping
+    // the default to bubblewrap would have turned the flag into a silent no-op
+    // that ran *sandboxed* — the opposite of its name. Simulate the flipped
+    // default directly so the invariant does not depend on a default value.
+    #[test]
+    fn deprecated_alias_survives_a_changed_sandbox_default() {
+        let mut args = parse(&["--unsafe-no-sandbox"]);
+        assert!(args.unsafe_no_sandbox);
+        args.sandbox = SandboxArg::Bubblewrap;
+        assert_eq!(args.backend(), Backend::Host);
     }
 }
