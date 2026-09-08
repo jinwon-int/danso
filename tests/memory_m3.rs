@@ -240,6 +240,7 @@ async fn run_inner(route: &Route, session_path: &Path) -> anyhow::Result<()> {
             execution_context: "",
             max_turns: 8,
             compact_at_bytes: Some(8192),
+            refresh_context: None,
         },
         &mut provider,
         &Executor,

@@ -96,6 +96,7 @@ async fn checkpoint_persistence_failure_prevents_next_provider_request() {
             execution_context: "",
             max_turns: 8,
             compact_at_bytes: Some(8192),
+            refresh_context: None,
         },
         &mut provider,
         &Executor,

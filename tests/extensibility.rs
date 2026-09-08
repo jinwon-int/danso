@@ -123,6 +123,7 @@ fn input() -> RunInput<'static> {
         execution_context: "",
         max_turns: 3,
         compact_at_bytes: None,
+        refresh_context: None,
     }
 }
 

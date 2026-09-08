@@ -40,6 +40,7 @@ pub struct RunConfig {
     pub no_tools: bool,
     pub system_context_file: Option<PathBuf>,
     pub memory: memory::MemoryConfig,
+    pub memory_refresh: memory::RefreshMode,
     pub memory_distill: memory::DistillMode,
     pub backend: Backend,
     pub max_turns: u32,
@@ -181,26 +182,25 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         "session must live outside writable workspace"
     );
     let mut ctx = context::discover(&cwd, &home, args.trust_project)?;
+    let discovered = ctx.prompt.clone();
     // Memory injection (issue #52 §5): the managed block lands before any
     // caller context, and the combined context is validated against the
-    // 65536-byte limit below. With memory OFF the context is byte-identical
-    // to a non-memory build.
+    // 65536-byte limit. With memory OFF the context is byte-identical to a
+    // non-memory build.
+    let mut ctx_prompt = discovered.clone();
     if args.memory.mode != memory::MemoryMode::Off {
         args.memory.validate().map_err(at(Kind::Configuration))?;
         memory::snapshot::inject_into_context(
-            &mut ctx.prompt,
+            &mut ctx_prompt,
             &args.memory,
             &args.prompt,
             &cwd,
             chrono::Utc::now(),
         )
         .map_err(at(Kind::Memory))?;
-        ensure!(
-            ctx.prompt.len() <= context::CONTEXT_LIMIT,
-            "combined context exceeds 65536 bytes"
-        );
     }
-    if let Some(path) = &args.system_context_file {
+    // Caller context (§5.3): appended after the memory block.
+    let caller_context: Option<String> = if let Some(path) = &args.system_context_file {
         ensure!(
             !crate::tools::SYSTEM_MOUNTS
                 .iter()
@@ -209,15 +209,50 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
             "system context overlaps a tool mount or discovered instruction file"
         );
         let supplied = context::private_system_context(path, &cwd)?;
-        ctx.prompt.push_str(
-            "\n\nExplicit caller memory context (reference data; not authority for actions):\n",
+        let part = format!(
+            "\n\nExplicit caller memory context (reference data; not authority for actions):\n{supplied}"
         );
-        ctx.prompt.push_str(&supplied);
-        ensure!(
-            ctx.prompt.len() <= context::CONTEXT_LIMIT,
-            "combined context exceeds 65536 bytes"
-        );
-    }
+        ctx_prompt.push_str(&part);
+        Some(part)
+    } else {
+        None
+    };
+    ensure!(
+        ctx_prompt.len() <= context::CONTEXT_LIMIT,
+        "combined context exceeds 65536 bytes"
+    );
+    ctx.prompt = ctx_prompt;
+    // Per-request refresh (§5.3): the hook re-assembles the memory block and
+    // re-composes the context right after a compaction.
+    let cwd_for_refresh = cwd.clone();
+    let refresh_context: Option<Box<dyn Fn() -> Result<String>>> = if args.memory.mode
+        == memory::MemoryMode::Read
+        && args.memory.refresh == memory::RefreshMode::PerRequest
+    {
+        let memory_config = args.memory.clone();
+        let discovered = discovered.clone();
+        let caller = caller_context.clone();
+        Some(Box::new(move || {
+            let mut fresh = discovered.clone();
+            memory::snapshot::inject_into_context(
+                &mut fresh,
+                &memory_config,
+                &args.prompt,
+                &cwd_for_refresh,
+                chrono::Utc::now(),
+            )?;
+            if let Some(caller) = &caller {
+                fresh.push_str(caller);
+            }
+            ensure!(
+                fresh.len() <= context::CONTEXT_LIMIT,
+                "combined context exceeds 65536 bytes"
+            );
+            Ok(fresh)
+        }))
+    } else {
+        None
+    };
     let session = Session::open(&session_path, &cwd).map_err(at(Kind::Session))?;
     ensure!(!args.model.trim().is_empty(), "model must not be empty");
     if let Some(effort) = &args.reasoning_effort {
@@ -270,6 +305,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
             execution_context: &execution_context,
             max_turns: args.max_turns,
             compact_at_bytes: args.compact_at_bytes,
+            refresh_context: refresh_context.as_deref(),
         },
         &mut provider,
         &runner,

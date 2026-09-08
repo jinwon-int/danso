@@ -13,7 +13,7 @@ with no Python, Node, Shell, or SQLite runtime dependency. Design source:
 | M1 | Storage + search core: `paths`, `scan`, `facts`, `recall`, `memory init/add/search/close/show/eval` | This PR |
 | M2 | Snapshot assembly + run integration (`snapshot.rs`, `--memory read`, dynamic budgets) | **This PR** |
 | M3 | Working-state + checkpoints (harness-written `working-state.md`) | Done (M1–M3) |
-| M2½ | `--memory-refresh per-request` (needs a runtime context hook) | Deferred |
+| M2½ | `--memory-refresh per-request` (runtime context hook) | **This PR** |
 | M4 | Distill extraction + journal + transactions (`--memory read-write`, `distill/drain/rollback`) | **This PR** |
 | M5 | Scope diagnostics (`check`, audit ledger, legacy read) | **This PR** (promotion deferred per §7) |
 
@@ -124,6 +124,16 @@ the combined system context (memory + caller `--system-context-file`) is
 validated against 65536 bytes. Memory OFF is byte-identical: `--memory` off
 never touches the context.
 
+## Promotion (§7 follow-up)
+
+`danso memory promote --from private-<32 hex> --fact distill-<12 hex>` copies
+one private fact into the shared store as `review: "explicit-promotion"` with
+`promoted`/`private-to-shared` tags, a deterministic promotion id
+(`promotion-` + `sha256("ccc-memory-promotion-v1" ‧ NUL ‧ scope ‧ NUL ‧
+fact_id)[:24]`), a destination id (`promoted-` + `sha256[:16]`), and an audit
+trail under the shared state. Repeats verify and report `promoted: false` —
+never duplicated, never automatic.
+
 ## Distill pipeline (§4.5–§4.7, M4)
 
 `danso run --memory read-write` registers a pending extraction job on a
@@ -187,12 +197,15 @@ scope: `--scope global|shared|private-<32 hex>`. Configuration errors exit 2;
 runtime refusals exit 1. Read rules (§7): a private scope reads its own tree
 plus `shared`; `shared` and `global` never open another tree.
 
-`danso run` gains `--memory off|read` (read-write arrives with M4 and is
-rejected), `--memory-dir`, `--memory-scope`, `--memory-query` (default:
-task + cwd + git branch/changed paths, capped at 1400 bytes), `--memory-max-bytes`
-(1..=24576, default 12000) and `--memory-as-of`. Memory configuration
-failures are configuration errors (exit 2, category `memory` for assembly
-failures such as marker forgery).
+`danso run` gains `--memory off|read|read-write` (read-write registers
+pending distill jobs; extraction runs via drain), `--memory-distill
+queue|inline|off`, `--memory-refresh per-run|per-request` (per-request
+re-assembles the context right after each compaction through a
+memory-agnostic runtime hook), `--memory-dir`, `--memory-scope`,
+`--memory-query` (default: task + cwd + git branch/changed paths, capped at
+1400 bytes), `--memory-max-bytes` (1..=24576, default 12000) and
+`--memory-as-of`. Memory configuration failures are configuration errors
+(exit 2, category `memory` for assembly failures such as marker forgery).
 
 ## Evaluation
 

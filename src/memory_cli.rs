@@ -6,7 +6,7 @@
 
 use clap::{Parser, Subcommand};
 use danso::memory::distill::journal;
-use danso::memory::{self, Route, eval, facts, paths, recall, snapshot, transaction};
+use danso::memory::{self, Route, eval, facts, paths, promote, recall, snapshot, transaction};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -107,6 +107,15 @@ pub enum Command {
     },
     /// Body-free diagnostics for this scope (§6.4/M5).
     Check,
+    /// Promote one private fact into the shared store (§7; idempotent).
+    Promote {
+        /// Source private scope (private-<32 hex>).
+        #[arg(long)]
+        from: String,
+        /// Fact id (distill-<12 lowercase hex>).
+        #[arg(long)]
+        fact: String,
+    },
 }
 
 fn default_root() -> PathBuf {
@@ -197,6 +206,20 @@ pub fn validate(args: &MemoryArgs) -> anyhow::Result<()> {
                 "action must be 32 lowercase hex characters"
             );
         }
+        Command::Promote { from, fact } => {
+            anyhow::ensure!(
+                from.starts_with("private-") && paths::valid_scope(from),
+                "promotion source must be a private-<32 hex> scope"
+            );
+            anyhow::ensure!(
+                fact.starts_with("distill-")
+                    && fact.len() == "distill-".len() + 12
+                    && fact[8..]
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "fact id must match distill-<12 lowercase hex>"
+            );
+        }
         Command::Init | Command::Show | Command::Check => {}
     }
     Ok(())
@@ -265,6 +288,18 @@ pub fn run(args: &MemoryArgs) -> anyhow::Result<Option<Value>> {
         } => drain_command(&route, provider, model, *max_jobs),
         Command::Rollback { action } => close_rollback(&route, action, args.lock_timeout_ms),
         Command::Check => check(&route),
+        Command::Promote { from, fact } => {
+            let result = promote::promote(
+                route.root(),
+                from,
+                fact,
+                chrono::Utc::now(),
+                paths::lock_timeout(args.lock_timeout_ms),
+            )?;
+            Ok(Some(
+                serde_json::to_value(&result).expect("promote result is serializable"),
+            ))
+        }
     }
 }
 

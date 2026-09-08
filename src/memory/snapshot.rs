@@ -678,6 +678,7 @@ mod tests {
             query: Some("policy".into()),
             max_bytes: SNAPSHOT_MAX_BYTES_DEFAULT,
             as_of: None,
+            refresh: crate::memory::RefreshMode::default(),
         };
         inject_into_context(&mut ctx, &config, "prompt", dir.path(), Utc::now()).unwrap();
         assert!(ctx.starts_with("system base"));

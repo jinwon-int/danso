@@ -16,6 +16,32 @@ pub struct RunInput<'a> {
     pub execution_context: &'a str,
     pub max_turns: u32,
     pub compact_at_bytes: Option<usize>,
+    /// Optional hook re-resolving the context string (e.g. per-request
+    /// memory refresh, §5.3). Called only right after a compaction; the
+    /// hook owns every policy — the runtime stays memory-agnostic.
+    pub refresh_context: Option<&'a dyn Fn() -> Result<String>>,
+}
+
+impl<'a> RunInput<'a> {
+    /// The static form used by every non-refreshing caller.
+    pub fn with_static_context(
+        no_tools: bool,
+        prompt: &'a str,
+        context: &'a str,
+        execution_context: &'a str,
+        max_turns: u32,
+        compact_at_bytes: Option<usize>,
+    ) -> RunInput<'a> {
+        RunInput {
+            no_tools,
+            prompt,
+            context,
+            execution_context,
+            max_turns,
+            compact_at_bytes,
+            refresh_context: None,
+        }
+    }
 }
 
 pub async fn run(
@@ -74,7 +100,7 @@ pub async fn run(
         .map(|d| d.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let base_system = format!(
+    let mut base_system = format!(
         "You are a headless coding worker. Use only {names}. Skills are loaded using read. Prefer targeted line-range reads and searches over whole-file dumps. After compaction, continue from recorded progress; re-read only missing or changed information.{}{}",
         input.context, input.execution_context
     );
@@ -130,6 +156,13 @@ pub async fn run(
                     summary_requests += before_summary - remaining;
                     // Rebuild after all summary fragments/repairs, then size the
                     // exact instructions that the next action request will use.
+                    if let Some(refresh) = input.refresh_context {
+                        let refreshed = refresh().map_err(at(Kind::Configuration))?;
+                        base_system = format!(
+                            "You are a headless coding worker. Use only {names}. Skills are loaded using read. Prefer targeted line-range reads and searches over whole-file dumps. After compaction, continue from recorded progress; re-read only missing or changed information.{}{}",
+                            refreshed, input.execution_context
+                        );
+                    }
                     system =
                         budget_system(&base_system, input.max_turns, remaining, summary_requests);
                     let compacted = crate::compaction::checkpoint_messages(&summary, &messages)?;

@@ -16,6 +16,7 @@ pub mod distill;
 pub mod eval;
 pub mod facts;
 pub mod paths;
+pub mod promote;
 pub mod recall;
 pub mod scan;
 pub mod snapshot;
@@ -59,6 +60,15 @@ pub enum MemoryMode {
     ReadWrite,
 }
 
+/// Context refresh cadence (§5.3): per-run assembles once at run start;
+/// per-request additionally re-assembles right after each compaction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RefreshMode {
+    #[default]
+    PerRun,
+    PerRequest,
+}
+
 /// Distill scheduling for a read-write run (§8): queue (default) registers
 /// a pending extraction; inline additionally drains one job after the run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -80,6 +90,7 @@ pub struct MemoryConfig {
     pub query: Option<String>,
     pub max_bytes: usize,
     pub as_of: Option<String>,
+    pub refresh: RefreshMode,
 }
 
 impl MemoryConfig {
