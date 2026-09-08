@@ -25,7 +25,12 @@ jobs:
           cargo +1.98.1 clippy --locked --all-targets -- -D warnings
           cargo +1.98.1 test --locked
           cargo +1.98.1 build --locked
+          cargo +1.98.1 build --release --locked
           python3 scripts/test_e2e.py
+          # The documented install builds --release; run the CLI contract
+          # against that artifact too. Release disables the overflow checks
+          # and debug assertions every other suite runs with.
+          DANSO_BIN=target/release/danso python3 scripts/test_e2e.py
           python3 scripts/test_compaction.py
           python3 scripts/test_providers.py
           python3 scripts/test_live_acceptance.py

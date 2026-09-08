@@ -142,6 +142,7 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked
+cargo build --release --locked
 python3 scripts/test_e2e.py
 python3 scripts/test_compaction.py
 python3 scripts/test_providers.py
@@ -152,7 +153,18 @@ python3 scripts/test_dev_check_host.py
 python3 scripts/test_ccc_node.py
 python3 scripts/test_progress.py
 python3 scripts/test_harness_eval.py
+python3 scripts/test_eval_case.py
+python3 scripts/test_eval_dispatch.py
+python3 scripts/test_host_execution.py
+python3 scripts/test_chatgpt.py
+python3 scripts/test_chatgpt_refresh.py
 ```
+
+CI additionally re-runs the E2E suite against the release artifact
+(`DANSO_BIN=target/release/danso`), because `README.md` tells users to build
+`--release` and that profile disables the overflow checks and debug assertions
+every other suite runs under. `dev_check.py --profile host` builds `--release`
+but does not repeat the suite; the CI job is the gate for that.
 
 The real-bubblewrap E2E suite continues to cover CLI behavior and the actual
 Anthropic wire adapter. The Piri fixture test covers interchange. Adapter tests
