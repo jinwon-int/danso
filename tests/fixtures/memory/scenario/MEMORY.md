@@ -1,0 +1,1 @@
+ccc-node SessionStart must stay no-network and fail-open. Durable operating policy uses PR-first evidence and human-gated Wiki triage. historical editor Vim was used before the current editor changed.
