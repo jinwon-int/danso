@@ -1,4 +1,5 @@
 mod cli;
+mod memory_cli;
 use clap::Parser;
 use cli::Args;
 use danso::{
@@ -21,6 +22,38 @@ async fn interrupted() -> i32 {
 // The tool worker must not initialize Tokio: RLIMIT_AS intentionally leaves
 // room for a shell, not a multithreaded async runtime with many thread stacks.
 fn main() {
+    // The memory subcommand is synchronous and provider-free; it short-circuits
+    // before the async runtime is touched (issue #52 M1).
+    if std::env::args().nth(1).as_deref() == Some("memory") {
+        let args = match memory_cli::MemoryArgs::try_parse_from(std::env::args_os().skip(1)) {
+            Ok(args) => args,
+            Err(error) => {
+                let code = error.exit_code();
+                error.print().ok();
+                std::process::exit(code);
+            }
+        };
+        if let Err(error) = memory_cli::validate(&args) {
+            eprintln!("memory configuration error: {error}");
+            std::process::exit(2);
+        }
+        match memory_cli::run(&args) {
+            Ok(Some(value)) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).expect("serializable")
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // Body-free refusal: memory commands never echo record bodies
+                // through the error path.
+                eprintln!("memory command refused: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("auth-adopt") {
         #[derive(clap::Parser)]
         #[command(
