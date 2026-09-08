@@ -92,6 +92,9 @@ pub struct Args {
     /// bubblewrap defaults to 30 seconds (maximum 300).
     #[arg(long)]
     pub tool_timeout_seconds: Option<u64>,
+    /// Host-only HOME for development tools. Provider/context HOME stays native HOME.
+    #[arg(long)]
+    pub tool_home: Option<PathBuf>,
     /// Opt in to the bounded long-task journal and cumulative budgets (up to six active hours).
     #[arg(long, conflicts_with = "task_status")]
     pub long_task: bool,
@@ -191,6 +194,7 @@ impl Args {
             timeout_seconds,
             provider_timeout_seconds: self.provider_timeout_seconds,
             tool_timeout_seconds,
+            tool_home: self.tool_home.clone(),
             long_task: long.then(|| danso::runtime::LongTaskRun {
                 limits: danso::long_task::Limits {
                     wall_seconds: timeout_seconds,
@@ -318,6 +322,16 @@ mod tests {
                 .config()
                 .tool_timeout_seconds,
             300
+        );
+    }
+
+    #[test]
+    fn tool_home_is_optional_and_preserved_in_config() {
+        assert!(parse(&[]).config().tool_home.is_none());
+        let args = parse(&["--tool-home", "/opt/native-tool-home"]);
+        assert_eq!(
+            args.config().tool_home,
+            Some(PathBuf::from("/opt/native-tool-home"))
         );
     }
 

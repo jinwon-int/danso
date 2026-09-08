@@ -29,6 +29,9 @@ credentials. Host tool limits are intentionally larger for development work,
 while bubblewrap keeps the original restrictive limits. Use `--sandbox
 bubblewrap` to require `/usr/bin/bwrap` and usable user namespaces;
 isolation failure never falls back to host execution. See [execution modes](docs/execution.md).
+For a host-only toolchain HOME override, use `--tool-home /absolute/path`;
+this changes child tool `HOME`/`PATH` only and never changes provider
+authentication or context discovery. Bubblewrap rejects the option.
 Without `-p`, stdout is JSONL. Reuse the session path to continue a completed
 linear conversation. An uncertain interrupted tool requires manual recovery.
 

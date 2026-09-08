@@ -16,6 +16,11 @@ folder is organizational separation, not a sandbox. Run under the intended
 non-root user. Model-visible Bash metadata describes the selected mode and
 limits. Host tools also receive the fixed `CARGO_BUILD_JOBS=2` development
 setting so a local compile does not fan out across every host CPU.
+When a host worker needs a toolchain from another absolute HOME, pass
+`--tool-home /absolute/path`. This changes only the child tool's `HOME` and
+Cargo-first `PATH`; provider authentication, context discovery and the caller's
+native HOME remain unchanged. The option is rejected for bubblewrap and invalid
+PATH components fail before provider construction.
 
 `--sandbox bubblewrap` retains the original PID/mount/network isolation and
 requires /usr/bin/bwrap plus working user namespaces. A selected backend must

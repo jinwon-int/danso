@@ -14,7 +14,7 @@ pub(crate) use runner::SYSTEM_MOUNTS;
 pub use runner::{
     BUBBLEWRAP_TOOL_TIMEOUT_DEFAULT_SECONDS, BUBBLEWRAP_TOOL_TIMEOUT_MAX_SECONDS,
     HOST_TOOL_TIMEOUT_DEFAULT_SECONDS, HOST_TOOL_TIMEOUT_MAX_SECONDS, ResourceLimits, Runner,
-    resource_limits, tool_timeout_default, tool_timeout_max,
+    resolve_tool_home, resource_limits, tool_timeout_default, tool_timeout_max,
 };
 use serde_json::Value;
 

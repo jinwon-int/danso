@@ -62,6 +62,33 @@ class Host(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertFalse(self.results()[0]['isError'], self.results())
 
+    def test_host_tool_home_changes_tools_only_and_not_context_discovery(self):
+        (self.home / '.pi' / 'agent').mkdir(parents=True)
+        (self.home / '.pi' / 'agent' / 'AGENTS.md').write_text('PRIVATE_NATIVE_HOME_SENTINEL')
+        tool_home = self.root / 'real-tool-home'
+        (tool_home / '.pi' / 'agent').mkdir(parents=True)
+        (tool_home / '.pi' / 'agent' / 'AGENTS.md').write_text('TOOL_HOME_MUST_NOT_BE_DISCOVERED')
+        self.tool('bash', {'command': 'printf "%s\n%s\n" "$HOME" "$PATH" > tool-home'})
+        p = self.run_cli('--tool-home', str(tool_home))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(
+            (self.repo / 'tool-home').read_text().splitlines(),
+            [str(tool_home), f'{tool_home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin'],
+        )
+        self.assertIn('PRIVATE_NATIVE_HOME_SENTINEL', self.requests[0]['system'])
+        self.assertNotIn('TOOL_HOME_MUST_NOT_BE_DISCOVERED', self.requests[0]['system'])
+
+    def test_tool_home_rejects_invalid_path_and_bubblewrap_before_provider(self):
+        invalid = self.run_cli('--tool-home', str(self.root / 'bad:home'))
+        self.assertEqual(invalid.returncode, 2, invalid.stderr)
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.session.exists())
+
+        bubblewrap = self.run_cli('--sandbox', 'bubblewrap', '--tool-home', str(self.root / 'tool-home'))
+        self.assertEqual(bubblewrap.returncode, 2, bubblewrap.stderr)
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.session.exists())
+
     def test_host_allows_large_write_and_loopback_download(self):
         self.download_size = 32 * 1024 * 1024
         port = self.server.server_port

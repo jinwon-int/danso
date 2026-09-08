@@ -53,6 +53,9 @@ pub struct RunConfig {
     pub timeout_seconds: u64,
     pub provider_timeout_seconds: u64,
     pub tool_timeout_seconds: u64,
+    /// Optional host-only HOME for child development tools. The native HOME
+    /// remains the source for provider auth and context discovery.
+    pub tool_home: Option<PathBuf>,
     pub long_task: Option<runtime::LongTaskRun>,
     pub task_progress: bool,
     /// Process-local graceful-pause request, installed by the CLI signal
@@ -200,6 +203,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     );
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is required")?);
     ensure!(home.is_absolute(), "HOME must be an absolute path");
+    let tool_home = tools::resolve_tool_home(args.backend, args.tool_home.as_deref(), &home)?;
     let session_path = if args.session.is_absolute() {
         args.session.clone()
     } else {
@@ -385,7 +389,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         cwd,
         readable: ctx.readable,
         backend: args.backend,
-        home,
+        home: tool_home,
         timeout: Duration::from_secs(args.tool_timeout_seconds),
     };
     let mut session = session;

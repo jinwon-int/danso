@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -61,6 +62,44 @@ pub fn resource_limits(backend: crate::app::Backend, timeout: Duration) -> Resou
             cpu_seconds: 30,
         }
     }
+}
+
+/// Resolve the HOME used by host development tools without changing the
+/// native HOME used for provider authentication or context discovery.
+///
+/// The path is validated before provider construction and the same joined
+/// PATH is built here as in the child command. This keeps malformed PATH
+/// components (for example a HOME containing `:` on Unix) fail-closed before
+/// any provider request can be attempted.
+pub fn resolve_tool_home(
+    backend: crate::app::Backend,
+    requested: Option<&Path>,
+    native_home: &Path,
+) -> Result<PathBuf> {
+    ensure!(
+        requested.is_none() || backend.is_host(),
+        "--tool-home is only supported with the host execution backend"
+    );
+    let home = requested.unwrap_or(native_home);
+    ensure!(home.is_absolute(), "tool HOME must be an absolute path");
+    ensure!(
+        !home.as_os_str().as_bytes().contains(&0),
+        "tool HOME contains an invalid PATH component"
+    );
+    if backend.is_host() {
+        let _ = host_path(home)?;
+    }
+    Ok(home.to_path_buf())
+}
+
+fn host_path(home: &Path) -> Result<OsString> {
+    let cargo_bin = home.join(".cargo/bin");
+    Ok(std::env::join_paths([
+        cargo_bin.as_os_str(),
+        std::ffi::OsStr::new("/usr/local/bin"),
+        std::ffi::OsStr::new("/usr/bin"),
+        std::ffi::OsStr::new("/bin"),
+    ])?)
 }
 
 /// Bound on each stage of the post-timeout host reap. The supervisor sends
@@ -123,13 +162,7 @@ impl Runner {
             cmd.arg("__tool");
         }
         let (path, home): (OsString, OsString) = if self.backend.is_host() {
-            let cargo_bin = self.home.join(".cargo/bin");
-            let path = std::env::join_paths([
-                cargo_bin.as_os_str(),
-                std::ffi::OsStr::new("/usr/local/bin"),
-                std::ffi::OsStr::new("/usr/bin"),
-                std::ffi::OsStr::new("/bin"),
-            ])?;
+            let path = host_path(&self.home)?;
             (path, self.home.as_os_str().to_os_string())
         } else {
             (OsString::from("/usr/bin:/bin"), OsString::from("/tmp"))
@@ -391,6 +424,47 @@ mod tests {
                 open_files: 128,
                 cpu_seconds: 30,
             }
+        );
+    }
+
+    #[test]
+    fn tool_home_is_host_only_and_validates_joined_path_before_launch() {
+        let native = Path::new("/private/native-home");
+        assert_eq!(
+            resolve_tool_home(crate::app::Backend::Host, None, native).unwrap(),
+            native
+        );
+        let selected = Path::new("/real/native-home");
+        assert_eq!(
+            resolve_tool_home(crate::app::Backend::Host, Some(selected), native).unwrap(),
+            selected
+        );
+        assert!(
+            resolve_tool_home(
+                crate::app::Backend::Host,
+                Some(Path::new("relative-home")),
+                native
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_tool_home(
+                crate::app::Backend::Host,
+                Some(Path::new("/home/with:separator")),
+                native
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_tool_home(
+                crate::app::Backend::Host,
+                Some(Path::new("/home/with\0nul")),
+                native
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_tool_home(crate::app::Backend::Bubblewrap, Some(selected), native).is_err()
         );
     }
 }
