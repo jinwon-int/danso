@@ -16,6 +16,7 @@ pub mod facts;
 pub mod paths;
 pub mod recall;
 pub mod scan;
+pub mod snapshot;
 
 pub use facts::{
     Candidate, CloseOutcome, FactRecord, FactsFile, GateReport, MAX_FACTS_DEFAULT,
@@ -24,6 +25,7 @@ pub use facts::{
 pub use paths::{Route, valid_scope};
 pub use recall::SearchOptions;
 pub use scan::ScanOutcome;
+pub use snapshot::SnapshotOptions;
 
 /// Audience labels carried by every fact record (§4.1). The scope tree is
 /// the enforcement boundary; the label is data.
@@ -37,5 +39,66 @@ pub fn audience_for_scope(scope: &str) -> &'static str {
         AUDIENCE_SHARED
     } else {
         AUDIENCE_PRIVATE
+    }
+}
+
+/// Local memory injection mode for a run (§8). `ReadWrite` is reserved for
+/// M4 (extraction/journal) and is rejected by `danso run` until then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MemoryMode {
+    #[default]
+    Off,
+    /// Assemble the snapshot once per run and inject it into the system
+    /// context (§5).
+    Read,
+    ReadWrite,
+}
+
+/// Local memory injection configuration for a run (§8). Defaults reproduce
+/// memory OFF exactly: without `--memory read` the system context is byte
+/// identical to a non-memory build.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryConfig {
+    pub mode: MemoryMode,
+    pub root: Option<std::path::PathBuf>,
+    pub scope: String,
+    pub query: Option<String>,
+    pub max_bytes: usize,
+    pub as_of: Option<String>,
+}
+
+impl MemoryConfig {
+    /// `$DANSO_MEMORY_DIR` or `~/.danso/memory` (§8).
+    pub fn default_root() -> std::path::PathBuf {
+        if let Some(dir) = std::env::var_os("DANSO_MEMORY_DIR") {
+            return std::path::PathBuf::from(dir);
+        }
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/root"));
+        home.join(".danso/memory")
+    }
+
+    /// Fail-closed configuration validation (§8): out-of-range values are
+    /// configuration errors, never clamped.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        ensure!(
+            self.mode != MemoryMode::ReadWrite,
+            "--memory read-write is not implemented until M4 (#52)"
+        );
+        ensure!(
+            paths::valid_scope(&self.scope),
+            "memory scope must be global, shared, or private-<32 hex>"
+        );
+        ensure!(
+            (1..=snapshot::SNAPSHOT_MAX_BYTES_MAX).contains(&self.max_bytes),
+            "memory max bytes must be 1..={}",
+            snapshot::SNAPSHOT_MAX_BYTES_MAX
+        );
+        if let Some(root) = &self.root {
+            ensure!(root.is_absolute(), "memory dir must be an absolute path");
+        }
+        Ok(())
     }
 }

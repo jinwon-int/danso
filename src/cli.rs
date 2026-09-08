@@ -47,6 +47,24 @@ pub struct Args {
     /// Explicit private UTF-8 system context (at most 32768 bytes), refreshed each run.
     #[arg(long)]
     pub system_context_file: Option<PathBuf>,
+    /// Local long-term memory injection: off | read (read-write arrives in M4, #52).
+    #[arg(long, value_parser = ["off", "read", "read-write"], default_value = "off")]
+    pub memory: String,
+    /// Memory root directory (scope directories live below it).
+    #[arg(long)]
+    pub memory_dir: Option<PathBuf>,
+    /// Memory scope: global | shared | private-<32 hex>.
+    #[arg(long)]
+    pub memory_scope: Option<String>,
+    /// Task-conditioned query for the local-hot block; default derives from the prompt.
+    #[arg(long)]
+    pub memory_query: Option<String>,
+    /// Total snapshot budget in bytes (1..=24576, default 12000).
+    #[arg(long)]
+    pub memory_max_bytes: Option<usize>,
+    /// Pin recall to an instant (tests/debugging).
+    #[arg(long)]
+    pub memory_as_of: Option<String>,
     /// Execution backend: host uses current-user permissions; bubblewrap isolates tools.
     #[arg(long, default_value = "host", value_enum)]
     pub sandbox: SandboxArg,
@@ -91,6 +109,23 @@ impl Args {
             trust_project: self.trust_project,
             no_tools: self.no_tools,
             system_context_file: self.system_context_file.clone(),
+            memory: danso::memory::MemoryConfig {
+                mode: match self.memory.as_str() {
+                    "read" => danso::memory::MemoryMode::Read,
+                    "read-write" => danso::memory::MemoryMode::ReadWrite,
+                    _ => danso::memory::MemoryMode::Off,
+                },
+                root: self.memory_dir.clone(),
+                scope: self
+                    .memory_scope
+                    .clone()
+                    .unwrap_or_else(|| "global".to_string()),
+                query: self.memory_query.clone(),
+                max_bytes: self
+                    .memory_max_bytes
+                    .unwrap_or(danso::memory::snapshot::SNAPSHOT_MAX_BYTES_DEFAULT),
+                as_of: self.memory_as_of.clone(),
+            },
             backend: self.backend(),
             max_turns: self.max_turns,
             compact_at_bytes: self.compact_at_bytes,

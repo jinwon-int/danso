@@ -5,7 +5,7 @@
 //! `global` tree under `$DANSO_MEMORY_DIR` (or `~/.danso/memory`) is used.
 
 use clap::{Parser, Subcommand};
-use danso::memory::{self, Route, eval, facts, paths, recall};
+use danso::memory::{self, Route, eval, facts, paths, recall, snapshot};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -360,48 +360,20 @@ fn close(route: &Route, fact: &str, lock_timeout_ms: u64) -> anyhow::Result<Opti
     }
 }
 
-/// M1 snapshot preview (§5.1 partial): the three markdown/state blocks in
-/// the ccc load-memory order with fixed caps, every block scanned and
-/// independently fail-open. The dynamic budget and the local-hot block land
-/// with M2.
+/// Snapshot preview (§5.1): the real assembly — title, resume, status,
+/// MEMORY+USER, working-state with the STALE warning, and the local-hot
+/// block — exactly what `danso run --memory read` injects, without the
+/// managed-block wrapper.
 fn show(route: &Route) -> anyhow::Result<()> {
-    const RESUME_CAP: usize = 2000;
-    const MEMORY_CAP: usize = 4000;
-    const WORKING_STATE_CAP: usize = 2048;
-    let read = |path: &std::path::Path| -> Option<String> {
-        paths::read_bounded(path, 64 * 1024, "memory document")
-            .ok()
-            .flatten()
-            .map(|payload| String::from_utf8_lossy(&payload).into_owned())
-            .filter(|text| !text.trim().is_empty())
+    let options = snapshot::SnapshotOptions {
+        event: "preview",
+        query: None,
+        max_bytes: snapshot::SNAPSHOT_MAX_BYTES_DEFAULT,
+        stale_days: snapshot::STALE_DAYS_DEFAULT,
+        now: chrono::Utc::now(),
     };
-
-    println!("# danso memory snapshot (preview)");
-    if let Some(resume) = read(&route.resume_file()) {
-        let scanned = memory::scan::scan("resume", &resume, Some(RESUME_CAP));
-        println!("\n▶ 직전 세션에서 이어서:\n{}", scanned.text.trim_end());
-    }
-    let mut combined = String::new();
-    for file in ["MEMORY.md", "USER.md"] {
-        if let Some(doc) = read(&route.memories_dir().join(file)) {
-            if !combined.is_empty() {
-                combined.push('\n');
-            }
-            combined.push_str(&doc);
-        }
-    }
-    if combined.is_empty() {
-        println!("\n## Built-in MEMORY + USER\n(memory files unavailable)");
-    } else {
-        let scanned = memory::scan::scan("memory", &combined, Some(MEMORY_CAP));
-        println!("\n## Built-in MEMORY + USER\n{}", scanned.text.trim_end());
-    }
-    if let Some(working_state) = read(&route.working_state_file()) {
-        let scanned = memory::scan::scan("working-state", &working_state, Some(WORKING_STATE_CAP));
-        println!("\n## Working-state checkpoint\n{}", scanned.text.trim_end());
-    } else {
-        println!("\n## Working-state checkpoint\n(no working state recorded)");
-    }
+    let body = snapshot::assemble(route, &options)?;
+    print!("{body}");
     Ok(())
 }
 

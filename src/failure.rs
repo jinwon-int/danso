@@ -17,6 +17,7 @@ pub enum Kind {
     Runtime,
     RunTimeout,
     Interrupted,
+    Memory,
 }
 
 /// Safe metadata for a failure raised by the native HTTP transport.

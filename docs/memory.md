@@ -11,8 +11,9 @@ with no Python, Node, Shell, or SQLite runtime dependency. Design source:
 | Stage | Scope | Status |
 | --- | --- | --- |
 | M1 | Storage + search core: `paths`, `scan`, `facts`, `recall`, `memory init/add/search/close/show/eval` | This PR |
-| M2 | Snapshot assembly + run integration (`snapshot.rs`, `--memory read`, dynamic budgets) | Planned |
+| M2 | Snapshot assembly + run integration (`snapshot.rs`, `--memory read`, dynamic budgets) | **This PR** |
 | M3 | Working-state + checkpoints (harness-written `working-state.md`) | Planned |
+| M2½ | `--memory-refresh per-request` (needs a runtime context hook) | Planned |
 | M4 | Distill extraction + journal + transactions (`--memory read-write`, `distill/drain/rollback`) | Planned |
 | M5 | Audience derivation + diagnostics (`check`, legacy read, promotion) | Planned |
 
@@ -95,6 +96,34 @@ never dropped — and byte caps reserve the truncation marker inside the limit,
 cut on a UTF-8 boundary. Audit metadata carries category names and byte
 counts only (§6.4).
 
+## Snapshot assembly (§5, M2)
+
+With `--memory read` the run injects a managed block into the system context,
+assembled once per run (per-run refresh; per-request refresh lands with a
+later stage). Block order and caps follow §5.1 — resume (2000 B, omitted when
+absent) → status line → `## Built-in MEMORY + USER` (4000 B, placeholder
+`(memory files unavailable)`) → `## Working-state checkpoint` (2048 B, with a
+`> STALE: …` first line once the file is older than 14 days, 0 disables) →
+`## Local hot memory` (dynamic: `alloc = max(3000, max_bytes − 1000 − used)`,
+`limit = clamp(alloc/180, 5, 25)`, placeholder `(local hot memory disabled or
+no hits)`).
+
+The local-hot block follows §4.4: a counts-only review warning header, every
+open constraint first (never budget-dropped), then query matches in ranking
+order and newest-first fill, assembled with skip-then-fill where the first
+fact line is always kept. Observations never enter the snapshot; needs-human
+facts stay visible and marked; volatile facts carry `⟳` and a single
+`⟳ live-check …` guidance line.
+
+The managed block (§5.2) wraps the snapshot with the audited markers
+(`ccc-node:codex-memory:begin/end`), the body SHA-256, `materialized-at`, the
+`danso-native-v1` working-state policy, and the untrusted-data policy lines.
+A stored file that itself contains the markers is a forgery and aborts the
+injection with a `memory` failure. The block is capped at 32768 bytes, and
+the combined system context (memory + caller `--system-context-file`) is
+validated against 65536 bytes. Memory OFF is byte-identical: `--memory` off
+never touches the context.
+
 ## CLI (§8 M1 subset)
 
 ```
@@ -110,6 +139,13 @@ Root: `--memory-dir` or `$DANSO_MEMORY_DIR` (default `~/.danso/memory`);
 scope: `--scope global|shared|private-<32 hex>`. Configuration errors exit 2;
 runtime refusals exit 1. Read rules (§7): a private scope reads its own tree
 plus `shared`; `shared` and `global` never open another tree.
+
+`danso run` gains `--memory off|read` (read-write arrives with M4 and is
+rejected), `--memory-dir`, `--memory-scope`, `--memory-query` (default:
+task + cwd + git branch/changed paths, capped at 1400 bytes), `--memory-max-bytes`
+(1..=24576, default 12000) and `--memory-as-of`. Memory configuration
+failures are configuration errors (exit 2, category `memory` for assembly
+failures such as marker forgery).
 
 ## Evaluation
 

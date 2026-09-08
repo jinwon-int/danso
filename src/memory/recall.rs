@@ -53,7 +53,7 @@ fn age_expiry_forbidden(kind: &str) -> bool {
     matches!(kind, "decision" | "procedure" | "constraint")
 }
 
-fn retention_keeps(record: &FactRecord, now: DateTime<Utc>) -> bool {
+pub(crate) fn retention_keeps(record: &FactRecord, now: DateTime<Utc>) -> bool {
     if !record.known_kind {
         return true; // unknown kinds are kept conservatively
     }
@@ -271,13 +271,19 @@ pub fn build_index(route: &Route, now: DateTime<Utc>) -> Result<Vec<Doc>> {
             }
         }
         // Structured docs stay scoped to the route's own tree; the shared
-        // tree contributes its own facts file when present.
+        // tree contributes its own facts file when present. Source failures
+        // are fail-open (§5.1): the block is skipped, the rest still injects.
         let facts_route = if index == 0 {
             route.clone()
         } else {
-            shared_route_for(scope_dir)?
+            match shared_route_for(scope_dir) {
+                Ok(shared) => shared,
+                Err(_) => continue,
+            }
         };
-        docs.extend(structured_docs(&facts_route, now)?);
+        if let Ok(structured) = structured_docs(&facts_route, now) {
+            docs.extend(structured);
+        }
     }
     Ok(docs)
 }

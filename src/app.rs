@@ -3,6 +3,7 @@ use crate::{
     context,
     contracts::EventSink,
     failure::{Kind, at},
+    memory,
     provider::{Selected, anthropic::Anthropic, glm::Glm, openai::OpenAi},
     runtime::{self, RunInput},
     session::Session,
@@ -39,6 +40,7 @@ pub struct RunConfig {
     pub trust_project: bool,
     pub no_tools: bool,
     pub system_context_file: Option<PathBuf>,
+    pub memory: memory::MemoryConfig,
     pub backend: Backend,
     pub max_turns: u32,
     pub compact_at_bytes: Option<usize>,
@@ -91,6 +93,25 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         "session must live outside writable workspace"
     );
     let mut ctx = context::discover(&cwd, &home, args.trust_project)?;
+    // Memory injection (issue #52 §5): the managed block lands before any
+    // caller context, and the combined context is validated against the
+    // 65536-byte limit below. With memory OFF the context is byte-identical
+    // to a non-memory build.
+    if args.memory.mode != memory::MemoryMode::Off {
+        args.memory.validate().map_err(at(Kind::Configuration))?;
+        memory::snapshot::inject_into_context(
+            &mut ctx.prompt,
+            &args.memory,
+            &args.prompt,
+            &cwd,
+            chrono::Utc::now(),
+        )
+        .map_err(at(Kind::Memory))?;
+        ensure!(
+            ctx.prompt.len() <= context::CONTEXT_LIMIT,
+            "combined context exceeds 65536 bytes"
+        );
+    }
     if let Some(path) = &args.system_context_file {
         ensure!(
             !crate::tools::SYSTEM_MOUNTS
