@@ -12,6 +12,11 @@ use tokio::{
     process::Command,
 };
 pub(crate) const SYSTEM_MOUNTS: [&str; 4] = ["/usr", "/bin", "/lib", "/lib64"];
+/// Bound on each stage of the post-timeout host reap. The supervisor sends
+/// SIGKILL and is a subreaper, so a normal tree converges in tens of
+/// milliseconds; this only caps the pathological case where a descendant is
+/// stuck in uninterruptible sleep and can never be reaped.
+const REAP_GRACE: Duration = Duration::from_secs(5);
 
 pub struct Runner {
     pub cwd: PathBuf,
@@ -144,10 +149,7 @@ impl Runner {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => {
                 if self.backend.is_host() {
-                    cleanup.stop();
-                    if child.wait().await.is_ok() {
-                        cleanup.0 = None;
-                    }
+                    reap_host(&mut cleanup, &mut child).await;
                 } else {
                     child.kill().await.ok();
                 }
@@ -155,10 +157,7 @@ impl Runner {
             }
             Err(_) => {
                 if self.backend.is_host() {
-                    cleanup.stop();
-                    if child.wait().await.is_ok() {
-                        cleanup.0 = None;
-                    }
+                    reap_host(&mut cleanup, &mut child).await;
                 } else {
                     child.kill().await.ok();
                 }
@@ -182,13 +181,16 @@ impl HostCleanup {
         })))
     }
     fn stop(&self) {
+        self.signal(libc::SIGTERM);
+    }
+    fn signal(&self, signal: i32) {
         use std::os::fd::AsRawFd;
         if let Some(fd) = &self.0 {
             unsafe {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal,
                     fd.as_raw_fd(),
-                    libc::SIGTERM,
+                    signal,
                     std::ptr::null::<libc::siginfo_t>(),
                     0,
                 );
@@ -199,6 +201,34 @@ impl HostCleanup {
 impl Drop for HostCleanup {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Terminate the host supervisor and reap it without blocking indefinitely.
+///
+/// The supervisor kills its descendants with SIGKILL under
+/// PR_SET_CHILD_SUBREAPER, so this normally completes in tens of
+/// milliseconds. It cannot reap a descendant stuck in uninterruptible sleep,
+/// and its reap loop has no exit for that case. An unbounded wait here would
+/// hand a per-tool timeout up to the whole-run timeout, so escalate to
+/// SIGKILL and then give up rather than stall the agent loop.
+///
+/// Giving up leaves the guard armed, so Drop signals once more.
+async fn reap_host(cleanup: &mut HostCleanup, child: &mut tokio::process::Child) {
+    async fn settled(child: &mut tokio::process::Child) -> bool {
+        matches!(
+            tokio::time::timeout(REAP_GRACE, child.wait()).await,
+            Ok(Ok(_))
+        )
+    }
+    cleanup.signal(libc::SIGTERM);
+    if settled(child).await {
+        cleanup.0 = None;
+        return;
+    }
+    cleanup.signal(libc::SIGKILL);
+    if settled(child).await {
+        cleanup.0 = None;
     }
 }
 
