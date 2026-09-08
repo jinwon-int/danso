@@ -130,3 +130,63 @@ fn execution_context_does_not_guess_non_utf8_paths() {
     assert!(context.contains("use relative paths from the configured directory"));
     assert!(!context.contains('\u{fffd}'));
 }
+
+// Skill frontmatter is parsed by a third-party YAML crate, so these cases pin
+// the semantics the harness depends on rather than the crate's full surface.
+// They must hold across any parser swap.
+#[test]
+fn skill_frontmatter_semantics_are_parser_independent() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    put(&home.join(".pi/agent/AGENTS.md"), "global");
+
+    // Quoted scalars, and a colon inside a quoted value.
+    put(
+        &home.join(".pi/agent/skills/quoted.md"),
+        "---\nname: \"quoted-skill\"\ndescription: \"has: a colon\"\n---\nbody",
+    );
+    // Unknown keys are ignored, not fatal.
+    put(
+        &home.join(".pi/agent/skills/extra.md"),
+        "---\nname: extra-skill\ndescription: Extra\nunknown-key: 1\n---\nbody",
+    );
+    // disable-model-invocation hides the skill.
+    put(
+        &home.join(".pi/agent/skills/hidden.md"),
+        "---\nname: hidden-skill\ndescription: Hidden\ndisable-model-invocation: true\n---\nbody",
+    );
+    // A missing description is skipped, not a hard error.
+    put(
+        &home.join(".pi/agent/skills/nodesc.md"),
+        "---\nname: nodesc-skill\n---\nbody",
+    );
+    // An empty description is skipped.
+    put(
+        &home.join(".pi/agent/skills/empty.md"),
+        "---\nname: empty-skill\ndescription: \"   \"\n---\nbody",
+    );
+    // Malformed YAML is skipped without failing discovery.
+    put(
+        &home.join(".pi/agent/skills/broken.md"),
+        "---\nname: [unclosed\ndescription: Broken\n---\nbody",
+    );
+    // With no name, the directory name is used.
+    put(
+        &home.join(".pi/agent/skills/named-dir/SKILL.md"),
+        "---\ndescription: From directory\n---\nbody",
+    );
+
+    let ctx = context::discover(&repo, &home, false).unwrap();
+    assert!(ctx.prompt.contains("quoted-skill"));
+    assert!(ctx.prompt.contains("has: a colon"));
+    assert!(ctx.prompt.contains("extra-skill"));
+    assert!(ctx.prompt.contains("named-dir"));
+    assert!(!ctx.prompt.contains("hidden-skill"));
+    assert!(!ctx.prompt.contains("nodesc-skill"));
+    assert!(!ctx.prompt.contains("empty-skill"));
+    assert!(!ctx.prompt.contains("Broken"));
+    // Skill bodies never enter the prompt.
+    assert!(!ctx.prompt.contains("body"));
+}
