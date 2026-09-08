@@ -172,7 +172,7 @@ pub fn discover(cwd: &Path, home: &Path, trusted: bool) -> Result<ContextFiles> 
         let Some((header, _)) = rest.split_once("\n---") else {
             continue;
         };
-        let Ok(meta) = serde_yaml::from_str::<Frontmatter>(header) else {
+        let Ok(meta) = serde_norway::from_str::<Frontmatter>(header) else {
             continue;
         };
         if meta.description.trim().is_empty() || meta.hidden {
