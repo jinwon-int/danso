@@ -12,7 +12,7 @@ with no Python, Node, Shell, or SQLite runtime dependency. Design source:
 | --- | --- | --- |
 | M1 | Storage + search core: `paths`, `scan`, `facts`, `recall`, `memory init/add/search/close/show/eval` | This PR |
 | M2 | Snapshot assembly + run integration (`snapshot.rs`, `--memory read`, dynamic budgets) | **This PR** |
-| M3 | Working-state + checkpoints (harness-written `working-state.md`) | Planned |
+| M3 | Working-state + checkpoints (harness-written `working-state.md`) | **This PR** |
 | M2½ | `--memory-refresh per-request` (needs a runtime context hook) | Planned |
 | M4 | Distill extraction + journal + transactions (`--memory read-write`, `distill/drain/rollback`) | Planned |
 | M5 | Audience derivation + diagnostics (`check`, legacy read, promotion) | Planned |
@@ -123,6 +123,22 @@ injection with a `memory` failure. The block is capped at 32768 bytes, and
 the combined system context (memory + caller `--system-context-file`) is
 validated against 65536 bytes. Memory OFF is byte-identical: `--memory` off
 never touches the context.
+
+## Working state (§5.3, M3)
+
+The harness — not the model — records `state/working-state.md`:
+- on every compaction, the checkpoint's five fields (objective / constraints
+  / changes / tests / pending) are rendered into the file, after the
+  previous state is preserved as a PreCompact copy under
+  `state/checkpoints/working-state-YYYYMMDD_HHMMSS.md` (newest 30 kept by
+  mtime);
+- when a run finishes, the first 2048 bytes of the final answer are recorded
+  in a `## last final answer` section, the pending list is resolved, and an
+  archived copy lands in `state/session-archive/working-state-<sha256[:24]>.md`.
+
+Writes are fail-closed (an unwritable tree fails the run), the rendered text
+passes the injection scanner, and the session journal is never touched. The
+STALE read-side warning lives in the snapshot (§5.1).
 
 ## CLI (§8 M1 subset)
 

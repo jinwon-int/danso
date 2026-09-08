@@ -17,6 +17,7 @@ pub mod paths;
 pub mod recall;
 pub mod scan;
 pub mod snapshot;
+pub mod working_state;
 
 pub use facts::{
     Candidate, CloseOutcome, FactRecord, FactsFile, GateReport, MAX_FACTS_DEFAULT,

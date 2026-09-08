@@ -209,7 +209,26 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         timeout: Duration::from_secs(args.tool_timeout_seconds),
     };
     let mut session = session;
-    runtime::run(
+    // The harness records working state on compaction and at a finished run
+    // (§5.3); the runtime itself stays memory-agnostic.
+    let memory_root = if args.memory.mode != memory::MemoryMode::Off {
+        Some(
+            args.memory
+                .root
+                .clone()
+                .unwrap_or_else(memory::MemoryConfig::default_root),
+        )
+    } else {
+        None
+    };
+    let memory_route = memory_root
+        .as_deref()
+        .map(|root| memory::Route::new(root, &args.memory.scope))
+        .transpose()?;
+    let mut recorder =
+        memory_route.map(|route| memory::working_state::Recorder::new(route, &args.prompt));
+    let mut recording = memory::working_state::RecordingSink::new(sink, recorder.as_mut());
+    let run = runtime::run(
         RunInput {
             no_tools: args.no_tools,
             prompt: &args.prompt,
@@ -221,9 +240,14 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         &mut provider,
         &runner,
         &mut session,
-        sink,
+        &mut recording,
         usage,
     )
-    .await
-    .map_err(at(Kind::Runtime))
+    .await;
+    if run.is_ok()
+        && let Some(recorder) = recorder.as_mut()
+    {
+        recorder.on_run_end().map_err(at(Kind::Memory))?;
+    }
+    run.map_err(at(Kind::Runtime))
 }
