@@ -159,6 +159,15 @@ pub async fn summarize(
         })
         .collect();
     let ledger = serde_json::to_string(&evidence)?;
+    // Char boundaries of the whole ledger, computed once. `offset` only ever
+    // advances by a boundary, so each chunk's boundaries are this list from
+    // `offset` onward, shifted. Rebuilding it per chunk allocated 8 bytes per
+    // remaining char up to MAX_CHUNKS times for an identical result.
+    let boundaries: Vec<usize> = ledger
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(ledger.len()))
+        .collect();
     let mut offset = 0;
     let mut summary = Value::Null;
     for part in 0..MAX_CHUNKS {
@@ -168,11 +177,12 @@ pub async fn summarize(
             )));
         }
         let rest = &ledger[offset..];
-        let boundaries: Vec<usize> = rest
-            .char_indices()
-            .map(|(i, _)| i)
-            .chain(std::iter::once(rest.len()))
-            .collect();
+        // `boundaries[base]` is `offset` itself, so `base + i` indexes this
+        // chunk's i-th boundary and subtracting `offset` makes it relative to
+        // `rest` — the same values the per-chunk Vec held.
+        let base = boundaries.partition_point(|&b| b < offset);
+        let boundary = |i: usize| boundaries[base + i] - offset;
+        let count = boundaries.len() - base;
         let make = |end: usize| {
             vec![
                 json!({"role":"user","content":serde_json::to_string(&json!({
@@ -182,10 +192,10 @@ pub async fn summarize(
         // Binary search the exact wire size, including JSON escaping and provider
         // wrappers. Never slice a UTF-8 code point or truncate unseen evidence.
         let mut lo = 0;
-        let mut hi = boundaries.len();
+        let mut hi = count;
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            let candidate = make(boundaries[mid]);
+            let candidate = make(boundary(mid));
             let bytes = provider
                 .request_bytes(&ModelRequest {
                     // Reserve the longer repair prompt before choosing a fragment.
@@ -200,7 +210,7 @@ pub async fn summarize(
                 hi = mid;
             }
         }
-        let end = boundaries[lo];
+        let end = boundary(lo);
         ensure!(
             end > 0,
             "checkpoint and summarizer instructions exceed request budget"

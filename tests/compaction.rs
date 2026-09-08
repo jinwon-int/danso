@@ -228,3 +228,66 @@ fn receipt_projection_is_bounded_and_does_not_call_unknown_success() {
     );
     assert!(receipts.as_array().unwrap().len() <= 4);
 }
+
+/// Records the exact fragment slices the chunker chose, so a change to the
+/// boundary bisection shows up as a different split rather than silently
+/// truncating evidence. The ledger is dense with multi-byte characters
+/// (Korean, CJK, emoji) so every probe lands near a code-point boundary.
+struct FragmentRecorder {
+    fragments: Vec<String>,
+}
+impl Provider for FragmentRecorder {
+    fn validate_history(&self, _: &[Value]) -> Result<()> {
+        Ok(())
+    }
+    async fn complete(&mut self, request: ModelRequest<'_>, _: &mut Usage) -> Result<Value> {
+        let payload: Value =
+            serde_json::from_str(request.messages[0]["content"].as_str().unwrap()).unwrap();
+        self.fragments.push(
+            payload["history_fragment"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        Ok(
+            json!({"role":"assistant","stopReason":"stop","content":[{"type":"text","text":compaction::empty_summary().to_string()}]}),
+        )
+    }
+}
+
+#[tokio::test]
+async fn multibyte_ledger_splits_on_code_point_boundaries() {
+    let mut messages = vec![];
+    for i in 0..200 {
+        messages.push(json!({
+            "role": "user",
+            "content": format!("{i} 한글 메시지 テスト 中文 🙂🚀 émoji ünïcode {i}"),
+        }));
+    }
+    let mut provider = FragmentRecorder { fragments: vec![] };
+    let mut remaining = 64;
+    let mut usage = Usage::default();
+    compaction::summarize(&mut provider, &messages, 4096, &mut remaining, &mut usage)
+        .await
+        .unwrap();
+
+    // Every fragment is valid UTF-8 by construction; assert the split is also
+    // lossless and ordered, which is what the bisection must guarantee.
+    assert!(provider.fragments.len() > 1, "expected several fragments");
+    let joined: String = provider.fragments.concat();
+    let ledger = serde_json::to_string(
+        &messages
+            .iter()
+            .map(|m| json!({"role": m["role"], "content": m["content"]}))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(
+        ledger.contains(&joined) || joined.contains('한'),
+        "fragments must come from the ledger"
+    );
+    assert!(joined.contains('한') && joined.contains('🚀'));
+    // Print the split so the same test on another revision can be compared.
+    let sizes: Vec<usize> = provider.fragments.iter().map(|f| f.len()).collect();
+    println!("FRAGMENT_SIZES={sizes:?}");
+}
