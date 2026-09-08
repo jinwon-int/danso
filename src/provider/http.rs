@@ -6,10 +6,32 @@ use std::time::{Duration, Instant};
 pub struct Http {
     client: reqwest::Client,
     url: reqwest::Url,
+    header: reqwest::header::HeaderName,
     key: reqwest::header::HeaderValue,
 }
 impl Http {
+    /// Bearer-authenticated transport (OpenAI, GLM).
     pub fn new(base: &str, suffix: &str, key: &str, timeout_seconds: u64) -> Result<Self> {
+        Self::with_auth(
+            base,
+            suffix,
+            reqwest::header::AUTHORIZATION,
+            &format!("Bearer {key}"),
+            key,
+            timeout_seconds,
+        )
+    }
+    /// Transport for providers that authenticate with a non-Bearer header
+    /// (Anthropic uses `x-api-key`). The credential is still carried in a
+    /// sensitive `HeaderValue` and the same URL and redirect rules apply.
+    pub fn with_auth(
+        base: &str,
+        suffix: &str,
+        header: reqwest::header::HeaderName,
+        header_value: &str,
+        key: &str,
+        timeout_seconds: u64,
+    ) -> Result<Self> {
         ensure!(
             (1..=300).contains(&timeout_seconds),
             "invalid provider timeout"
@@ -17,14 +39,19 @@ impl Http {
         Self::with_timeouts(
             base,
             suffix,
+            header,
+            header_value,
             key,
             Duration::from_secs(timeout_seconds),
             Duration::from_secs(10),
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn with_timeouts(
         base: &str,
         suffix: &str,
+        header: reqwest::header::HeaderName,
+        header_value: &str,
         key: &str,
         request_timeout: Duration,
         connect_timeout: Duration,
@@ -47,7 +74,7 @@ impl Http {
             "provider base URL cannot contain credentials, query, or fragment"
         );
         url.set_path(&format!("{}/{}", url.path().trim_end_matches('/'), suffix));
-        let mut key = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+        let mut key = reqwest::header::HeaderValue::from_str(header_value)
             .map_err(|_| anyhow::anyhow!("invalid provider API key header"))?;
         key.set_sensitive(true);
         let client = reqwest::Client::builder()
@@ -55,7 +82,12 @@ impl Http {
             .connect_timeout(connect_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Self { client, url, key })
+        Ok(Self {
+            client,
+            url,
+            header,
+            key,
+        })
     }
     pub async fn post(&self, body: &Value, usage: &mut crate::usage::Usage) -> Result<Value> {
         let bytes = self
@@ -89,7 +121,7 @@ impl Http {
             .client
             .post(self.url.clone())
             .headers(headers)
-            .header(reqwest::header::AUTHORIZATION, self.key.clone())
+            .header(self.header.clone(), self.key.clone())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(bytes)
             .build()
@@ -201,6 +233,8 @@ mod tests {
         let client = Http::with_timeouts(
             &base,
             "test",
+            reqwest::header::AUTHORIZATION,
+            "Bearer PRIVATE_KEY_MARKER",
             "PRIVATE_KEY_MARKER",
             Duration::from_millis(if tls { 1000 } else { 150 }),
             Duration::from_millis(if tls { 100 } else { 1000 }),

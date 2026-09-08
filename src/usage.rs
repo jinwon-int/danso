@@ -14,7 +14,7 @@ pub struct Usage {
     total: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
