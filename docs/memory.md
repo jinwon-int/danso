@@ -12,10 +12,10 @@ with no Python, Node, Shell, or SQLite runtime dependency. Design source:
 | --- | --- | --- |
 | M1 | Storage + search core: `paths`, `scan`, `facts`, `recall`, `memory init/add/search/close/show/eval` | This PR |
 | M2 | Snapshot assembly + run integration (`snapshot.rs`, `--memory read`, dynamic budgets) | **This PR** |
-| M3 | Working-state + checkpoints (harness-written `working-state.md`) | **This PR** |
-| M2½ | `--memory-refresh per-request` (needs a runtime context hook) | Planned |
-| M4 | Distill extraction + journal + transactions (`--memory read-write`, `distill/drain/rollback`) | Planned |
-| M5 | Audience derivation + diagnostics (`check`, legacy read, promotion) | Planned |
+| M3 | Working-state + checkpoints (harness-written `working-state.md`) | Done (M1–M3) |
+| M2½ | `--memory-refresh per-request` (needs a runtime context hook) | Deferred |
+| M4 | Distill extraction + journal + transactions (`--memory read-write`, `distill/drain/rollback`) | **This PR** |
+| M5 | Scope diagnostics (`check`, audit ledger, legacy read) | **This PR** (promotion deferred per §7) |
 
 ## On-disk layout (§3)
 
@@ -123,6 +123,37 @@ injection with a `memory` failure. The block is capped at 32768 bytes, and
 the combined system context (memory + caller `--system-context-file`) is
 validated against 65536 bytes. Memory OFF is byte-identical: `--memory` off
 never touches the context.
+
+## Distill pipeline (§4.5–§4.7, M4)
+
+`danso run --memory read-write` registers a pending extraction job on a
+final answer or turn-budget exhaustion (`--memory-distill queue|inline|off`;
+inline drains one job after the run). `danso memory distill --session
+<path>` enqueues explicitly; `danso memory drain` claims pending jobs and
+runs the one-turn tool-free extraction over the production provider
+(env-selected, one STRICT retry), validates the output against the ccc
+`codex-distill-extraction-v1` contract plus the Danso `source`/`quote`
+extensions (bounds, duplicate keys, NaN/Infinity, credential and directive
+patterns, provenance identity, decision reasons), applies the §4.2 write
+gates, and commits both targets through the crash-recoverable
+`ccc.local-memory-rollback.v1` transaction: prepared → committed with the
+pre-image retained as the single undoable head, recovery completing forward
+or restoring atomically, `danso memory rollback --action <32hex>` restoring
+the newest head after a full post-image CAS check. Failures classify from
+the provider failure kind and HTTP status only (auth 6h, quota until
+01:00 UTC, rate-limit 30 min, model 6h, exponential otherwise, capped at
+4 h, dead-letter after five failures, 48 h age limit, transcript-change
+dead-letter) with a scope-wide cooldown for hard classes.
+
+## Diagnostics (§6.4, M5)
+
+`danso memory check --json` reports body-free scope state: record counts
+(open/closed/needs-human/constraints), journal pending/dead counters, the
+cooldown state, rollback head/action counts, and file presence. The audit
+ledger `state/audit.jsonl` records `MemoryCommit` and `DistillJob` events
+(category names and counts only, 1 MiB rotation). The session id is hashed
+wherever it must appear; fact bodies and raw session ids never enter
+diagnostics.
 
 ## Working state (§5.3, M3)
 

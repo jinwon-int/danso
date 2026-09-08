@@ -65,6 +65,9 @@ pub struct Args {
     /// Pin recall to an instant (tests/debugging).
     #[arg(long)]
     pub memory_as_of: Option<String>,
+    /// Distill scheduling for read-write runs: queue | inline | off.
+    #[arg(long, value_parser = ["queue", "inline", "off"], default_value = "queue")]
+    pub memory_distill: String,
     /// Execution backend: host uses current-user permissions; bubblewrap isolates tools.
     #[arg(long, default_value = "host", value_enum)]
     pub sandbox: SandboxArg,
@@ -125,6 +128,11 @@ impl Args {
                     .memory_max_bytes
                     .unwrap_or(danso::memory::snapshot::SNAPSHOT_MAX_BYTES_DEFAULT),
                 as_of: self.memory_as_of.clone(),
+            },
+            memory_distill: match self.memory_distill.as_str() {
+                "inline" => danso::memory::DistillMode::Inline,
+                "off" => danso::memory::DistillMode::Off,
+                _ => danso::memory::DistillMode::Queue,
             },
             backend: self.backend(),
             max_turns: self.max_turns,

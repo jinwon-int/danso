@@ -11,12 +11,15 @@
 //! init|add|search|close|show|eval`); snapshot assembly and run
 //! integration arrive with M2.
 
+pub mod audit;
+pub mod distill;
 pub mod eval;
 pub mod facts;
 pub mod paths;
 pub mod recall;
 pub mod scan;
 pub mod snapshot;
+pub mod transaction;
 pub mod working_state;
 
 pub use facts::{
@@ -24,6 +27,7 @@ pub use facts::{
     MAX_FACTS_FILE_BYTES,
 };
 pub use paths::{Route, valid_scope};
+pub const FACTS_FILE_NAME: &str = paths::FACTS_FILE;
 pub use recall::SearchOptions;
 pub use scan::ScanOutcome;
 pub use snapshot::SnapshotOptions;
@@ -53,6 +57,16 @@ pub enum MemoryMode {
     /// context (§5).
     Read,
     ReadWrite,
+}
+
+/// Distill scheduling for a read-write run (§8): queue (default) registers
+/// a pending extraction; inline additionally drains one job after the run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DistillMode {
+    #[default]
+    Queue,
+    Inline,
+    Off,
 }
 
 /// Local memory injection configuration for a run (§8). Defaults reproduce

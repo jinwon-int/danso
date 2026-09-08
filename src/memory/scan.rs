@@ -202,6 +202,20 @@ pub fn truncate_utf8(payload: &str, budget: usize) -> &str {
     &payload[..cut]
 }
 
+/// Credential-only redaction for extraction inputs (§4.6): the ccc marker
+/// `[REDACTED_CREDENTIAL]` replaces recognized credential shapes. Unlike
+/// [`scan`] this is a data-preparation step for the distill round trip, not
+/// an injection boundary.
+pub fn redact_credentials(input: &str) -> String {
+    let marker = "[REDACTED_CREDENTIAL]";
+    let mut text = input.to_string();
+    for (pattern, _) in CREDENTIAL_PATTERNS {
+        let re = static_regex(pattern);
+        text = re.replace_all(&text, regex::NoExpand(marker)).into_owned();
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
