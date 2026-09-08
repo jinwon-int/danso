@@ -170,21 +170,25 @@ fn transport_error(
     started: Instant,
     request_bytes: usize,
 ) -> anyhow::Error {
-    let message = if error.is_timeout() {
-        "provider request timed out"
-    } else if error.is_connect() {
-        "provider connection failed"
-    } else {
-        "provider transport failed"
+    let phase = match phase {
+        "connect" => crate::failure::TransportPhase::Connect,
+        "before_response_headers" => crate::failure::TransportPhase::BeforeResponseHeaders,
+        "response_body" => crate::failure::TransportPhase::ResponseBody,
+        _ => unreachable!("native HTTP transport supplied an unknown phase"),
     };
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let request_bytes = u64::try_from(request_bytes).unwrap_or(u64::MAX);
+    let diagnostic = crate::failure::TransportDiagnostic::new(
+        phase,
+        elapsed_ms,
+        request_bytes,
+        error.is_timeout(),
+    );
     crate::failure::at(if error.is_timeout() {
         crate::failure::Kind::ProviderTimeout
     } else {
         crate::failure::Kind::Provider
-    })(anyhow::anyhow!(
-        "{message}: phase={phase} elapsed_ms={} request_bytes={request_bytes}",
-        started.elapsed().as_millis()
-    ))
+    })(anyhow::Error::new(diagnostic))
 }
 
 #[cfg(test)]
@@ -280,5 +284,65 @@ mod tests {
                 .await
                 .contains("phase=response_body ")
         );
+    }
+
+    #[tokio::test]
+    async fn transport_timeout_exposes_only_typed_safe_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            thread::sleep(Duration::from_millis(250));
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let client = Http::with_timeouts(
+            &base,
+            "test",
+            reqwest::header::AUTHORIZATION,
+            "Bearer PRIVATE_KEY_MARKER",
+            "PRIVATE_KEY_MARKER",
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let request = serde_json::json!({"private":"PRIVATE_BODY_MARKER"});
+        let error = client
+            .post(&request, &mut crate::usage::Usage::default())
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(
+            crate::failure::category(&error),
+            Some(crate::failure::Kind::ProviderTimeout)
+        );
+        let diagnostic = crate::failure::transport(&error).expect("typed transport metadata");
+        assert_eq!(
+            diagnostic.phase(),
+            crate::failure::TransportPhase::BeforeResponseHeaders
+        );
+        assert!(diagnostic.elapsed_ms() > 0);
+        assert_eq!(
+            diagnostic.request_bytes(),
+            serde_json::to_vec(&request).unwrap().len() as u64
+        );
+        let rendered = error.to_string();
+        assert!(!rendered.contains("PRIVATE") && !rendered.contains(&base));
     }
 }

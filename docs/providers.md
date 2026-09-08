@@ -70,7 +70,7 @@ target/debug/danso --provider glm --model YOUR_GLM_MODEL \
   and keeps `totalTokens` free of double counting. Per-response and cumulative
   arithmetic are checked; overflow fails without changing the last valid summary. Cost remains unknown (zero
   solely for Piri schema compatibility).
-- Requests are capped at 512 KiB, responses at 1 MiB, and HTTP transport at 60s by default.
+- Requests are capped at 512 KiB, responses at 1 MiB, and HTTP transport at 180s by default.
   The CLI run/turn/tool limits still apply. Large reasoning histories can reach
   the byte cap; opt-in [context compaction](compaction.md) can summarize portable evidence
   and start a fresh provider reasoning context while preserving the journal.
@@ -96,12 +96,13 @@ Protocol references checked for this implementation:
 - [OpenAI Responses create reference](https://developers.openai.com/api/reference/resources/responses/methods/create)
 - [Z.AI Chat Completion reference](https://docs.z.ai/api-reference/llm/chat-completion)
 
-## OpenAI/GLM transport diagnostics
+## Provider transport diagnostics
 
-The shared Bearer transport uses a default 60-second total request deadline and a
-separate 10-second connection deadline. The latter includes establishing the
-connection (DNS/TCP/TLS); it is not a reason to retry automatically. Anthropic
-uses its separate adapter and is not changed by this policy.
+All three API-key adapters use the bounded shared HTTP transport with a default
+180-second total request deadline and a separate 10-second connection deadline.
+The latter includes establishing the connection (DNS/TCP/TLS); it is not a
+reason to retry automatically. The ChatGPT subscription adapter keeps its
+explicit authentication flow while using the same selected request timeout.
 
 Transport failures now include only static labels and measured numbers:
 
@@ -119,20 +120,36 @@ is the serialized JSON body length. Errors contain no URL, key, request/response
 body, or underlying exception text. Redirects, byte limits, usage accounting
 and the no-retry policy remain unchanged.
 
+For a typed HTTP transport failure, the CLI also emits one optional body-free
+record alongside the unchanged `DANSO_ERROR` record:
+
+```text
+DANSO_TRANSPORT={"version":1,"phase":"response_body","elapsed_ms":60001,"request_bytes":30502}
+```
+
+Its exact keys are `version`, `phase`, `elapsed_ms`, and `request_bytes`.
+`phase` is one of `connect`, `before_response_headers`, or `response_body`;
+the numeric fields are nonnegative bounded integers. The record is emitted only
+for typed native HTTP transport failures, never for HTTP status or response
+validation errors. The ccc-node adapter treats it as optional and ignores a
+missing or invalid record while preserving the terminal category and no-replay
+behavior.
+
 On 2026-09-06, two direct diagnostic requests returned HTTP 200: a small control
 request in 1.96s and a 30,502-byte action request reconstructed from the saved task
 context in 10.24s. DNS/TCP/TLS each took under 0.06s; header waits were 1.85s and 10.15s.
 The timed probes used HTTPS/1.1 and a 180s upper bound, and executed no returned
 tool calls. They did not reproduce the earlier 60s timeout, so its cause remains
-unconfirmed; these observations do not justify increasing the default deadline.
+unconfirmed. The current 180s default is an owner-selected usability budget;
+it is not a claim that those probes established a service-side latency fix.
 
 ## Request timeout override
 
 `--provider-timeout-seconds 120` sets the total time for each provider HTTP
 request, including response-body reads. It applies to Anthropic, OpenAI and GLM,
 including checkpoint summarization and its one permitted format repair. The
-default remains 60 seconds; accepted values are 1..300. The OpenAI/GLM connection
-limit remains 10 seconds, capped by the shorter total when applicable.
+default is 180 seconds; accepted values are 1..300. The connection limit
+remains 10 seconds, capped by the shorter total when applicable.
 
 This is separate from `--timeout-seconds`, which bounds the entire CLI run,
 and `--tool-timeout-seconds`, which bounds each tool. A longer provider timeout

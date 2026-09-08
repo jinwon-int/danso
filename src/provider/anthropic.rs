@@ -13,7 +13,7 @@ pub struct Anthropic {
 }
 impl Anthropic {
     pub fn new(model: String, key: String, base: &str) -> Result<Self> {
-        Self::new_with_timeout(model, key, base, 60)
+        Self::new_with_timeout(model, key, base, 180)
     }
     pub fn new_with_timeout(
         model: String,

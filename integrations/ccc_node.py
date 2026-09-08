@@ -77,6 +77,8 @@ FAILURE_CATEGORIES = {
     'configuration', 'session', 'sandbox', 'provider', 'provider_timeout',
     'compaction', 'request_budget', 'output', 'runtime', 'run_timeout', 'interrupted',
 }
+TRANSPORT_PHASES = {'connect', 'before_response_headers', 'response_body'}
+TRANSPORT_KEYS = {'version', 'phase', 'elapsed_ms', 'request_bytes'}
 
 
 def _unique_object(pairs):
@@ -86,6 +88,34 @@ def _unique_object(pairs):
             raise ValueError('duplicate diagnostic key')
         result[key] = value
     return result
+
+
+def _transport(text, category, code):
+    """Return trusted native transport facts, or ignore the optional record."""
+    if category not in {'provider', 'provider_timeout'}:
+        return None
+    # A native HTTP transport failure has already marked the request attempted,
+    # so both provider categories must carry the normal attempted exit code.
+    if code != 3:
+        return None
+    lines = [line[len('DANSO_TRANSPORT='):] for line in text.splitlines()
+             if line.startswith('DANSO_TRANSPORT=')]
+    if len(lines) != 1:
+        return None
+    try:
+        diagnostic = json.loads(lines[0], object_pairs_hook=_unique_object)
+        if (type(diagnostic) is not dict or set(diagnostic) != TRANSPORT_KEYS
+                or type(diagnostic['version']) is not int or diagnostic['version'] != 1
+                or not isinstance(diagnostic['phase'], str)
+                or diagnostic['phase'] not in TRANSPORT_PHASES
+                or type(diagnostic['elapsed_ms']) is not int
+                or not 0 <= diagnostic['elapsed_ms'] <= 2**64 - 1
+                or type(diagnostic['request_bytes']) is not int
+                or not 0 <= diagnostic['request_bytes'] <= 512 * 1024):
+            raise ValueError('invalid transport diagnostic')
+        return (diagnostic['phase'], diagnostic['elapsed_ms'], diagnostic['request_bytes'])
+    except (ValueError, TypeError, RecursionError):
+        return None
 
 
 def _failure(stderr, code):
@@ -118,16 +148,19 @@ def _failure(stderr, code):
         counts = f", reported_requests={usage['requests']}, reported_tokens={usage['totalTokens']}"
     except (ValueError, TypeError, RecursionError):
         pass
+    transport = _transport(text, category, code)
+    transport_detail = '' if transport is None else (
+        f', phase={transport[0]}, elapsed_ms={transport[1]}, request_bytes={transport[2]}')
     label = 'timeout' if category == 'run_timeout' else category
     return ErrorEvent(code='danso_' + label, message=(
-        f'Worker failed: category={category}, exit_code={code}{counts}. '
+        f'Worker failed: category={category}, exit_code={code}{counts}{transport_detail}. '
         'Reported usage may omit failed requests; not a total attempt count. No automatic replay.'))
 
 
 class DansoRuntime:
     """One configured model; explicit credentials and private journal directory."""
     def __init__(self, *, binary, state_directory, provider, model, environment,
-                 timeout_seconds=300, provider_timeout_seconds=60, max_turns=16, compact_at_bytes=None):
+                 timeout_seconds=300, provider_timeout_seconds=180, max_turns=16, compact_at_bytes=None):
         if provider not in PROVIDERS or not model or not isinstance(model, str):
             raise ValueError('invalid provider/model')
         for value, maximum in ((timeout_seconds, 3600), (provider_timeout_seconds, 300), (max_turns, 128)):
@@ -234,7 +267,8 @@ class DansoSession:
                 elif code != 0:
                     events.append(_failure(stderr, code))
                 else:
-                    if any(line.startswith(b'DANSO_ERROR=') for line in stderr.splitlines()):
+                    if any(line.startswith(prefix) for line in stderr.splitlines()
+                           for prefix in (b'DANSO_ERROR=', b'DANSO_TRANSPORT=')):
                         raise ValueError('failure diagnostic on successful exit')
                     text = stdout.decode('utf-8').strip()
                     usage = _usage(stderr.decode('utf-8'))

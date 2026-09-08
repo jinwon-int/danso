@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -23,7 +24,7 @@ contract = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = contract
 spec.loader.exec_module(contract)
 sys.path.insert(0, str(ROOT))
-from integrations.ccc_node import DansoRuntime
+from integrations.ccc_node import DansoRuntime, _failure, _transport
 
 
 async def collect(session, message='do the bounded task'):
@@ -357,6 +358,9 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
                 session = await runtime.start_or_resume(contract.SessionRequest(working_directory=str(self.repo)))
                 events = await collect(session)
                 self.assertEqual(events[0].code, 'danso_provider_timeout')
+                self.assertIn('phase=before_response_headers', events[0].message)
+                self.assertIn('elapsed_ms=', events[0].message)
+                self.assertIn('request_bytes=', events[0].message)
                 await asyncio.sleep(.4)
         self.runtime.compact_at_bytes = 8192
         self.runtime.provider_timeout = 3
@@ -365,6 +369,7 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
         events = await collect(await self.new_session())
         self.assertEqual(events[0].code, 'danso_provider')
         self.assertNotIn('PRIVATE', repr(events))
+
 
     async def test_configuration_failure_and_cli_validation(self):
         self.runtime.environment['DANSO_GLM_BASE_URL'] = 'bad-url'
@@ -431,6 +436,103 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('CCC_STATE_DIR', self.runtime.environment)
         self.assertNotIn('PIRI_BOOTSTRAP_CONTEXT_FILE', self.runtime.environment)
         self.assertEqual(set(self.runtime.environment), {'PATH', 'HOME', 'ZAI_API_KEY', 'DANSO_GLM_BASE_URL'})
+
+
+class TransportDiagnostics(unittest.IsolatedAsyncioTestCase):
+    def test_default_and_explicit_provider_timeout(self):
+        root = Path(tempfile.mkdtemp(prefix='danso-diagnostic-'))
+        try:
+            binary = root / 'binary'
+            binary.write_text('#!/bin/sh\nexit 0\n')
+            binary.chmod(0o700)
+            home = root / 'home'
+            home.mkdir()
+            runtime = DansoRuntime(binary=binary, state_directory=root / 'state', provider='glm',
+                                   model='fixture', environment={
+                                       'PATH': '/usr/bin:/bin', 'HOME': str(home),
+                                       'ZAI_API_KEY': 'synthetic',
+                                   })
+            self.assertEqual(runtime.provider_timeout, 180)
+            override = DansoRuntime(binary=binary, state_directory=root / 'override', provider='glm',
+                                     model='fixture', environment={
+                                         'PATH': '/usr/bin:/bin', 'HOME': str(home),
+                                         'ZAI_API_KEY': 'synthetic',
+                                     }, provider_timeout_seconds=37)
+            self.assertEqual(override.provider_timeout, 37)
+        finally:
+            import shutil
+            shutil.rmtree(root)
+
+    def test_valid_transport_is_attached_only_to_matching_provider_failure(self):
+        record = json.dumps({
+            'version': 1, 'phase': 'response_body', 'elapsed_ms': 180001,
+            'request_bytes': 30502,
+        }, separators=(',', ':'))
+        stderr = (f'DANSO_ERROR={{"version":1,"category":"provider_timeout","exit_code":3}}\n'
+                  f'DANSO_TRANSPORT={record}\n').encode()
+        event = _failure(stderr, 3)
+        self.assertEqual(event.code, 'danso_provider_timeout')
+        self.assertIn('phase=response_body, elapsed_ms=180001, request_bytes=30502', event.message)
+        self.assertNotIn('DANSO_TRANSPORT', event.message)
+        self.assertIsNone(_transport(stderr.decode(), 'provider_timeout', 2))
+
+        provider_exit_two = (
+            'DANSO_ERROR={"version":1,"category":"provider","exit_code":2}\n'
+            f'DANSO_TRANSPORT={record}\n').encode()
+        event = _failure(provider_exit_two, 2)
+        self.assertEqual(event.code, 'danso_provider')
+        self.assertNotIn('phase=', event.message)
+        self.assertIsNone(_transport(provider_exit_two.decode(), 'provider', 2))
+
+    def test_malformed_duplicate_unknown_bool_and_private_transport_are_ignored(self):
+        base = 'DANSO_ERROR={"version":1,"category":"provider","exit_code":3}\n'
+        records = [
+            '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"extra":"PRIVATE"}',
+            '{"version":1,"phase":"PRIVATE","elapsed_ms":1,"request_bytes":1}',
+            '{"version":1,"phase":"response_body","elapsed_ms":true,"request_bytes":1}',
+            '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":524289}',
+            '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"request_bytes":2}',
+            '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1',
+        ]
+        for record in records:
+            with self.subTest(record=record):
+                event = _failure((base + 'DANSO_TRANSPORT=' + record + '\nPRIVATE_URL').encode(), 3)
+                self.assertEqual(event.code, 'danso_provider')
+                self.assertNotIn('phase=', event.message)
+                self.assertNotIn('PRIVATE', event.message)
+
+    async def test_transport_on_success_is_rejected(self):
+        root = Path(tempfile.mkdtemp(prefix='danso-success-diagnostic-'))
+        try:
+            workspace = root / 'workspace'
+            workspace.mkdir()
+            home = root / 'home'
+            home.mkdir()
+            binary = root / 'binary'
+            binary.write_text("""#!/usr/bin/python3
+import json, sys
+print('done')
+usage = {'requests': 1, 'inputTokens': 1, 'outputTokens': 0,
+         'cacheReadTokens': 0, 'cacheWriteTokens': 0, 'totalTokens': 1}
+for prefix in ('DANSO_USAGE', 'PIRI_USAGE'):
+    print(prefix + '=' + json.dumps(usage), file=sys.stderr)
+print('DANSO_TRANSPORT=' + json.dumps({'version': 1, 'phase': 'connect',
+      'elapsed_ms': 1, 'request_bytes': 1}), file=sys.stderr)
+""")
+            binary.chmod(0o700)
+            runtime = DansoRuntime(binary=binary, state_directory=root / 'state', provider='glm',
+                                   model='fixture', environment={
+                                       'PATH': '/usr/bin:/bin', 'HOME': str(home),
+                                       'ZAI_API_KEY': 'synthetic',
+                                   })
+            session = await runtime.start_or_resume(
+                contract.SessionRequest(working_directory=str(workspace)))
+            events = await collect(session)
+            self.assertEqual([event.kind for event in events], ['error'])
+            self.assertEqual(events[0].code, 'danso_adapter_error')
+        finally:
+            import shutil
+            shutil.rmtree(root)
 
 
 if __name__ == '__main__':

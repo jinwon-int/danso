@@ -61,7 +61,7 @@ pub struct Args {
     #[arg(long, default_value_t = 300)]
     pub timeout_seconds: u64,
     /// Total time per provider request, including response body (1..300 seconds).
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 180)]
     pub provider_timeout_seconds: u64,
     #[arg(long, default_value_t = 30)]
     pub tool_timeout_seconds: u64,
@@ -164,5 +164,14 @@ mod tests {
         assert!(args.unsafe_no_sandbox);
         args.sandbox = SandboxArg::Bubblewrap;
         assert_eq!(args.backend(), Backend::Host);
+    }
+
+    #[test]
+    fn provider_timeout_default_and_explicit_override_are_stable() {
+        assert_eq!(parse(&[]).provider_timeout_seconds, 180);
+        assert_eq!(
+            parse(&["--provider-timeout-seconds", "42"]).provider_timeout_seconds,
+            42
+        );
     }
 }
