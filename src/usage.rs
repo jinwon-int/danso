@@ -14,6 +14,16 @@ pub struct Usage {
     total: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageSnapshot {
+    pub requests: u64,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub total: u64,
+}
+
 #[derive(Default, Clone, Copy)]
 pub struct TokenUsage {
     pub input: u64,
@@ -23,6 +33,17 @@ pub struct TokenUsage {
 }
 
 impl Usage {
+    pub fn snapshot(&self) -> UsageSnapshot {
+        UsageSnapshot {
+            requests: self.requests,
+            input: self.input,
+            output: self.output,
+            cache_read: self.cache_read,
+            cache_write: self.cache_write,
+            total: self.total,
+        }
+    }
+
     pub fn add(&mut self, provider: &str, model: &str, tokens: TokenUsage) -> Result<()> {
         // Validate every aggregate before mutating state. Error reporting must
         // still be able to print the last valid summary without wrapping/panic.

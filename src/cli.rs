@@ -16,14 +16,14 @@ pub enum SandboxArg {
 #[command(version, about = "Headless worker harness with Pi session interchange")]
 pub struct Args {
     /// Prompt for this run. Use -- to separate a prompt beginning with '-'.
-    pub prompt: String,
+    pub prompt: Option<String>,
     #[arg(long, default_value = ".")]
     pub cwd: PathBuf,
     /// JSONL v3 path outside the workspace. Existing linear sessions resume.
     #[arg(long)]
     pub session: PathBuf,
     #[arg(long)]
-    pub model: String,
+    pub model: Option<String>,
     /// Wire protocol / service to use. Defaults to the original Anthropic path.
     #[arg(long, default_value = "anthropic", value_parser = ["anthropic", "openai", "openai-codex", "glm"])]
     pub provider: String,
@@ -82,13 +82,41 @@ pub struct Args {
     /// Opt in to checkpoint compaction above this serialized request size (8192..393216).
     #[arg(long)]
     pub compact_at_bytes: Option<usize>,
-    #[arg(long, default_value_t = 300)]
-    pub timeout_seconds: u64,
+    /// Whole-run wall time. Short mode is 1..3600; long mode is 1..21600.
+    #[arg(long)]
+    pub timeout_seconds: Option<u64>,
     /// Total time per provider request, including response body (1..300 seconds).
     #[arg(long, default_value_t = 180)]
     pub provider_timeout_seconds: u64,
     #[arg(long, default_value_t = 30)]
     pub tool_timeout_seconds: u64,
+    /// Opt in to the bounded long-task journal and cumulative budgets (up to six active hours).
+    #[arg(long, conflicts_with = "task_status")]
+    pub long_task: bool,
+    /// Resume a previously paused long task without appending a new prompt.
+    #[arg(long, conflicts_with = "task_status")]
+    pub resume_task: bool,
+    /// Inspect a session without creating or mutating it, or contacting a provider.
+    #[arg(long, conflicts_with_all = ["long_task", "resume_task", "print", "progress_jsonl"])]
+    pub task_status: bool,
+    /// Soft stage rollover target in model requests (1..1024, default 16).
+    #[arg(long)]
+    pub task_stage_requests: Option<u64>,
+    /// Cumulative model request cap (1..2048, default 1024).
+    #[arg(long)]
+    pub task_max_requests: Option<u64>,
+    /// Cumulative provider-reported token threshold (1..25000000, default 10000000).
+    #[arg(long)]
+    pub task_max_tokens: Option<u64>,
+    /// Consecutive identical settled tool-batch limit (2..8, default 3).
+    #[arg(long)]
+    pub task_repeat_limit: Option<u64>,
+    /// Pause after the numbered settled stage (1..2048).
+    #[arg(long)]
+    pub task_pause_after_stage: Option<u64>,
+    /// Emit body-free DANSO_TASK checkpoint snapshots to stderr.
+    #[arg(long)]
+    pub task_progress: bool,
 }
 
 impl Args {
@@ -105,11 +133,17 @@ impl Args {
         }
     }
     pub fn config(&self) -> danso::app::RunConfig {
+        let long = self.long_task || self.resume_task;
+        let timeout_seconds = self.timeout_seconds.unwrap_or(if long {
+            danso::long_task::MAX_WALL_SECONDS
+        } else {
+            300
+        });
         danso::app::RunConfig {
-            prompt: self.prompt.clone(),
+            prompt: self.prompt.clone().unwrap_or_default(),
             cwd: self.cwd.clone(),
             session: self.session.clone(),
-            model: self.model.clone(),
+            model: self.model.clone().unwrap_or_default(),
             provider: self.provider.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             trust_project: self.trust_project,
@@ -148,9 +182,35 @@ impl Args {
             backend: self.backend(),
             max_turns: self.max_turns,
             compact_at_bytes: self.compact_at_bytes,
-            timeout_seconds: self.timeout_seconds,
+            timeout_seconds,
             provider_timeout_seconds: self.provider_timeout_seconds,
             tool_timeout_seconds: self.tool_timeout_seconds,
+            long_task: long.then(|| danso::runtime::LongTaskRun {
+                limits: danso::long_task::Limits {
+                    wall_seconds: timeout_seconds,
+                    stage_requests: self
+                        .task_stage_requests
+                        .unwrap_or(danso::long_task::DEFAULT_STAGE_REQUESTS),
+                    max_requests: self
+                        .task_max_requests
+                        .unwrap_or(danso::long_task::DEFAULT_MAX_REQUESTS),
+                    max_tokens: self
+                        .task_max_tokens
+                        .unwrap_or(danso::long_task::DEFAULT_MAX_TOKENS),
+                    repeat_limit: self
+                        .task_repeat_limit
+                        .unwrap_or(danso::long_task::DEFAULT_REPEAT_LIMIT),
+                },
+                explicit_limits: (u8::from(self.timeout_seconds.is_some()))
+                    | (u8::from(self.task_stage_requests.is_some()) << 1)
+                    | (u8::from(self.task_max_requests.is_some()) << 2)
+                    | (u8::from(self.task_max_tokens.is_some()) << 3)
+                    | (u8::from(self.task_repeat_limit.is_some()) << 4),
+                resume: self.resume_task,
+                pause_after_stage: self.task_pause_after_stage,
+            }),
+            task_progress: self.task_progress,
+            pause_requested: None,
         }
     }
     pub fn output_mode(&self) -> danso::output::Mode {
@@ -227,5 +287,39 @@ mod tests {
             parse(&["--provider-timeout-seconds", "42"]).provider_timeout_seconds,
             42
         );
+    }
+
+    #[test]
+    fn long_task_defaults_are_bounded_and_resume_omits_immutable_assertions() {
+        let args = parse(&["--long-task"]);
+        let config = args.config();
+        let task = config.long_task.unwrap();
+        assert_eq!(task.limits.wall_seconds, danso::long_task::MAX_WALL_SECONDS);
+        assert_eq!(task.limits.stage_requests, 16);
+        assert_eq!(task.limits.max_requests, 1024);
+        assert_eq!(task.limits.max_tokens, 10_000_000);
+        assert_eq!(task.limits.repeat_limit, 3);
+        assert_eq!(task.explicit_limits, 0);
+
+        let args = parse(&[
+            "--resume-task",
+            "--timeout-seconds",
+            "60",
+            "--task-stage-requests",
+            "4",
+            "--task-max-requests",
+            "5",
+            "--task-max-tokens",
+            "500",
+            "--task-repeat-limit",
+            "2",
+        ]);
+        let task = args.config().long_task.unwrap();
+        assert_eq!(task.explicit_limits, 31);
+        assert_eq!(task.limits.wall_seconds, 60);
+        assert_eq!(task.limits.stage_requests, 4);
+        assert_eq!(task.limits.max_requests, 5);
+        assert_eq!(task.limits.max_tokens, 500);
+        assert_eq!(task.limits.repeat_limit, 2);
     }
 }

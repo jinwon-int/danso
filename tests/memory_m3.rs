@@ -200,6 +200,7 @@ impl EventSink for Collecting {
             Event::FinalAnswer(_) => "final",
             Event::ToolStarted(_) => "tool-started",
             Event::ToolSettled { .. } => "tool-settled",
+            Event::Task(_) => "task",
         };
         self.events.borrow_mut().push(label);
         Ok(())
@@ -241,6 +242,8 @@ async fn run_inner(route: &Route, session_path: &Path) -> anyhow::Result<()> {
             max_turns: 8,
             compact_at_bytes: Some(8192),
             refresh_context: None,
+            long_task: None,
+            pause_requested: None,
         },
         &mut provider,
         &Executor,

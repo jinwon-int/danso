@@ -3,6 +3,7 @@ pub mod compaction;
 pub mod context;
 pub mod contracts;
 pub mod failure;
+pub mod long_task;
 pub mod memory;
 pub mod output;
 pub mod provider;

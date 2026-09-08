@@ -10,6 +10,7 @@ use std::io::Write;
 pub struct ProgressSink<S> {
     inner: S,
     enabled: bool,
+    task_enabled: bool,
     sequence: u64,
     active: Option<&'static str>,
 }
@@ -19,9 +20,15 @@ impl<S> ProgressSink<S> {
         Self {
             inner,
             enabled,
+            task_enabled: false,
             sequence: 0,
             active: None,
         }
+    }
+
+    pub fn with_task_progress(mut self, enabled: bool) -> Self {
+        self.task_enabled = enabled;
+        self
     }
 }
 
@@ -58,6 +65,13 @@ impl<S: EventSink> EventSink for ProgressSink<S> {
                 writeln!(stdout, "{record}")?;
                 stdout.flush()?;
             }
+        }
+        if self.task_enabled
+            && let Event::Task(progress) = &event
+        {
+            let mut stderr = std::io::stderr().lock();
+            writeln!(stderr, "DANSO_TASK={progress}")?;
+            stderr.flush()?;
         }
         self.inner.emit(event)
     }
