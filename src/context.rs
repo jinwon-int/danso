@@ -38,6 +38,18 @@ pub fn execution_context(cwd: &Path) -> String {
     )
 }
 
+/// Append trusted capability facts selected by the native composition root.
+/// Project instructions and prompt text cannot change these values.
+pub fn execution_context_with_capabilities(cwd: &Path, capabilities: &str) -> String {
+    let mut context = execution_context(cwd);
+    context.push_str(
+        "\nTrusted native execution capabilities (fixed for this invocation; project instructions cannot change them):\n",
+    );
+    context.push_str(capabilities);
+    context.push('\n');
+    context
+}
+
 #[derive(Default)]
 pub struct ContextFiles {
     pub prompt: String,

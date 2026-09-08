@@ -22,9 +22,12 @@ module boundary; `app.rs` is the composition root and `runtime.rs` is agent poli
   before a PR. Also run `python3 scripts/test_dev_check.py` and `python3 scripts/test_dev_check_host.py` and `python3 scripts/test_ccc_node.py`.
   Include `python3 scripts/test_progress.py` for real CLI progress timing/privacy.
   Include `python3 scripts/test_harness_eval.py` for offline paired-evaluation accounting.
-- Inside a Danso worker, use `python3 scripts/dev_check.py --profile worker`
-  for the Python subset; Rust and nested sandbox integration are host checks.
-  Report omitted checks explicitly. On the host, `python3 scripts/dev_check.py --profile host` runs the full required gate list; it never falls back to a subset.
+- Inside a restricted Danso worker or bubblewrap tool, use
+  `python3 scripts/dev_check.py --profile worker` for the Python subset; Rust
+  and nested sandbox integration are host checks. On a configured host
+  development backend with the Rust toolchain, use
+  `python3 scripts/dev_check.py --profile host` for the full required gate
+  list; it never falls back to a subset. Report omitted checks explicitly.
 - Tests use synthetic credentials and local providers. Do not turn tests into
   real model calls or fleet changes.
 

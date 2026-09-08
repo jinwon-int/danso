@@ -39,7 +39,7 @@ flowchart TD
 | `tools/runner.rs`, `tools/supervisor.rs` | Selected execution backend, descendant lifecycle, environment clearing, resource/time/output limits | Tool implementation details |
 | `session.rs` | Pi v3 persistence, locking, linear history, recovery validation | Provider I/O or replaying effects |
 | `memory/` | Owner-only fact store, write gates, in-process recall, injection scanning (issue #52) | Model requests, tool execution, or session mutations |
-| `context.rs` | Trust-aware discovery, execution context and context budgets | Model requests or tool execution |
+| `context.rs` | Trust-aware discovery, trusted backend/limit execution context and context budgets | Model requests or tool execution |
 | `failure.rs` | Typed failure categories and body-free CLI error records | Inferring causes from provider text or authorizing retries |
 | `usage.rs`, `output.rs` | Normalized usage, event rendering, usage prefixes | Authorization or execution policy |
 
@@ -181,16 +181,19 @@ complement these tests; they do not replace isolation or protocol evidence.
 
 ## Development check environments
 
-Use `python3 scripts/dev_check.py --profile worker` inside the coding worker. It
-runs the Python safety, mocked failure-report and development-profile unit tests, without Cargo, network
-listeners or nested bubblewrap. Its PASS explicitly covers only this subset.
+Use `python3 scripts/dev_check.py --profile worker` inside a restricted coding
+worker or bubblewrap tool. It runs the Python safety, mocked failure-report and
+development-profile unit tests, without Cargo, network listeners or nested
+bubblewrap. Its PASS explicitly covers only this subset.
 
-Use `python3 scripts/dev_check.py --profile host` on a development host with
-Cargo/rustfmt/clippy and functioning bubblewrap. This runs all required checks
-and stops on the first failure, with no automatic fallback to worker mode. The
-worker profile does not install or expose a Rust toolchain, and cannot validate
-Rust changes or replace integration gates. Root/system mount boundaries and
-network isolation remain unchanged. A real-sandbox regression verifies that the
+Use `python3 scripts/dev_check.py --profile host` on a configured host
+development backend with Cargo/rustfmt/clippy and functioning bubblewrap. This
+runs all required checks and stops on the first failure, with no automatic
+fallback to worker mode. The worker profile does not install or expose a Rust
+toolchain, and cannot validate Rust changes or replace integration gates. Root
+and system mount boundaries and bubblewrap network isolation remain unchanged;
+host mode intentionally uses current-user filesystem/network permissions and
+its larger development limits. A real-sandbox regression verifies that the
 worker profile can run where the previous nested integration attempt failed.
 
 #### Listing planned commands (`--list`)

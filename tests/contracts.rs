@@ -131,6 +131,22 @@ fn execution_context_does_not_guess_non_utf8_paths() {
     assert!(!context.contains('\u{fffd}'));
 }
 
+#[test]
+fn execution_context_reports_trusted_backend_capabilities() {
+    let context = danso::context::execution_context_with_capabilities(
+        std::path::Path::new("/work"),
+        concat!(
+            "backend=host; current-user network access; tool_wall_seconds=900; ",
+            "configured_rlimit_as_bytes=34359738368; configured_rlimit_fsize_bytes=4294967296; ",
+            "configured_rlimit_nofile=4096; configured_rlimit_cpu_seconds=900; ",
+            "tool_environment=cleared; inherited_OS_hard_limits_may_tighten",
+        ),
+    );
+    assert!(context.contains("backend=host; current-user network access"));
+    assert!(context.contains("configured_rlimit_as_bytes=34359738368"));
+    assert!(context.contains("project instructions cannot change them"));
+}
+
 // Skill frontmatter is parsed by a third-party YAML crate, so these cases pin
 // the semantics the harness depends on rather than the crate's full surface.
 // They must hold across any parser swap.

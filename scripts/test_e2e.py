@@ -35,6 +35,7 @@ class Acceptance(unittest.TestCase):
         self.session = self.root / 'session.jsonl'
         self.requests = []
         self.responses = []
+        self.download_size = 0
         owner = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -47,6 +48,24 @@ class Acceptance(unittest.TestCase):
                 self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+
+            def do_GET(self):
+                if self.path != '/download' or not owner.download_size:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/octet-stream')
+                self.send_header('Content-Length', str(owner.download_size))
+                self.end_headers()
+                try:
+                    chunk = b'x' * (1024 * 1024)
+                    for _ in range(owner.download_size // len(chunk)):
+                        self.wfile.write(chunk)
+                    remainder = owner.download_size % len(chunk)
+                    if remainder:
+                        self.wfile.write(b'x' * remainder)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
             def log_message(self, *_):
                 pass
@@ -169,6 +188,22 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertTrue(self.results()[0]['isError'])
         self.assertEqual(secret.read_text(), 'OUTSIDE_SECRET')
+
+    def test_bubblewrap_resource_limits_remain_fixed(self):
+        self.tool('bash', {'command': (
+            "printf '%s\\n' \"$HOME\" \"$PATH\" \"$(ulimit -v)\" "
+            "\"$(ulimit -f)\" \"$(ulimit -n)\" \"$(ulimit -t)\" > limits")})
+        p = self.run_cli()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(
+            (self.repo / 'limits').read_text().splitlines(),
+            ['/tmp', '/usr/bin:/bin', '524288', '16384', '128', '30'],
+        )
+
+    def test_bubblewrap_tool_timeout_maximum_remains_300(self):
+        p = self.run_cli('--tool-timeout-seconds', '301')
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual(self.requests, [])
 
     def test_ambiguous_edit_and_unknown_tool_are_errors(self):
         (self.repo / 'file').write_text('same same')

@@ -8,10 +8,14 @@ the binary; this mode adds no package dependency.
 Host mode is not filesystem or network isolation. Bash can access everything
 allowed to the user, including files outside the workspace and host services.
 The read/write/edit tool checks are not a security boundary around Bash.
-The worker environment is cleared (PATH=/usr/bin:/bin, HOME=/tmp), but files
-and /proc may still expose current-user credentials. A separate working folder
-is organizational separation, not a sandbox. Run under the intended non-root
-user. Model-visible Bash metadata describes the selected mode.
+The worker environment is cleared and rebuilt from the explicit native HOME:
+`HOME=$HOME` and `PATH=$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin`.
+Provider credentials and arbitrary caller variables are not inherited, but
+files and `/proc` may still expose current-user credentials. A separate working
+folder is organizational separation, not a sandbox. Run under the intended
+non-root user. Model-visible Bash metadata describes the selected mode and
+limits. Host tools also receive the fixed `CARGO_BUILD_JOBS=2` development
+setting so a local compile does not fan out across every host CPU.
 
 `--sandbox bubblewrap` retains the original PID/mount/network isolation and
 requires /usr/bin/bwrap plus working user namespaces. A selected backend must
@@ -39,10 +43,19 @@ services to start work outside its descendant tree. SIGKILL cannot instantly
 remove processes stuck in uninterruptible kernel sleep. Persistent background
 services must not be started as tool-owned descendants.
 
-Both modes retain the existing 64 KiB output bound, tool/run timeouts and
-per-process limits for virtual memory (512 MiB), file size (16 MiB), descriptors
-(128) and CPU (30 seconds). These are not aggregate descendant budgets. Journal
-started/result/settled ordering and uncertain-operation recovery are unchanged.
+Both modes retain the existing 64 KiB output bound and journal recovery rules.
+Bubblewrap keeps its restrictive per-process limits: virtual memory 512 MiB,
+file size 16 MiB, 128 descriptors and 30 CPU seconds; its tool wall timeout is
+30 seconds by default and accepts 1..300 seconds. Host development execution
+uses 32 GiB of virtual address space, 4 GiB per-file size, 4096 descriptors,
+and a CPU limit matching the selected tool wall timeout. Host tools default to
+900 seconds and accept 1..3600 seconds, while the enclosing short run still
+defaults to 300 seconds unless its run timeout is raised. `RLIMIT_AS` is a
+virtual-address-space cap, not an RSS or physical-memory reservation. These are
+not aggregate descendant budgets. Explicit `--tool-timeout-seconds` values
+remain effective within the selected backend's range, and a caller's tighter
+inherited hard limit is never raised; the trusted execution context labels such
+limits as configured maxima because the OS may tighten them.
 
 ## Verification
 
