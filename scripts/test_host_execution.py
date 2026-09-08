@@ -3,6 +3,8 @@
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -39,6 +41,94 @@ class Host(unittest.TestCase):
         self.assertIn('touched', outside.read_text())
         description = next(d['description'] for d in self.requests[0]['tools'] if d['name']=='bash')
         self.assertIn('not sandboxed', description)
+
+    def test_host_limits_and_sanitized_development_environment(self):
+        self.tool('bash', {'command': (
+            "printf '%s\\n' \"$HOME\" \"$PATH\" \"${ANTHROPIC_API_KEY:-}\" "
+            "\"${CARGO_BUILD_JOBS:-}\" "
+            "\"$(ulimit -v)\" \"$(ulimit -f)\" \"$(ulimit -n)\" "
+            "\"$(ulimit -t)\" > limits")})
+        p = self.run_cli()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(
+            (self.repo / 'limits').read_text().splitlines(),
+            [str(self.home), f'{self.home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin',
+             '', '2', '33554432', '4194304', '4096', '900'],
+        )
+
+    def test_host_explicit_tool_timeout_override_reaches_host_maximum(self):
+        self.tool('bash', {'command': 'true'})
+        p = self.run_cli('--tool-timeout-seconds', '3600')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(self.results()[0]['isError'], self.results())
+
+    def test_host_tool_home_changes_tools_only_and_not_context_discovery(self):
+        (self.home / '.pi' / 'agent').mkdir(parents=True)
+        (self.home / '.pi' / 'agent' / 'AGENTS.md').write_text('PRIVATE_NATIVE_HOME_SENTINEL')
+        tool_home = self.root / 'real-tool-home'
+        (tool_home / '.pi' / 'agent').mkdir(parents=True)
+        (tool_home / '.pi' / 'agent' / 'AGENTS.md').write_text('TOOL_HOME_MUST_NOT_BE_DISCOVERED')
+        self.tool('bash', {'command': 'printf "%s\n%s\n" "$HOME" "$PATH" > tool-home'})
+        p = self.run_cli('--tool-home', str(tool_home))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(
+            (self.repo / 'tool-home').read_text().splitlines(),
+            [str(tool_home), f'{tool_home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin'],
+        )
+        self.assertIn('PRIVATE_NATIVE_HOME_SENTINEL', self.requests[0]['system'])
+        self.assertNotIn('TOOL_HOME_MUST_NOT_BE_DISCOVERED', self.requests[0]['system'])
+
+    def test_tool_home_rejects_invalid_path_and_bubblewrap_before_provider(self):
+        invalid = self.run_cli('--tool-home', str(self.root / 'bad:home'))
+        self.assertEqual(invalid.returncode, 2, invalid.stderr)
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.session.exists())
+
+        bubblewrap = self.run_cli('--sandbox', 'bubblewrap', '--tool-home', str(self.root / 'tool-home'))
+        self.assertEqual(bubblewrap.returncode, 2, bubblewrap.stderr)
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.session.exists())
+
+    def test_host_allows_large_write_and_loopback_download(self):
+        self.download_size = 32 * 1024 * 1024
+        port = self.server.server_port
+        command = (
+            'dd if=/dev/zero of=large.bin bs=1M count=32 status=none && '
+            f'/usr/bin/curl --fail --silent http://127.0.0.1:{port}/download -o downloaded.bin && '
+            'test "$(stat -c %s large.bin)" -eq 33554432 && '
+            'test "$(stat -c %s downloaded.bin)" -eq 33554432'
+        )
+        self.tool('bash', {'command': command})
+        p = self.run_cli()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual((self.repo / 'large.bin').stat().st_size, self.download_size)
+        self.assertEqual((self.repo / 'downloaded.bin').stat().st_size, self.download_size)
+
+    def test_host_can_compile_large_artifact_when_rustc_is_available(self):
+        rustc = shutil.which('rustc')
+        if rustc is None:
+            self.skipTest('rustc is not on the host development PATH')
+        rustc_path = Path(rustc)
+        if rustc_path.resolve().name == 'rustup':
+            rustup = shutil.which('rustup')
+            if rustup is None:
+                self.skipTest('rustup proxy has no host resolver')
+            resolved = subprocess.run([rustup, 'which', 'rustc'], capture_output=True,
+                                      text=True, check=True).stdout.strip()
+            rustc_path = Path(resolved)
+        if not rustc_path.is_file():
+            self.skipTest('host rustc target is unavailable')
+        source = (
+            '#[used] static DATA: [u8; 20 * 1024 * 1024] = *include_bytes!("payload.bin");\n'
+            'fn main() { println!("{}", std::hint::black_box(&DATA).len()); }\n'
+        )
+        (self.repo / 'main.rs').write_text(source)
+        (self.repo / 'payload.bin').write_bytes(b'x' * (20 * 1024 * 1024))
+        self.tool('bash', {'command': f'{shlex.quote(str(rustc_path))} main.rs -O -o compiled && ./compiled'})
+        p = self.run_cli()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(self.results()[0]['isError'], self.results())
+        self.assertGreater((self.repo / 'compiled').stat().st_size, 16 * 1024 * 1024)
 
     def test_explicit_system_memory_refreshes_without_project_trust_or_journal_copy(self):
         context = self.root / 'memory.md'

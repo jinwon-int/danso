@@ -392,6 +392,41 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_failure(stderr, process.returncode).code, 'danso_configuration')
         self.assertEqual(len(self.requests), 0)
 
+    async def test_optional_tool_home_reaches_child_without_replacing_private_home(self):
+        tool_home = self.root / 'tool-home'
+        tool_home.mkdir()
+        self.runtime = DansoRuntime(
+            binary=fixture.BIN, state_directory=self.runtime.root, provider='glm',
+            model='fixture', environment=self.env('glm'), tool_home=tool_home,
+        )
+        self.fake_binary("""import json, os, sys
+from pathlib import Path
+Path('argv.json').write_text(json.dumps(sys.argv))
+Path('environment.json').write_text(json.dumps({key: os.environ.get(key) for key in ('HOME', 'PATH')}))
+print('done')
+usage = {'requests': 1, 'inputTokens': 1, 'outputTokens': 0,
+         'cacheReadTokens': 0, 'cacheWriteTokens': 0, 'totalTokens': 1}
+for prefix in ('DANSO_USAGE', 'PIRI_USAGE'):
+    print(prefix + '=' + json.dumps(usage), file=sys.stderr)
+""")
+        events = await collect(await self.new_session())
+        self.assertEqual(events[-1].kind, 'completion')
+        argv = json.loads((self.repo / 'argv.json').read_text())
+        self.assertEqual(argv[argv.index('--tool-home') + 1], str(tool_home))
+        environment = json.loads((self.repo / 'environment.json').read_text())
+        self.assertEqual(environment['HOME'], str(self.home))
+        self.assertNotEqual(environment['HOME'], str(tool_home))
+
+    def test_tool_home_is_host_only_and_absolute(self):
+        for value, sandbox in (('relative-home', 'host'),
+                               (str(self.root / 'tool:home'), 'host'),
+                               ('/tool\x00home', 'host'),
+                               (str(self.root / 'tool-home'), 'bubblewrap')):
+            with self.subTest(value=value, sandbox=sandbox), self.assertRaises(ValueError):
+                DansoRuntime(binary=fixture.BIN, state_directory=self.root / 'invalid-tool-home',
+                             provider='glm', model='fixture', environment=self.env('glm'),
+                             sandbox=sandbox, tool_home=value)
+
     async def test_truncated_provider_response_keeps_provider_category(self):
         import test_e2e
         runtime = DansoRuntime(binary=fixture.BIN, state_directory=self.runtime.root,

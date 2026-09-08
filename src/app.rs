@@ -6,6 +6,7 @@ use crate::{
     memory,
     runtime::{self, RunInput},
     session::Session,
+    tools,
     tools::Runner,
     usage::Usage,
 };
@@ -52,6 +53,9 @@ pub struct RunConfig {
     pub timeout_seconds: u64,
     pub provider_timeout_seconds: u64,
     pub tool_timeout_seconds: u64,
+    /// Optional host-only HOME for child development tools. The native HOME
+    /// remains the source for provider auth and context discovery.
+    pub tool_home: Option<PathBuf>,
     pub long_task: Option<runtime::LongTaskRun>,
     pub task_progress: bool,
     /// Process-local graceful-pause request, installed by the CLI signal
@@ -159,7 +163,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
             3600
         })
             .contains(&args.timeout_seconds)
-            && (1..=300).contains(&args.tool_timeout_seconds)
+            && (1..=tools::tool_timeout_max(args.backend)).contains(&args.tool_timeout_seconds)
             && (1..=300).contains(&args.provider_timeout_seconds),
         "invalid timeout"
     );
@@ -198,6 +202,8 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         "workspace must be a non-root directory"
     );
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is required")?);
+    ensure!(home.is_absolute(), "HOME must be an absolute path");
+    let tool_home = tools::resolve_tool_home(args.backend, args.tool_home.as_deref(), &home)?;
     let session_path = if args.session.is_absolute() {
         args.session.clone()
     } else {
@@ -349,11 +355,41 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         args.reasoning_effort.as_deref(),
         args.provider_timeout_seconds,
     )?;
-    let execution_context = context::execution_context(&cwd);
+    let limits =
+        tools::resource_limits(args.backend, Duration::from_secs(args.tool_timeout_seconds));
+    let backend = if args.backend.is_host() {
+        "host"
+    } else {
+        "bubblewrap"
+    };
+    let network = if args.backend.is_host() {
+        "current-user network access"
+    } else {
+        "unshared network namespace"
+    };
+    let execution_context = context::execution_context_with_capabilities(
+        &cwd,
+        &format!(
+            concat!(
+                "backend={}; {}; tool_wall_seconds={}; ",
+                "configured_rlimit_as_bytes={}; configured_rlimit_fsize_bytes={}; ",
+                "configured_rlimit_nofile={}; configured_rlimit_cpu_seconds={}; ",
+                "tool_environment=cleared; inherited_OS_hard_limits_may_tighten",
+            ),
+            backend,
+            network,
+            args.tool_timeout_seconds,
+            limits.address_space_bytes,
+            limits.file_size_bytes,
+            limits.open_files,
+            limits.cpu_seconds,
+        ),
+    );
     let runner = Runner {
         cwd,
         readable: ctx.readable,
         backend: args.backend,
+        home: tool_home,
         timeout: Duration::from_secs(args.tool_timeout_seconds),
     };
     let mut session = session;

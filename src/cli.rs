@@ -88,8 +88,13 @@ pub struct Args {
     /// Total time per provider request, including response body (1..300 seconds).
     #[arg(long, default_value_t = 180)]
     pub provider_timeout_seconds: u64,
-    #[arg(long, default_value_t = 30)]
-    pub tool_timeout_seconds: u64,
+    /// Per-tool wall time. Host defaults to 900 seconds (maximum 3600);
+    /// bubblewrap defaults to 30 seconds (maximum 300).
+    #[arg(long)]
+    pub tool_timeout_seconds: Option<u64>,
+    /// Host-only HOME for development tools. Provider/context HOME stays native HOME.
+    #[arg(long)]
+    pub tool_home: Option<PathBuf>,
     /// Opt in to the bounded long-task journal and cumulative budgets (up to six active hours).
     #[arg(long, conflicts_with = "task_status")]
     pub long_task: bool,
@@ -134,6 +139,10 @@ impl Args {
     }
     pub fn config(&self) -> danso::app::RunConfig {
         let long = self.long_task || self.resume_task;
+        let backend = self.backend();
+        let tool_timeout_seconds = self
+            .tool_timeout_seconds
+            .unwrap_or_else(|| danso::tools::tool_timeout_default(backend));
         let timeout_seconds = self.timeout_seconds.unwrap_or(if long {
             danso::long_task::MAX_WALL_SECONDS
         } else {
@@ -179,12 +188,13 @@ impl Args {
                 "off" => danso::memory::DistillMode::Off,
                 _ => danso::memory::DistillMode::Queue,
             },
-            backend: self.backend(),
+            backend,
             max_turns: self.max_turns,
             compact_at_bytes: self.compact_at_bytes,
             timeout_seconds,
             provider_timeout_seconds: self.provider_timeout_seconds,
-            tool_timeout_seconds: self.tool_timeout_seconds,
+            tool_timeout_seconds,
+            tool_home: self.tool_home.clone(),
             long_task: long.then(|| danso::runtime::LongTaskRun {
                 limits: danso::long_task::Limits {
                     wall_seconds: timeout_seconds,
@@ -286,6 +296,42 @@ mod tests {
         assert_eq!(
             parse(&["--provider-timeout-seconds", "42"]).provider_timeout_seconds,
             42
+        );
+    }
+
+    #[test]
+    fn tool_timeout_defaults_follow_backend_and_explicit_values_are_preserved() {
+        assert_eq!(
+            parse(&[]).config().tool_timeout_seconds,
+            danso::tools::HOST_TOOL_TIMEOUT_DEFAULT_SECONDS
+        );
+        assert_eq!(
+            parse(&["--sandbox", "bubblewrap"])
+                .config()
+                .tool_timeout_seconds,
+            danso::tools::BUBBLEWRAP_TOOL_TIMEOUT_DEFAULT_SECONDS
+        );
+        assert_eq!(
+            parse(&["--tool-timeout-seconds", "3600"])
+                .config()
+                .tool_timeout_seconds,
+            3600
+        );
+        assert_eq!(
+            parse(&["--sandbox", "bubblewrap", "--tool-timeout-seconds", "300",])
+                .config()
+                .tool_timeout_seconds,
+            300
+        );
+    }
+
+    #[test]
+    fn tool_home_is_optional_and_preserved_in_config() {
+        assert!(parse(&[]).config().tool_home.is_none());
+        let args = parse(&["--tool-home", "/opt/native-tool-home"]);
+        assert_eq!(
+            args.config().tool_home,
+            Some(PathBuf::from("/opt/native-tool-home"))
         );
     }
 

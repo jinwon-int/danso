@@ -22,6 +22,7 @@ runtime = DansoRuntime(
     provider='glm', model='glm-5.3-flash',
     environment={'PATH': '/usr/bin:/bin', 'HOME': '/srv/ccc/danso-home',
                  'ZAI_API_KEY': os.environ['ZAI_API_KEY']},
+    tool_home=os.environ.get('CCC_DANSO_TOOL_HOME'),
     timeout_seconds=300, provider_timeout_seconds=180, max_turns=8,
 )
 session = await runtime.start_or_resume(SessionRequest(
@@ -40,6 +41,10 @@ The environment accepts only PATH, HOME and the selected provider's credential
 and optional endpoint variables. No ambient environment is inherited. Use
 `DANSO_GLM_BASE_URL` explicitly if the operator selects the coding endpoint.
 Credentials are not stored in journals or error events by the adapter.
+The optional `tool_home` argument (for example from `CCC_DANSO_TOOL_HOME`) is
+host-only and must be absolute. It changes child development-tool `HOME` and
+Cargo-first `PATH`; provider authentication and context discovery keep the
+explicit native HOME. Bubblewrap rejects the option.
 
 Supported behavior:
 

@@ -22,10 +22,16 @@ target/release/danso --cwd /path/to/repo --trust-project \
 
 Requires Rust 1.98.1 to build. Running the binary requires Linux 5.3+ with
 procfs/pidfd support and `/bin/bash`; no bubblewrap, Python, Node or Docker is
-needed for the default CLI. Tools use the current user’s filesystem/network
-permissions. Environment clearing is not protection from readable host credentials.
-Use `--sandbox bubblewrap` to require `/usr/bin/bwrap` and usable user namespaces;
+needed for the default CLI. Host tools use the current user’s
+filesystem/network permissions with a cleared, native HOME-based development
+environment; environment clearing is not protection from readable host
+credentials. Host tool limits are intentionally larger for development work,
+while bubblewrap keeps the original restrictive limits. Use `--sandbox
+bubblewrap` to require `/usr/bin/bwrap` and usable user namespaces;
 isolation failure never falls back to host execution. See [execution modes](docs/execution.md).
+For a host-only toolchain HOME override, use `--tool-home /absolute/path`;
+this changes child tool `HOME`/`PATH` only and never changes provider
+authentication or context discovery. Bubblewrap rejects the option.
 Without `-p`, stdout is JSONL. Reuse the session path to continue a completed
 linear conversation. An uncertain interrupted tool requires manual recovery.
 
@@ -91,7 +97,9 @@ For frozen Danso/Pi comparison plans and honest paired result accounting, see
 [harness evaluation](docs/harness-evaluation.md). The offline tool does not run
 agents or claim a measured performance advantage.
 
-Inside a Danso coding worker, run `python3 scripts/dev_check.py --profile worker`
-for the Python subset. On the host, run `python3 scripts/dev_check.py --profile host`
+Inside a restricted Danso coding worker or bubblewrap tool, run
+`python3 scripts/dev_check.py --profile worker` for the Python subset; it cannot
+validate Rust or nested sandbox integration. On a configured host development
+backend with the Rust toolchain, run `python3 scripts/dev_check.py --profile host`
 for all required Rust and sandbox integration checks. Worker success does not
 replace the host gate; see [check environments](docs/architecture.md#development-check-environments).

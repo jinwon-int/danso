@@ -3,6 +3,8 @@ use crate::contracts::{ToolCall, ToolDefinition, ToolExecutor, ToolOutcome};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
+    ffi::OsString,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -12,6 +14,94 @@ use tokio::{
     process::Command,
 };
 pub(crate) const SYSTEM_MOUNTS: [&str; 4] = ["/usr", "/bin", "/lib", "/lib64"];
+pub const HOST_TOOL_TIMEOUT_DEFAULT_SECONDS: u64 = 900;
+pub const HOST_TOOL_TIMEOUT_MAX_SECONDS: u64 = 3600;
+pub const BUBBLEWRAP_TOOL_TIMEOUT_DEFAULT_SECONDS: u64 = 30;
+pub const BUBBLEWRAP_TOOL_TIMEOUT_MAX_SECONDS: u64 = 300;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceLimits {
+    pub address_space_bytes: u64,
+    pub file_size_bytes: u64,
+    pub open_files: u64,
+    pub cpu_seconds: u64,
+}
+
+pub fn tool_timeout_default(backend: crate::app::Backend) -> u64 {
+    if backend.is_host() {
+        HOST_TOOL_TIMEOUT_DEFAULT_SECONDS
+    } else {
+        BUBBLEWRAP_TOOL_TIMEOUT_DEFAULT_SECONDS
+    }
+}
+
+pub fn tool_timeout_max(backend: crate::app::Backend) -> u64 {
+    if backend.is_host() {
+        HOST_TOOL_TIMEOUT_MAX_SECONDS
+    } else {
+        BUBBLEWRAP_TOOL_TIMEOUT_MAX_SECONDS
+    }
+}
+
+pub fn resource_limits(backend: crate::app::Backend, timeout: Duration) -> ResourceLimits {
+    if backend.is_host() {
+        ResourceLimits {
+            address_space_bytes: 32 * 1024 * 1024 * 1024,
+            file_size_bytes: 4 * 1024 * 1024 * 1024,
+            open_files: 4096,
+            // Keep the kernel CPU budget aligned with the configured per-tool
+            // wall budget.  A sub-second library timeout still gets one CPU
+            // second so the rlimit remains valid and fail-closed.
+            cpu_seconds: timeout.as_secs().max(1),
+        }
+    } else {
+        ResourceLimits {
+            address_space_bytes: 512 * 1024 * 1024,
+            file_size_bytes: 16 * 1024 * 1024,
+            open_files: 128,
+            cpu_seconds: 30,
+        }
+    }
+}
+
+/// Resolve the HOME used by host development tools without changing the
+/// native HOME used for provider authentication or context discovery.
+///
+/// The path is validated before provider construction and the same joined
+/// PATH is built here as in the child command. This keeps malformed PATH
+/// components (for example a HOME containing `:` on Unix) fail-closed before
+/// any provider request can be attempted.
+pub fn resolve_tool_home(
+    backend: crate::app::Backend,
+    requested: Option<&Path>,
+    native_home: &Path,
+) -> Result<PathBuf> {
+    ensure!(
+        requested.is_none() || backend.is_host(),
+        "--tool-home is only supported with the host execution backend"
+    );
+    let home = requested.unwrap_or(native_home);
+    ensure!(home.is_absolute(), "tool HOME must be an absolute path");
+    ensure!(
+        !home.as_os_str().as_bytes().contains(&0),
+        "tool HOME contains an invalid PATH component"
+    );
+    if backend.is_host() {
+        let _ = host_path(home)?;
+    }
+    Ok(home.to_path_buf())
+}
+
+fn host_path(home: &Path) -> Result<OsString> {
+    let cargo_bin = home.join(".cargo/bin");
+    Ok(std::env::join_paths([
+        cargo_bin.as_os_str(),
+        std::ffi::OsStr::new("/usr/local/bin"),
+        std::ffi::OsStr::new("/usr/bin"),
+        std::ffi::OsStr::new("/bin"),
+    ])?)
+}
+
 /// Bound on each stage of the post-timeout host reap. The supervisor sends
 /// SIGKILL and is a subreaper, so a normal tree converges in tens of
 /// milliseconds; this only caps the pathological case where a descendant is
@@ -22,6 +112,7 @@ pub struct Runner {
     pub cwd: PathBuf,
     pub readable: Vec<PathBuf>,
     pub backend: crate::app::Backend,
+    pub home: PathBuf,
     pub timeout: Duration,
 }
 
@@ -70,24 +161,45 @@ impl Runner {
         if !self.backend.is_host() {
             cmd.arg("__tool");
         }
+        let (path, home): (OsString, OsString) = if self.backend.is_host() {
+            let path = host_path(&self.home)?;
+            (path, self.home.as_os_str().to_os_string())
+        } else {
+            (OsString::from("/usr/bin:/bin"), OsString::from("/tmp"))
+        };
         cmd.current_dir(&self.cwd)
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", "/tmp");
+            .env("PATH", path)
+            .env("HOME", home);
+        if self.backend.is_host() {
+            // Keep development builds bounded on hosts with many CPUs without
+            // inheriting an arbitrary caller setting.
+            cmd.env("CARGO_BUILD_JOBS", "2");
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(!self.backend.is_host());
         // RLIMIT_AS is a virtual-memory cap, not an RSS claim. Sequential tools
         // cap concurrent bash at one. Host mode uses a subreaper; bubblewrap a PID namespace.
+        let limits = resource_limits(self.backend, self.timeout);
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 for (resource, limit) in [
-                    (libc::RLIMIT_AS, 512 * 1024 * 1024),
-                    (libc::RLIMIT_FSIZE, 16 * 1024 * 1024),
-                    (libc::RLIMIT_NOFILE, 128),
-                    (libc::RLIMIT_CPU, 30),
+                    (libc::RLIMIT_AS, limits.address_space_bytes),
+                    (libc::RLIMIT_FSIZE, limits.file_size_bytes),
+                    (libc::RLIMIT_NOFILE, limits.open_files),
+                    (libc::RLIMIT_CPU, limits.cpu_seconds),
                 ] {
+                    let mut inherited = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                    if libc::getrlimit(resource, inherited.as_mut_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let inherited = inherited.assume_init();
+                    // Never raise a hard limit inherited from the caller.  A
+                    // tighter caller limit remains tighter; an unlimited
+                    // caller gets exactly the backend cap below.
+                    let limit = limit.min(inherited.rlim_max);
                     let r = libc::rlimit {
                         rlim_cur: limit,
                         rlim_max: limit,
@@ -270,5 +382,89 @@ impl ToolExecutor for Runner {
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutcome> {
         let (output, is_error) = self.run(&serde_json::to_value(call)?).await?;
         Ok(ToolOutcome { output, is_error })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_defaults_and_limits_are_distinct() {
+        assert_eq!(
+            tool_timeout_default(crate::app::Backend::Host),
+            HOST_TOOL_TIMEOUT_DEFAULT_SECONDS
+        );
+        assert_eq!(
+            tool_timeout_default(crate::app::Backend::Bubblewrap),
+            BUBBLEWRAP_TOOL_TIMEOUT_DEFAULT_SECONDS
+        );
+        assert_eq!(
+            tool_timeout_max(crate::app::Backend::Host),
+            HOST_TOOL_TIMEOUT_MAX_SECONDS
+        );
+        assert_eq!(
+            tool_timeout_max(crate::app::Backend::Bubblewrap),
+            BUBBLEWRAP_TOOL_TIMEOUT_MAX_SECONDS
+        );
+        assert_eq!(
+            resource_limits(crate::app::Backend::Host, Duration::from_secs(900)),
+            ResourceLimits {
+                address_space_bytes: 32 * 1024 * 1024 * 1024,
+                file_size_bytes: 4 * 1024 * 1024 * 1024,
+                open_files: 4096,
+                cpu_seconds: 900,
+            }
+        );
+        assert_eq!(
+            resource_limits(crate::app::Backend::Bubblewrap, Duration::from_secs(300)),
+            ResourceLimits {
+                address_space_bytes: 512 * 1024 * 1024,
+                file_size_bytes: 16 * 1024 * 1024,
+                open_files: 128,
+                cpu_seconds: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn tool_home_is_host_only_and_validates_joined_path_before_launch() {
+        let native = Path::new("/private/native-home");
+        assert_eq!(
+            resolve_tool_home(crate::app::Backend::Host, None, native).unwrap(),
+            native
+        );
+        let selected = Path::new("/real/native-home");
+        assert_eq!(
+            resolve_tool_home(crate::app::Backend::Host, Some(selected), native).unwrap(),
+            selected
+        );
+        assert!(
+            resolve_tool_home(
+                crate::app::Backend::Host,
+                Some(Path::new("relative-home")),
+                native
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_tool_home(
+                crate::app::Backend::Host,
+                Some(Path::new("/home/with:separator")),
+                native
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_tool_home(
+                crate::app::Backend::Host,
+                Some(Path::new("/home/with\0nul")),
+                native
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_tool_home(crate::app::Backend::Bubblewrap, Some(selected), native).is_err()
+        );
     }
 }
