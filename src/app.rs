@@ -1,7 +1,7 @@
 //! Composition root: resolves local configuration and chooses production adapters.
 use crate::{
     context,
-    contracts::EventSink,
+    contracts::{EventSink, SessionStore},
     failure::{Kind, at},
     memory,
     runtime::{self, RunInput},
@@ -10,7 +10,11 @@ use crate::{
     usage::Usage,
 };
 use anyhow::{Context, Result, ensure};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
 /// Tool execution backend. This is the single source of truth for isolation:
 /// no caller infers it from a flag default, and adding a variant forces every
@@ -48,6 +52,11 @@ pub struct RunConfig {
     pub timeout_seconds: u64,
     pub provider_timeout_seconds: u64,
     pub tool_timeout_seconds: u64,
+    pub long_task: Option<runtime::LongTaskRun>,
+    pub task_progress: bool,
+    /// Process-local graceful-pause request, installed by the CLI signal
+    /// handler. Library callers may leave this unset.
+    pub pause_requested: Option<Arc<AtomicBool>>,
 }
 
 /// Build a production provider from explicit parts (shared by `danso run`
@@ -144,14 +153,36 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         "max-turns must be 1..128"
     );
     ensure!(
-        (1..=3600).contains(&args.timeout_seconds)
+        (1..=if args.long_task.is_some() {
+            crate::long_task::MAX_WALL_SECONDS
+        } else {
+            3600
+        })
+            .contains(&args.timeout_seconds)
             && (1..=300).contains(&args.tool_timeout_seconds)
             && (1..=300).contains(&args.provider_timeout_seconds),
         "invalid timeout"
     );
     ensure!(
-        !args.prompt.trim().is_empty() && args.prompt.len() <= context::CONTEXT_LIMIT,
-        "prompt must be 1..65536 bytes"
+        (args.long_task.as_ref().is_some_and(|task| task.resume) || !args.prompt.trim().is_empty())
+            && args.prompt.len() <= context::CONTEXT_LIMIT,
+        "prompt must be 1..65536 bytes (resume-task takes no prompt)"
+    );
+    if let Some(task) = args.long_task {
+        ensure!(
+            task.explicit_limits & !31 == 0,
+            "invalid long-task limit mask"
+        );
+        task.limits.validate()?;
+        if let Some(stage) = task.pause_after_stage {
+            ensure!((1..=crate::long_task::MAX_MAX_REQUESTS).contains(&stage));
+        }
+    }
+    ensure!(
+        !(args.long_task.is_some()
+            && args.memory.mode == memory::MemoryMode::ReadWrite
+            && args.memory_distill == memory::DistillMode::Inline),
+        "inline memory distillation is unavailable in long-task mode; use queue or off"
     );
     ensure!(
         std::env::var_os("PIRI_BOOTSTRAP_CONTEXT_FILE").is_none()
@@ -254,6 +285,57 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         None
     };
     let session = Session::open(&session_path, &cwd).map_err(at(Kind::Session))?;
+    // Omitted resume limits are loaded from the immutable creation record.
+    // An explicitly supplied value remains an assertion, so a caller cannot
+    // silently change cumulative budgets by restarting with different flags.
+    let mut long_task = args.long_task;
+    let long_remaining = if let Some(mut task) = long_task {
+        let records = session.long_task_records().map_err(at(Kind::Session))?;
+        let ledger =
+            crate::long_task::Ledger::from_records(&records, session.header()["id"].as_str())
+                .map_err(at(Kind::Session))?;
+        if task.resume && ledger.has_task() {
+            let stored = ledger
+                .limits
+                .context("long-task creation record lacks limits")?;
+            let explicit = task.explicit_limits;
+            ensure!(
+                explicit & 1 == 0 || task.limits.wall_seconds == stored.wall_seconds,
+                "resume-task wall limit must match the immutable task limit"
+            );
+            ensure!(
+                explicit & 2 == 0 || task.limits.stage_requests == stored.stage_requests,
+                "resume-task stage limit must match the immutable task limit"
+            );
+            ensure!(
+                explicit & 4 == 0 || task.limits.max_requests == stored.max_requests,
+                "resume-task request limit must match the immutable task limit"
+            );
+            ensure!(
+                explicit & 8 == 0 || task.limits.max_tokens == stored.max_tokens,
+                "resume-task token limit must match the immutable task limit"
+            );
+            ensure!(
+                explicit & 16 == 0 || task.limits.repeat_limit == stored.repeat_limit,
+                "resume-task repeat limit must match the immutable task limit"
+            );
+            task.limits = stored;
+            long_task = Some(task);
+        }
+        if ledger.has_task()
+            && !matches!(
+                ledger.state,
+                crate::long_task::State::Completed | crate::long_task::State::Failed
+            )
+        {
+            let cap = task.limits.wall_seconds.saturating_mul(1000);
+            Some(cap.saturating_sub(ledger.elapsed_ms))
+        } else {
+            Some(task.limits.wall_seconds.saturating_mul(1000))
+        }
+    } else {
+        None
+    };
     ensure!(!args.model.trim().is_empty(), "model must not be empty");
     if let Some(effort) = &args.reasoning_effort {
         ensure!(
@@ -297,23 +379,42 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     let distill_enqueue = args.memory.mode == memory::MemoryMode::ReadWrite
         && args.memory_distill != memory::DistillMode::Off;
     let mut recording = memory::working_state::RecordingSink::new(sink, recorder.as_mut());
-    let run = runtime::run(
-        RunInput {
-            no_tools: args.no_tools,
-            prompt: &args.prompt,
-            context: &ctx.prompt,
-            execution_context: &execution_context,
-            max_turns: args.max_turns,
-            compact_at_bytes: args.compact_at_bytes,
-            refresh_context: refresh_context.as_deref(),
-        },
-        &mut provider,
-        &runner,
-        &mut session,
-        &mut recording,
-        usage,
-    )
-    .await;
+    let run = {
+        let run_future = runtime::run(
+            RunInput {
+                no_tools: args.no_tools,
+                prompt: &args.prompt,
+                context: &ctx.prompt,
+                execution_context: &execution_context,
+                max_turns: args.max_turns,
+                compact_at_bytes: args.compact_at_bytes,
+                refresh_context: refresh_context.as_deref(),
+                long_task,
+                pause_requested: args.pause_requested.as_deref(),
+            },
+            &mut provider,
+            &runner,
+            &mut session,
+            &mut recording,
+            usage,
+        );
+        if let Some(remaining) = long_remaining {
+            if remaining == 0 {
+                Err(at(Kind::RunTimeout)(anyhow::anyhow!(
+                    "long-task wall budget exhausted"
+                )))
+            } else {
+                match tokio::time::timeout(Duration::from_millis(remaining), run_future).await {
+                    Ok(result) => result,
+                    Err(_) => Err(at(Kind::RunTimeout)(anyhow::anyhow!(
+                        "long-task wall budget exhausted"
+                    ))),
+                }
+            }
+        } else {
+            run_future.await
+        }
+    };
     if run.is_ok()
         && let Some(recorder) = recorder.as_mut()
     {

@@ -9,7 +9,14 @@ use danso::{
     tools,
     usage::Usage,
 };
-use std::{io::Read, time::Duration};
+use std::{
+    io::Read,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 async fn interrupted() -> i32 {
     use tokio::signal::unix::{SignalKind, signal};
@@ -120,21 +127,66 @@ fn main() {
             std::process::exit(code);
         }
     };
+    if args.task_status {
+        let path = if args.session.is_absolute() {
+            args.session.clone()
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(&args.session),
+                Err(error) => {
+                    eprintln!("task status refused: {error}");
+                    std::process::exit(2);
+                }
+            }
+        };
+        match danso::session::Session::read_status(&path) {
+            Ok(status) => {
+                println!("{status}");
+                return;
+            }
+            Err(error) => {
+                eprintln!("task status refused: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     let mut usage = Usage::default();
-    let config = args.config();
-    let mut sink = ProgressSink::new(PrintSink(args.output_mode()), args.progress_jsonl);
+    let pause_requested = Arc::new(AtomicBool::new(false));
+    let mut config = args.config();
+    if config.long_task.is_some() {
+        config.pause_requested = Some(Arc::clone(&pause_requested));
+    }
+    let mut sink = ProgressSink::new(PrintSink(args.output_mode()), args.progress_jsonl)
+        .with_task_progress(args.task_progress);
     let code = runtime.block_on(async {
-        tokio::select! {
+        let pause_listener = if config.long_task.is_some() {
+            use tokio::signal::unix::{SignalKind, signal};
+            // Register the handler before the run's durable stage-0 handshake.
+            let mut usr1 = signal(SignalKind::user_defined1()).expect("SIGUSR1 handler");
+            let flag = Arc::clone(&pause_requested);
+            Some(tokio::spawn(async move {
+                usr1.recv().await;
+                flag.store(true, Ordering::Release);
+            }))
+        } else {
+            None
+        };
+        let code = tokio::select! {
             code = interrupted() => { eprintln!("run interrupted"); failure::report(Kind::Interrupted, code); code },
-            result = tokio::time::timeout(Duration::from_secs(args.timeout_seconds), app::run(&config, &mut sink, &mut usage)) => {
+            result = tokio::time::timeout(Duration::from_secs(config.timeout_seconds), app::run(&config, &mut sink, &mut usage)) => {
                 match result {
                     Ok(Ok(())) => 0,
                     Ok(Err(e)) => {
-                        let code = if usage.attempted { 3 } else { 2 };
+                        let code = match failure::category(&e) {
+                            Some(Kind::RunTimeout) => 124,
+                            Some(Kind::Interrupted) => 130,
+                            _ if usage.attempted => 3,
+                            _ => 2,
+                        };
                         eprintln!("{e:#}");
                         failure::report(failure::category(&e).unwrap_or(Kind::Configuration), code);
                         if let Some(diagnostic) = failure::transport(&e) {
@@ -145,7 +197,11 @@ fn main() {
                     Err(_) => { eprintln!("run timed out"); failure::report(Kind::RunTimeout, 124); 124 },
                 }
             }
+        };
+        if let Some(listener) = pause_listener {
+            listener.abort();
         }
+        code
     });
     report_usage(&usage);
     std::process::exit(code);

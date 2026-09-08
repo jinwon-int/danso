@@ -1,4 +1,5 @@
 //! Pi JSONL is interchange; custom operation records gate execution on recovery.
+use crate::contracts::SessionStore;
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde_json::{Value, json};
@@ -64,9 +65,72 @@ impl crate::contracts::SessionStore for Session {
     ) -> Result<()> {
         self.operation(id, state.as_str())
     }
+    fn long_task_records(&self) -> Result<Vec<Value>> {
+        Ok(self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry["type"] == "custom" && entry["customType"] == crate::long_task::CUSTOM_TYPE
+            })
+            .map(|entry| entry["data"].clone())
+            .collect())
+    }
+    fn record_long_task(&mut self, data: Value) -> Result<Value> {
+        self.append(json!({
+            "type":"custom",
+            "customType":crate::long_task::CUSTOM_TYPE,
+            "data":data
+        }))
+    }
 }
 
 impl Session {
+    /// Read-only status inspection. This path never creates/chmods a journal
+    /// and uses a shared lock so an active writer is reported as unavailable.
+    pub fn read_status(path: &Path) -> Result<Value> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(path).context("open session for status")?;
+        file.try_lock_shared()
+            .context("session is active; status is unavailable")?;
+        let metadata = file.metadata()?;
+        ensure!(metadata.is_file(), "session must be a regular file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            ensure!(metadata.uid() == unsafe { libc::geteuid() });
+            ensure!(
+                metadata.mode() & 0o077 == 0,
+                "session permissions are too broad"
+            );
+        }
+        ensure!(
+            metadata.len() <= 16 * 1024 * 1024,
+            "session exceeds 16 MiB import budget"
+        );
+        let mut data = Vec::new();
+        file.take(16 * 1024 * 1024 + 1).read_to_end(&mut data)?;
+        ensure!(
+            data.len() <= 16 * 1024 * 1024,
+            "session exceeds 16 MiB import budget"
+        );
+        let data = String::from_utf8(data).context("session is not UTF-8")?;
+        ensure!(
+            data.ends_with('\n'),
+            "incomplete session record; manual recovery required"
+        );
+        let entries = data
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<Vec<Value>, _>>()?;
+        crate::long_task::inspect_entries(&entries)
+    }
+
     pub fn open(path: &Path, cwd: &Path) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true).append(true).create(true);
@@ -233,6 +297,11 @@ impl Session {
                     )?;
                     messages = crate::compaction::checkpoint_messages(&data["summary"], &messages)?;
                 }
+                Some("custom") if e["customType"] == crate::long_task::CUSTOM_TYPE => {
+                    // The complete long-task ledger is validated below. Keeping
+                    // this branch explicit prevents long-task data from being
+                    // mistaken for arbitrary Pi metadata.
+                }
                 Some(
                     "custom" | "model_change" | "thinking_level_change" | "session_info" | "label",
                 ) => {}
@@ -240,6 +309,9 @@ impl Session {
             }
             prev = e["id"].clone();
         }
+        let long_records = self.long_task_records()?;
+        crate::long_task::validate_bindings(&self.entries)?;
+        crate::long_task::Ledger::from_records(&long_records, self.entries[0]["id"].as_str())?;
         Ok((messages, recovery))
     }
 }

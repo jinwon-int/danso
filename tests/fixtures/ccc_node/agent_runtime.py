@@ -178,6 +178,37 @@ class DelegatedTaskLifecycleEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskProgressEvent:
+    """Body-free progress emitted by the opt-in Danso long-task protocol.
+
+    These records describe only the native state machine counters.  They never
+    carry prompt text, tool arguments, paths, provider responses, or checkpoint
+    bodies, so the bridge can use them to refresh a bounded heartbeat safely.
+    """
+
+    state: Literal["checkpoint", "paused", "completed", "blocked"]
+    stage: int
+    requests: int
+    reported_tokens: int
+    elapsed_seconds: int
+    kind: Literal["task_progress"] = "task_progress"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, str) or self.state not in {
+            "checkpoint", "paused", "completed", "blocked"
+        }:
+            raise ValueError("invalid task progress state")
+        for name in ("stage", "requests", "reported_tokens", "elapsed_seconds"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= 2**64 - 1
+            ):
+                raise ValueError(f"invalid task progress {name}")
+
+
+@dataclass(frozen=True, slots=True)
 class CompletionEvent:
     """The provider has finished generating the current turn."""
 
@@ -224,6 +255,7 @@ AgentEvent: TypeAlias = (
     | ToolCompletedEvent
     | ApprovalRequestEvent
     | DelegatedTaskLifecycleEvent
+    | TaskProgressEvent
     | CompletionEvent
     | ResultEvent
     | ErrorEvent

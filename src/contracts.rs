@@ -53,6 +53,14 @@ pub trait SessionStore {
     }
     fn append_message(&mut self, message: Value) -> Result<Value>;
     fn record_operation(&mut self, id: &str, state: OperationState) -> Result<()>;
+    /// Long-task metadata is append-only and body-free. Stores that do not
+    /// support the opt-in mode keep the default refusal behavior.
+    fn long_task_records(&self) -> Result<Vec<Value>> {
+        Ok(Vec::new())
+    }
+    fn record_long_task(&mut self, _data: Value) -> Result<Value> {
+        anyhow::bail!("session store does not support long tasks")
+    }
 }
 
 /// The executor owns isolation and limits; the loop never invokes tools inline.
@@ -68,6 +76,8 @@ pub enum Event<'a> {
     Message(&'a Value),
     Compaction(&'a Value),
     FinalAnswer(&'a Value),
+    /// Body-free opt-in long-task checkpoint notification.
+    Task(&'a Value),
     /// Emitted only after the corresponding operation marker is durable.
     ToolStarted(&'a str),
     ToolSettled {

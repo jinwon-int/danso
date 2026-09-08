@@ -61,15 +61,43 @@ Supported behavior:
   groups and output readers are cleaned before terminal events are delivered.
 - Bounds: each stdout/stderr stream is limited to 1 MiB; CLI run timeout is
   supervised with a 5-second adapter grace. Request/turn limits are explicit.
-  The normal Linux bubblewrap sandbox stays enabled.
+  `sandbox="host"` is the default to match the native CLI; callers may select
+  `sandbox="bubblewrap"` when the host has that isolation available.
 
-Memory routing, custom sandbox/approval policies, approval reviewers, provider
-switching, model discovery and tool progress streaming are not
-implemented by this initial adapter. Unsupported request policies and memory
-routes fail before launch instead of being silently ignored. Project trust is
-not enabled. The explicitly selected HOME may still contain normal Danso global
-context; use an isolated HOME rather than an audience-scoped ccc memory route.
+Memory routing, approval policies, approval reviewers, provider switching and
+model discovery are not implemented by this adapter. Long-task progress is
+exposed only through the body-free event described below; arbitrary provider
+output is never converted into progress. Unsupported request policies and
+memory routes fail before launch instead of being silently ignored. Project
+trust is not enabled. The explicitly selected HOME may still contain normal
+Danso global context; use an isolated HOME rather than an audience-scoped ccc
+memory route.
 A successful smoke test does not establish long-task GLM reliability.
+
+## Optional long-task mode
+
+Set `long_task=True` to opt into the native six-hour active-time mode. The
+normal short mode remains the default. The adapter forwards the bounded
+settings `task_stage_requests` (default 16), `task_max_requests` (1024,
+maximum 2048), `task_max_tokens` (10000000, maximum 25000000), and
+`task_repeat_limit` (default 3); explicit limits are retained by the native
+journal and must match on resume. `task_pause_after_stage` is a deterministic
+pause point for tests and controlled operation.
+
+Long-mode `send_turn` yields `TaskProgressEvent` snapshots when the native
+process emits `--task-progress`. The exact body-free event is:
+`state` (`checkpoint`, `paused`, `completed`, or `blocked`), `stage`,
+`requests`, `reported_tokens`, and `elapsed_seconds`, all bounded integers.
+It carries no prompt, tool, path, provider response, or journal content. The
+first checkpoint is the ready handshake; `session.request_task_pause()` sends
+SIGUSR1 to the native parent and the runtime pauses only after settled work.
+SIGTERM/SIGINT cancellation leaves uncertain work non-resumable. To resume a
+paused checkpoint, the bridge must call `session.authorize_task_resume()` and
+send its private `TASK_RESUME_CONTROL` sentinel; no new prompt is appended.
+Pending provider/tool/final work, malformed journals, exhausted budgets,
+failed jobs, and completed jobs are rejected before another provider request.
+`--task-status` remains a provider-free native CLI operation and does not
+create or mutate a journal.
 
 ## Optional compaction
 

@@ -124,6 +124,8 @@ fn input() -> RunInput<'static> {
         max_turns: 3,
         compact_at_bytes: None,
         refresh_context: None,
+        long_task: None,
+        pause_requested: None,
     }
 }
 

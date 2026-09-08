@@ -165,5 +165,163 @@ class Host(unittest.TestCase):
         self.assertEqual(p.returncode, 2, p.stderr)
         self.assertEqual(len(self.requests), before)
 
+
+class LongTask(providers.Fixture):
+    """Cross-process long-task checks against the real native CLI."""
+
+    def command(self, *extra, prompt=None):
+        args = [str(providers.BIN), '--sandbox', 'host', '--cwd', str(self.repo),
+                '--session', str(self.session), '--provider', 'glm', '--model',
+                'fixture', '--long-task', *extra]
+        if prompt is not None:
+            args += ['-p', '--', prompt]
+        return args
+
+    def run_long(self, *extra, prompt=None, env=None, timeout=15):
+        return subprocess.run(self.command(*extra, prompt=prompt),
+                              env=env or self.env('glm'), capture_output=True,
+                              text=True, timeout=timeout)
+
+    def users(self):
+        return [record for record in map(json.loads, self.session.read_text().splitlines())
+                if record.get('message', {}).get('role') == 'user']
+
+    def tool_response(self, command):
+        return providers.response('glm', [('bash', {'command': command})])
+
+    def status(self):
+        return subprocess.run(
+            [str(providers.BIN), '--task-status', '--session', str(self.session)],
+            env={'PATH': '/usr/bin:/bin', 'HOME': str(self.home)},
+            capture_output=True, text=True, timeout=5,
+        )
+
+    def test_cli_resume_inherits_limits_and_does_not_replay_tools(self):
+        self.responses.append((200, self.tool_response('echo once >> effects')))
+        first = self.run_long(
+            '--timeout-seconds', '60', '--task-stage-requests', '1',
+            '--task-max-requests', '5', '--task-max-tokens', '500',
+            '--task-repeat-limit', '3', '--task-pause-after-stage', '1',
+            '--task-progress', prompt='Perform the task once',
+        )
+        self.assertEqual(first.returncode, 3, first.stderr)
+        self.assertEqual((self.repo / 'effects').read_text(), 'once\n')
+        self.assertEqual(len(self.users()), 1)
+        progress = [json.loads(line.split('=', 1)[1])
+                    for line in first.stderr.splitlines()
+                    if line.startswith('DANSO_TASK=')]
+        self.assertTrue(any(item['state'] == 'paused' for item in progress), first.stderr)
+
+        before = self.session.read_bytes()
+        status = self.status()
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertTrue(json.loads(status.stdout)['resume_allowed'])
+        self.assertEqual(self.session.read_bytes(), before)
+
+        refused = self.run_long('--timeout-seconds', '60',
+                                prompt='Start over without permission')
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.users()), 1)
+
+        self.responses.append((200, providers.response('glm', text='FINISHED')))
+        resumed = self.run_long('--resume-task', '-p', '--task-progress')
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout.strip(), 'FINISHED')
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(len(self.users()), 1)
+        self.assertEqual((self.repo / 'effects').read_text(), 'once\n')
+
+        completed = self.run_long('--resume-task', '-p')
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(len(self.requests), 2)
+
+    def test_sigusr1_pauses_after_settled_tool_and_resume_is_explicit(self):
+        self.responses.append((200, self.tool_response(
+            'echo started > started; sleep 0.3; echo once >> effects')))
+        process = subprocess.Popen(
+            self.command('--timeout-seconds', '60', '--task-stage-requests', '4',
+                         '--task-max-requests', '5', '--task-max-tokens', '500',
+                         '--task-repeat-limit', '3', '--task-progress',
+                         prompt='Perform the synthetic task once'),
+            env=self.env('glm'), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not (self.repo / 'started').exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue((self.repo / 'started').exists())
+            process.send_signal(signal.SIGUSR1)
+            stdout, stderr = process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        self.assertEqual(process.returncode, 3, stderr)
+        progress = [json.loads(line.split('=', 1)[1])
+                    for line in stderr.splitlines()
+                    if line.startswith('DANSO_TASK=')]
+        self.assertTrue(any(item['state'] == 'paused' for item in progress), stderr)
+        self.assertEqual((self.repo / 'effects').read_text(), 'once\n')
+        self.assertTrue(json.loads(self.status().stdout)['resume_allowed'])
+
+        self.responses.append((200, providers.response('glm', text='FINISHED')))
+        resumed = self.run_long('--resume-task', '-p')
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout.strip(), 'FINISHED')
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual((self.repo / 'effects').read_text(), 'once\n')
+
+    def test_sigterm_keeps_uncertain_long_task_non_resumable(self):
+        self.responses.append((200, self.tool_response(
+            'echo started > started; sleep 1; echo once >> effects')))
+        process = subprocess.Popen(
+            self.command('--timeout-seconds', '60', '--task-progress',
+                         prompt='Perform the synthetic task once'),
+            env=self.env('glm'), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not (self.repo / 'started').exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue((self.repo / 'started').exists())
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        self.assertEqual(process.returncode, 143, stderr)
+        self.assertFalse((self.repo / 'effects').exists())
+        status = self.status()
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertFalse(json.loads(status.stdout)['resume_allowed'])
+        resumed = self.run_long('--resume-task', '-p')
+        self.assertNotEqual(resumed.returncode, 0)
+        self.assertEqual(len(self.requests), 1)
+
+    def test_resume_uses_saved_active_deadline(self):
+        self.responses.append((200, self.tool_response(
+            'sleep 1.2; echo once > effects')))
+        first = self.run_long(
+            '--timeout-seconds', '3', '--task-stage-requests', '1',
+            '--task-max-requests', '5', '--task-max-tokens', '500',
+            '--task-pause-after-stage', '1', prompt='Perform synthetic work',
+        )
+        self.assertEqual(first.returncode, 3, first.stderr)
+
+        def delayed(_request):
+            time.sleep(2.5)
+            return providers.response('glm', text='LATE')
+
+        self.responses.append((200, delayed))
+        resumed = self.run_long('--resume-task', '-p', timeout=6)
+        self.assertEqual(resumed.returncode, 124, resumed.stderr)
+        self.assertIn('"category":"run_timeout"', resumed.stderr)
+        self.assertEqual(len(self.requests), 2)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

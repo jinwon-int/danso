@@ -26,11 +26,12 @@ flowchart TD
 
 | Module | Owns | Does not own |
 | --- | --- | --- |
-| `main.rs`, `cli.rs` | CLI parsing, signal cancellation, run wall timeout, process exits | Agent policy or provider requests |
+| `main.rs`, `cli.rs` | CLI parsing, signal cancellation/graceful pause, run wall timeout, process exits | Agent policy or provider requests |
 | `app.rs` | Validating configuration, resolving paths/env, choosing real adapters | Model response conversion or tool dispatch |
 | `contracts.rs` | Tool definitions/calls/results, operation states, storage/executor/output interfaces | HTTP formats, clap, subprocesses |
 | `compaction.rs` | Bounded text-only checkpoint summarization and schema validation | Journal writes or tool execution |
 | `runtime.rs` | History, turn budget, duplicate-call gate, durable operation order | Environment lookup, HTTP, shell spawning, output formatting |
+| `long_task.rs` | Opt-in cumulative budgets, safe stage ledger, resume/repetition policy | CLI parsing, environment lookup, filesystem access, provider requests |
 | `provider/` | Provider validation, request/response translation, bounded transport | Tool execution or session mutations |
 | `tools/mod.rs` | One registry for definitions and worker dispatch | Agent-loop policy |
 | `tools/{read,bash,edit,write}.rs` | Each builtin's definition and implementation | Provider selection or session writes |
@@ -105,6 +106,13 @@ For each tool it persists `started`, executes, persists the result, then
 persists `settled`. A failed journal write prevents execution. Completed
 history is context, never a replay queue. Cancellation can leave an unresolved
 operation and must not be turned into an implicit success or manual ACK.
+
+Long-task SIGUSR1 handling is owned by the CLI, but the runtime receives only a
+process-local pause flag and observes it after a settled provider/tool boundary.
+SIGINT/SIGTERM cancellation still drops the run and leaves uncertain work
+unresumable. `long_task.rs` persists the creation, request, tool-batch and
+stage records; status inspection validates the same ledger without creating or
+mutating a session.
 
 Limits belong at their enforcement boundary: discovered context in `context`,
 prompt/context/turn limits in `runtime`, serialized provider bytes in the

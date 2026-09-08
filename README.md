@@ -47,7 +47,15 @@ For Telegram/client tool lifecycle updates, see [durable progress](docs/progress
 
 ## Long tasks
 
-Opt in to automatic context checkpoints with `--compact-at-bytes 196608`.
+For work that needs multiple bounded invocations, opt in with `--long-task`.
+It persists request/token budgets and settled tool-stage checkpoints, supports
+an explicit `--resume-task`, and keeps uncertain provider/tool work
+non-resumable. The mode is capped at six hours of active execution; ordinary
+runs retain their short defaults. Use `--task-status` for a provider-free
+read-only status projection and `--task-progress` for body-free checkpoint
+notifications. See [the v0 long-task contract](docs/v0.md#optional-long-task-mode).
+
+Context compaction remains separately opt-in with `--compact-at-bytes 196608`.
 Compacted sessions retain the original journal and resume without replaying
 completed tools. See [compaction and recovery](docs/compaction.md) for limits,
 summary semantics and the offline/live stress workflow.
