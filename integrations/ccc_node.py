@@ -1,6 +1,8 @@
 """Opt-in ccc-node AgentRuntime adapter for bounded Danso tasks."""
 import asyncio
+from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -32,6 +34,15 @@ async def _read(stream):
     data = bytearray()
     while chunk := await stream.read(65536):
         if len(data) + len(chunk) > CAP:
+            raise ValueError('output limit')
+        data.extend(chunk)
+    return bytes(data)
+
+
+async def _read_limited(stream, limit):
+    data = bytearray()
+    while chunk := await stream.read(min(8192, limit + 1)):
+        if len(data) + len(chunk) > limit:
             raise ValueError('output limit')
         data.extend(chunk)
     return bytes(data)
@@ -90,6 +101,95 @@ TASK_PROGRESS_STATES = {'checkpoint', 'paused', 'completed', 'blocked'}
 TASK_PROGRESS_KEYS = {
     'version', 'state', 'stage', 'requests', 'reported_tokens', 'elapsed_seconds',
 }
+TASK_STATUS_STATES = {
+    'ready', 'pending_provider', 'pending_tools', 'final_pending',
+    'paused', 'completed', 'failed', 'not_long_task',
+}
+TASK_STATUS_KEYS = {
+    'version', 'kind', 'state', 'session_id', 'stage', 'elapsed_ms',
+    'limits', 'usage', 'pending', 'resume_allowed',
+}
+TASK_STATUS_LIMIT_KEYS = {
+    'wall_seconds', 'stage_requests', 'max_requests', 'max_tokens', 'repeat_limit',
+}
+TASK_STATUS_USAGE_KEYS = {'requests', 'reported_tokens'}
+
+
+@dataclass(frozen=True)
+class _TaskStatus:
+    state: str
+    stage: int
+    wall_seconds: int
+    stage_requests: int
+    max_requests: int
+    max_tokens: int
+    repeat_limit: int
+    elapsed_ms: int
+    requests: int
+    reported_tokens: int
+    resume_allowed: bool
+
+
+def _task_status(data):  # noqa: C901 -- strict nested protocol validation
+    """Parse the provider-free native status projection without relaying data."""
+    if (type(data) is not dict or set(data) != TASK_STATUS_KEYS
+            or type(data.get('version')) is not int or data['version'] != 1
+            or data.get('kind') != 'long_task_status'
+            or type(data.get('session_id')) is not str
+            or not isinstance(data.get('state'), str)
+            or data['state'] not in TASK_STATUS_STATES
+            or type(data.get('stage')) is not int
+            or not 0 <= data['stage'] <= 2**64 - 1
+            or type(data.get('elapsed_ms')) is not int
+            or not 0 <= data['elapsed_ms'] <= 2**64 - 1
+            or type(data.get('resume_allowed')) is not bool):
+        raise ValueError('invalid task status')
+    try:
+        if str(uuid.UUID(data['session_id'])) != data['session_id']:
+            raise ValueError('invalid task status session id')
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError('invalid task status session id') from exc
+    limits = data['limits']
+    usage = data['usage']
+    if (type(limits) is not dict or set(limits) != TASK_STATUS_LIMIT_KEYS
+            or type(usage) is not dict or set(usage) != TASK_STATUS_USAGE_KEYS):
+        raise ValueError('invalid task status')
+    values = {}
+    for key, maximum in (
+        ('wall_seconds', 21600), ('stage_requests', 1024),
+        ('max_requests', 2048), ('max_tokens', 25_000_000), ('repeat_limit', 8),
+    ):
+        value = limits[key]
+        if type(value) is not int or not 1 <= value <= maximum:
+            raise ValueError('invalid task status limits')
+        values[key] = value
+    if values['stage_requests'] > values['max_requests']:
+        raise ValueError('invalid task status limits')
+    usage_values = {}
+    for key, maximum in (('requests', values['max_requests']),
+                         ('reported_tokens', values['max_tokens'])):
+        value = usage[key]
+        if type(value) is not int or not 0 <= value <= maximum:
+            raise ValueError('invalid task status usage')
+        usage_values[key] = value
+    pending = data['pending']
+    if pending is not None:
+        if type(pending) is not dict:
+            raise ValueError('invalid task status pending')
+        if set(pending) == {'kind'}:
+            if pending['kind'] != 'tools':
+                raise ValueError('invalid task status pending')
+        elif set(pending) == {'kind', 'sequence'}:
+            if (pending['kind'] != 'provider'
+                    or type(pending['sequence']) is not int
+                    or not 0 <= pending['sequence'] <= 2**64 - 1):
+                raise ValueError('invalid task status pending')
+        else:
+            raise ValueError('invalid task status pending')
+    return _TaskStatus(
+        state=data['state'], stage=data['stage'], elapsed_ms=data['elapsed_ms'],
+        resume_allowed=data['resume_allowed'], **values, **usage_values,
+    )
 
 
 def _unique_object(pairs):
@@ -166,6 +266,13 @@ async def _read_stderr(stream, progress_queue, *, parse_progress):
                 # malformed progress.  Fail closed so the owned process is
                 # reaped immediately.
                 raise ValueError('stderr line limit')
+            if len(retained) + len(line) + 1 > CAP:
+                # Malformed reserved records are still untrusted stderr bytes;
+                # counting them prevents an arbitrary stream of records from
+                # bypassing the retained-output bound.
+                raise ValueError('output limit')
+            retained.extend(line)
+            retained.extend(b'\n')
             if progress_count < TASK_PROGRESS_CAP:
                 event = _task_progress(line.decode('utf-8', errors='replace'))
                 if event is not None:
@@ -240,6 +347,7 @@ class DansoRuntime:
     def __init__(self, *, binary, state_directory, provider, model, environment,
                  timeout_seconds=300, provider_timeout_seconds=180, max_turns=16,
                  compact_at_bytes=None, sandbox="host", system_context_loader=None,
+                 outer_timeout_seconds=None,
                  long_task=False, task_stage_requests=16, task_max_requests=1024,
                  task_max_tokens=10_000_000, task_repeat_limit=3,
                  task_pause_after_stage=None):
@@ -247,6 +355,11 @@ class DansoRuntime:
             raise ValueError('invalid provider/model')
         if type(long_task) is not bool:
             raise ValueError('invalid long-task setting')
+        if (outer_timeout_seconds is not None
+                and (type(outer_timeout_seconds) not in (int, float)
+                     or not math.isfinite(outer_timeout_seconds)
+                     or outer_timeout_seconds <= 0)):
+            raise ValueError('invalid outer timeout')
         timeout_maximum = 21600 if long_task else 3600
         for value, maximum in ((timeout_seconds, timeout_maximum), (provider_timeout_seconds, 300), (max_turns, 128),
                                (task_stage_requests, 1024), (task_max_requests, 2048),
@@ -282,6 +395,7 @@ class DansoRuntime:
         if not self.environment.get('HOME') or not self.environment.get(PROVIDERS[provider][0]):
             raise ValueError('explicit HOME and provider credential required')
         self.timeout, self.provider_timeout, self.max_turns = timeout_seconds, provider_timeout_seconds, max_turns
+        self.outer_timeout = outer_timeout_seconds
         self.long_task = long_task
         self.task_stage_requests = task_stage_requests
         self.task_max_requests = task_max_requests
@@ -325,6 +439,7 @@ class DansoSession:
         self._bootstrap_task = None
         self._resume_task_authorized = False
         self._task_progress_ready = False
+        self._task_progress_seen = False
         self._task_pause_requested = False
 
     def authorize_task_resume(self):
@@ -366,6 +481,50 @@ class DansoSession:
             self._stop_task = asyncio.create_task(_stop(self._process))
         await asyncio.shield(self._stop_task)
 
+    async def _read_task_status(self):
+        """Read the saved native task state without credentials or mutation."""
+        r = self.runtime
+        journal = r.root / (self.session_id + '.jsonl')
+        command = [r.binary, '--task-status', '--session', str(journal)]
+        spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+            *command, cwd=self.cwd,
+            env={'PATH': os.defpath, 'HOME': str(Path.home())},
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        ))
+        process, cancelled = await _wait_owned(spawn)
+        if cancelled:
+            stop_task = asyncio.create_task(_stop(process))
+            await _wait_owned(stop_task)
+            raise asyncio.CancelledError
+        stdout_task = asyncio.create_task(_read_limited(process.stdout, 64 * 1024))
+        stderr_task = asyncio.create_task(_read_limited(process.stderr, 64 * 1024))
+        try:
+            async with asyncio.timeout(2):
+                stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+                code = await process.wait()
+            stop_task = asyncio.create_task(_stop(process))
+            _, stop_cancelled = await _wait_owned(stop_task)
+            if stop_cancelled:
+                raise asyncio.CancelledError
+        except BaseException:
+            stop_task = asyncio.create_task(_stop(process))
+            _, stop_cancelled = await _wait_owned(stop_task)
+            for task in (stdout_task, stderr_task):
+                task.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            if stop_cancelled:
+                raise asyncio.CancelledError
+            raise
+        if code != 0 or stderr.strip() or len(stdout) > 64 * 1024:
+            raise ValueError('task status unavailable')
+        try:
+            data = json.loads(stdout.decode('utf-8'), object_pairs_hook=_unique_object)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+            raise ValueError('invalid task status') from exc
+        return _task_status(data)
+
     async def send_turn(self, message, *, approval_handler=deny_approval):  # noqa: C901 -- subprocess lifecycle and terminal event mapping
         async with self._lock:
             if not isinstance(message, str) or not message.strip() or len(message.encode()) > 65536:
@@ -380,30 +539,106 @@ class DansoSession:
             if resume_task and not r.long_task:
                 yield ErrorEvent(code='danso_task_resume_disabled', message='Long-task resume is disabled.')
                 return
+            self._active, self._interrupted = True, False
+            self._task_progress_ready = False
+            self._task_progress_seen = False
+            self._task_pause_requested = False
+            readers, events = [], []
+            self._stop_task = None
+            effective_timeout = r.timeout
+            effective_wall = r.timeout
+            effective_max_requests = r.task_max_requests
+            effective_max_tokens = r.task_max_tokens
+            resume_stage = None
+            if resume_task:
+                status_task = asyncio.create_task(self._read_task_status())
+                self._bootstrap_task = status_task
+                try:
+                    status = await status_task
+                except asyncio.CancelledError:
+                    if not self._interrupted:
+                        self._active = False
+                        self._bootstrap_task = None
+                        raise
+                    events.append(ErrorEvent(
+                        code='danso_cancelled',
+                        message='Worker interrupted before dispatch.',
+                    ))
+                    status = None
+                except (OSError, asyncio.TimeoutError, ValueError):
+                    if self._interrupted:
+                        events.append(ErrorEvent(
+                            code='danso_cancelled',
+                            message='Worker interrupted before dispatch.',
+                        ))
+                    else:
+                        events.append(ErrorEvent(
+                            code='danso_task_resume_unavailable',
+                            message=(
+                                'Saved Danso task cannot be resumed safely; its checkpoint '
+                                'or remaining deadline is unavailable.'
+                            ),
+                        ))
+                    status = None
+                finally:
+                    self._bootstrap_task = None
+                if status is None:
+                    self._active = False
+                    self._task_progress_ready = False
+                    self._task_progress_seen = False
+                    self._task_pause_requested = False
+                    for event in events:
+                        yield event
+                    return
+                try:
+                    if status.state not in {'ready', 'paused'} or not status.resume_allowed:
+                        raise ValueError('task is not resumable')
+                    remaining = status.wall_seconds - (status.elapsed_ms / 1000)
+                    if remaining <= 0:
+                        raise ValueError('task has no remaining wall time')
+                    if (r.outer_timeout is not None
+                            and r.outer_timeout < remaining + 10):
+                        raise ValueError('outer deadline is too short for saved task')
+                except (OSError, asyncio.TimeoutError, ValueError):
+                    self._active = False
+                    events.append(ErrorEvent(
+                        code='danso_task_resume_unavailable',
+                        message=(
+                            'Saved Danso task cannot be resumed safely; its checkpoint '
+                            'or remaining deadline is unavailable.'
+                        ),
+                    ))
+                    for event in events:
+                        yield event
+                    return
+                effective_timeout = remaining
+                effective_wall = status.wall_seconds
+                effective_max_requests = status.max_requests
+                effective_max_tokens = status.max_tokens
+                resume_stage = status.stage
             command = [r.binary, '--sandbox', r.sandbox, '--cwd', str(self.cwd), '--session', str(r.root / (self.session_id + '.jsonl')),
                        '--provider', r.provider, '--model', r.model, '--max-turns', str(r.max_turns),
-                       '--timeout-seconds', str(r.timeout), '--provider-timeout-seconds', str(r.provider_timeout),
-                       '-p']
+                       '--provider-timeout-seconds', str(r.provider_timeout), '-p']
+            if not resume_task:
+                command += ['--timeout-seconds', str(r.timeout)]
             if r.long_task:
                 command += [
                     '--long-task',
-                    '--task-stage-requests', str(r.task_stage_requests),
-                    '--task-max-requests', str(r.task_max_requests),
-                    '--task-max-tokens', str(r.task_max_tokens),
-                    '--task-repeat-limit', str(r.task_repeat_limit),
                     '--task-progress',
                 ]
-                if r.task_pause_after_stage is not None:
+                if not resume_task:
+                    command += [
+                        '--task-stage-requests', str(r.task_stage_requests),
+                        '--task-max-requests', str(r.task_max_requests),
+                        '--task-max-tokens', str(r.task_max_tokens),
+                        '--task-repeat-limit', str(r.task_repeat_limit),
+                    ]
+                if not resume_task and r.task_pause_after_stage is not None:
                     command += ['--task-pause-after-stage', str(r.task_pause_after_stage)]
             if self.effort is not None:
                 command += ['--reasoning-effort', self.effort]
             if r.compact_at_bytes is not None:
                 command += ['--compact-at-bytes', str(r.compact_at_bytes)]
-            self._active, self._interrupted = True, False
-            self._task_progress_ready = False
-            self._task_pause_requested = False
-            readers, events = [], []
-            self._stop_task = None
             try:
                 if r.system_context_loader is not None:
                     self._bootstrap_task = asyncio.create_task(r.system_context_loader())
@@ -417,7 +652,14 @@ class DansoSession:
                         command += ['--resume-task']
                     else:
                         command += ['--', message]
-                    async for event in self._execute(command, readers):
+                    async for event in self._execute(
+                        command, readers, resume_task=resume_task,
+                        resume_stage=resume_stage,
+                        timeout_seconds=effective_timeout,
+                        wall_seconds=effective_wall,
+                        max_requests=effective_max_requests,
+                        max_tokens=effective_max_tokens,
+                    ):
                         if isinstance(event, TaskProgressEvent):
                             # Progress is consumed incrementally and never
                             # retained alongside the final answer.
@@ -440,8 +682,15 @@ class DansoSession:
             for event in events:
                 yield event
 
-    async def _execute(self, command, readers):  # noqa: C901 -- bounded concurrent stdout/stderr/progress lifecycle
+    async def _execute(self, command, readers, *, resume_task=False,  # noqa: C901 -- bounded concurrent stdout/stderr/progress lifecycle
+                       resume_stage=None,
+                       timeout_seconds=None, wall_seconds=None,
+                       max_requests=None, max_tokens=None):
         r = self.runtime
+        timeout_seconds = r.timeout if timeout_seconds is None else timeout_seconds
+        wall_seconds = r.timeout if wall_seconds is None else wall_seconds
+        max_requests = r.task_max_requests if max_requests is None else max_requests
+        max_tokens = r.task_max_tokens if max_tokens is None else max_tokens
         events = []
         spawn = asyncio.create_task(asyncio.create_subprocess_exec(
             *command, cwd=self.cwd, env=r.environment, stdin=asyncio.subprocess.DEVNULL,
@@ -466,7 +715,7 @@ class DansoSession:
         stdout_done = stderr_done = False
         last_progress = None
         try:
-            async with asyncio.timeout(r.timeout + 5):
+            async with asyncio.timeout(timeout_seconds + 5):
                 while True:
                     # A caller can pause an async-generator consumer after a
                     # progress event.  Drain every task that finished during
@@ -484,11 +733,19 @@ class DansoSession:
                             progress_task = None
                         else:
                             last_progress = item
-                            if item.state == 'checkpoint':
-                                # The first body-free checkpoint is the
-                                # native-ready handshake.  Never signal a
-                                # process before that record has been seen.
-                                self._task_progress_ready = True
+                            if item.state == 'checkpoint' and not self._task_progress_seen:
+                                self._task_progress_seen = True
+                                # New tasks must prove native readiness with
+                                # the stage-zero record.  A resumed task's
+                                # first record legitimately carries its
+                                # persisted nonzero stage/cumulative usage.
+                                if ((resume_task and (
+                                        resume_stage is None or item.stage >= resume_stage))
+                                        or (
+                                        item.stage == 0 and item.requests == 0
+                                        and item.reported_tokens == 0
+                                        and item.elapsed_seconds == 0)):
+                                    self._task_progress_ready = True
                             progress_task = asyncio.create_task(progress_queue.get())
                             yield item
                         continue
@@ -517,9 +774,9 @@ class DansoSession:
             if (code in (2, 3) and failure.code == 'danso_request_budget'
                     and last_progress is not None and last_progress.state == 'paused'):
                 has_remaining_budget = (
-                    last_progress.requests < r.task_max_requests
-                    and last_progress.reported_tokens < r.task_max_tokens
-                    and last_progress.elapsed_seconds < r.timeout
+                    last_progress.requests < max_requests
+                    and last_progress.reported_tokens < max_tokens
+                    and last_progress.elapsed_seconds < wall_seconds
                 )
                 failure = ErrorEvent(
                     code='danso_task_paused',
@@ -555,4 +812,5 @@ class DansoSession:
             await asyncio.gather(*readers, return_exceptions=True)
             self._process, self._active, self._bootstrap_task = None, False, None
             self._task_progress_ready = False
+            self._task_progress_seen = False
             self._task_pause_requested = False
