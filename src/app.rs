@@ -4,7 +4,6 @@ use crate::{
     contracts::EventSink,
     failure::{Kind, at},
     memory,
-    provider::{Selected, anthropic::Anthropic, glm::Glm, openai::OpenAi},
     runtime::{self, RunInput},
     session::Session,
     tools::Runner,
@@ -41,12 +40,101 @@ pub struct RunConfig {
     pub no_tools: bool,
     pub system_context_file: Option<PathBuf>,
     pub memory: memory::MemoryConfig,
+    pub memory_distill: memory::DistillMode,
     pub backend: Backend,
     pub max_turns: u32,
     pub compact_at_bytes: Option<usize>,
     pub timeout_seconds: u64,
     pub provider_timeout_seconds: u64,
     pub tool_timeout_seconds: u64,
+}
+
+/// Build a production provider from explicit parts (shared by `danso run`
+/// and the memory drain CLI; credentials come from the environment).
+pub fn provider_from_parts(
+    provider: &str,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    provider_timeout_seconds: u64,
+) -> Result<crate::provider::Selected> {
+    let effort = reasoning_effort.map(str::to_string);
+    ensure!(!model.trim().is_empty(), "model must not be empty");
+    if let Some(effort) = &effort {
+        ensure!(
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort.as_str()),
+            "invalid reasoning effort"
+        );
+    }
+    if provider == "openai-codex" {
+        let auth = std::env::var_os("DANSO_CHATGPT_AUTH_FILE")
+            .context("DANSO_CHATGPT_AUTH_FILE is required")?;
+        let base = std::env::var("DANSO_CHATGPT_BASE_URL")
+            .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".into());
+        return Ok(crate::provider::Selected::OpenAi(
+            crate::provider::openai::OpenAi::new_chatgpt(
+                model.to_string(),
+                std::path::Path::new(&auth),
+                &base,
+                effort,
+                provider_timeout_seconds,
+            )?,
+        ));
+    }
+    let (key_name, base_name, default_base) = match provider {
+        "anthropic" => (
+            "ANTHROPIC_API_KEY",
+            "DANSO_ANTHROPIC_BASE_URL",
+            "https://api.anthropic.com",
+        ),
+        "openai" => (
+            "OPENAI_API_KEY",
+            "DANSO_OPENAI_BASE_URL",
+            "https://api.openai.com/v1",
+        ),
+        "glm" => (
+            "ZAI_API_KEY",
+            "DANSO_GLM_BASE_URL",
+            "https://api.z.ai/api/paas/v4",
+        ),
+        _ => anyhow::bail!("unsupported provider"),
+    };
+    let key = std::env::var(key_name).with_context(|| format!("{key_name} is required"))?;
+    let base = std::env::var(base_name).unwrap_or_else(|_| default_base.into());
+    match provider {
+        "anthropic" => {
+            ensure!(
+                effort.is_none(),
+                "reasoning-effort is unsupported by the Anthropic adapter"
+            );
+            Ok(crate::provider::Selected::Anthropic(
+                crate::provider::anthropic::Anthropic::new_with_timeout(
+                    model.to_string(),
+                    key,
+                    &base,
+                    provider_timeout_seconds,
+                )?,
+            ))
+        }
+        "openai" => Ok(crate::provider::Selected::OpenAi(
+            crate::provider::openai::OpenAi::new_with_timeout(
+                model.to_string(),
+                key,
+                &base,
+                effort,
+                provider_timeout_seconds,
+            )?,
+        )),
+        "glm" => Ok(crate::provider::Selected::Glm(
+            crate::provider::glm::Glm::new_with_timeout(
+                model.to_string(),
+                key,
+                &base,
+                effort,
+                provider_timeout_seconds,
+            )?,
+        )),
+        _ => anyhow::bail!("unsupported provider"),
+    }
 }
 
 pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage) -> Result<()> {
@@ -138,69 +226,12 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
             "invalid reasoning effort"
         );
     }
-    let mut provider = if args.provider == "openai-codex" {
-        let auth = std::env::var_os("DANSO_CHATGPT_AUTH_FILE")
-            .context("DANSO_CHATGPT_AUTH_FILE is required")?;
-        let base = std::env::var("DANSO_CHATGPT_BASE_URL")
-            .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".into());
-        Selected::OpenAi(OpenAi::new_chatgpt(
-            args.model.clone(),
-            std::path::Path::new(&auth),
-            &base,
-            args.reasoning_effort.clone(),
-            args.provider_timeout_seconds,
-        )?)
-    } else {
-        let (key_name, base_name, default_base) = match args.provider.as_str() {
-            "anthropic" => (
-                "ANTHROPIC_API_KEY",
-                "DANSO_ANTHROPIC_BASE_URL",
-                "https://api.anthropic.com",
-            ),
-            "openai" => (
-                "OPENAI_API_KEY",
-                "DANSO_OPENAI_BASE_URL",
-                "https://api.openai.com/v1",
-            ),
-            "glm" => (
-                "ZAI_API_KEY",
-                "DANSO_GLM_BASE_URL",
-                "https://api.z.ai/api/paas/v4",
-            ),
-            _ => anyhow::bail!("unsupported provider"),
-        };
-        let key = std::env::var(key_name).with_context(|| format!("{key_name} is required"))?;
-        let base = std::env::var(base_name).unwrap_or_else(|_| default_base.into());
-        match args.provider.as_str() {
-            "anthropic" => {
-                ensure!(
-                    args.reasoning_effort.is_none(),
-                    "reasoning-effort is unsupported by the Anthropic adapter"
-                );
-                Selected::Anthropic(Anthropic::new_with_timeout(
-                    args.model.clone(),
-                    key,
-                    &base,
-                    args.provider_timeout_seconds,
-                )?)
-            }
-            "openai" => Selected::OpenAi(OpenAi::new_with_timeout(
-                args.model.clone(),
-                key,
-                &base,
-                args.reasoning_effort.clone(),
-                args.provider_timeout_seconds,
-            )?),
-            "glm" => Selected::Glm(Glm::new_with_timeout(
-                args.model.clone(),
-                key,
-                &base,
-                args.reasoning_effort.clone(),
-                args.provider_timeout_seconds,
-            )?),
-            _ => unreachable!(),
-        }
-    };
+    let mut provider = provider_from_parts(
+        &args.provider,
+        &args.model,
+        args.reasoning_effort.as_deref(),
+        args.provider_timeout_seconds,
+    )?;
     let execution_context = context::execution_context(&cwd);
     let runner = Runner {
         cwd,
@@ -225,8 +256,11 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         .as_deref()
         .map(|root| memory::Route::new(root, &args.memory.scope))
         .transpose()?;
-    let mut recorder =
-        memory_route.map(|route| memory::working_state::Recorder::new(route, &args.prompt));
+    let mut recorder = memory_route
+        .as_ref()
+        .map(|route| memory::working_state::Recorder::new(route.clone(), &args.prompt));
+    let distill_enqueue = args.memory.mode == memory::MemoryMode::ReadWrite
+        && args.memory_distill != memory::DistillMode::Off;
     let mut recording = memory::working_state::RecordingSink::new(sink, recorder.as_mut());
     let run = runtime::run(
         RunInput {
@@ -248,6 +282,33 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         && let Some(recorder) = recorder.as_mut()
     {
         recorder.on_run_end().map_err(at(Kind::Memory))?;
+    }
+    // Distill enqueue (§4.7): final answers and turn-budget exhaustion both
+    // leave a durable pending job; drain runs inline only when requested.
+    if distill_enqueue && let Some(route) = &memory_route {
+        let trigger = match &run {
+            Ok(()) => "final_answer",
+            Err(error) if crate::failure::category(error) == Some(Kind::RequestBudget) => {
+                "budget_exhausted"
+            }
+            _ => "",
+        };
+        if !trigger.is_empty() {
+            memory::distill::journal::enqueue(route, &session_path, trigger, chrono::Utc::now())
+                .map_err(at(Kind::Memory))?;
+        }
+        if run.is_ok() && args.memory_distill == memory::DistillMode::Inline {
+            memory::distill::extract::drain(
+                route,
+                &mut provider,
+                usage,
+                1,
+                args.provider_timeout_seconds * 1000,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(at(Kind::Memory))?;
+        }
     }
     run.map_err(at(Kind::Runtime))
 }

@@ -5,7 +5,8 @@
 //! `global` tree under `$DANSO_MEMORY_DIR` (or `~/.danso/memory`) is used.
 
 use clap::{Parser, Subcommand};
-use danso::memory::{self, Route, eval, facts, paths, recall, snapshot};
+use danso::memory::distill::journal;
+use danso::memory::{self, Route, eval, facts, paths, recall, snapshot, transaction};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -84,6 +85,28 @@ pub enum Command {
         #[arg(long)]
         scenario: bool,
     },
+    /// Register a session journal for extraction (§4.7 explicit trigger).
+    Distill {
+        /// Pi v3 session journal path.
+        #[arg(long)]
+        session: PathBuf,
+    },
+    /// Extract and commit pending journal jobs (provider credentials required).
+    Drain {
+        #[arg(long, default_value_t = 1)]
+        max_jobs: usize,
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+        #[arg(long)]
+        model: String,
+    },
+    /// Roll back the newest committed facts+resume change (§4.5).
+    Rollback {
+        #[arg(long)]
+        action: String,
+    },
+    /// Body-free diagnostics for this scope (§6.4/M5).
+    Check,
 }
 
 fn default_root() -> PathBuf {
@@ -153,7 +176,28 @@ pub fn validate(args: &MemoryArgs) -> anyhow::Result<()> {
                 "exactly one of --golden or --scenario is required"
             );
         }
-        Command::Init | Command::Show => {}
+        Command::Distill { session } => {
+            anyhow::ensure!(session.exists(), "session journal must exist");
+        }
+        Command::Drain {
+            max_jobs, model, ..
+        } => {
+            anyhow::ensure!(!model.trim().is_empty(), "drain requires --model");
+            anyhow::ensure!(
+                *max_jobs >= 1 && *max_jobs <= 100,
+                "max-jobs must be 1..=100"
+            );
+        }
+        Command::Rollback { action } => {
+            anyhow::ensure!(
+                action.len() == 32
+                    && action
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "action must be 32 lowercase hex characters"
+            );
+        }
+        Command::Init | Command::Show | Command::Check => {}
     }
     Ok(())
 }
@@ -200,6 +244,27 @@ pub fn run(args: &MemoryArgs) -> anyhow::Result<Option<Value>> {
             };
             eval_command(mode)
         }
+        Command::Distill { session } => {
+            let outcome = journal::enqueue(&route, session, "explicit", chrono::Utc::now())?;
+            Ok(Some(match outcome {
+                journal::EnqueueOutcome::Enqueued { job_id } => {
+                    json!({ "enqueued": true, "job_id": job_id })
+                }
+                journal::EnqueueOutcome::AlreadyPending { job_id } => {
+                    json!({ "enqueued": "already", "job_id": job_id })
+                }
+                journal::EnqueueOutcome::Skipped { reason } => {
+                    json!({ "enqueued": false, "reason": reason })
+                }
+            }))
+        }
+        Command::Drain {
+            max_jobs,
+            provider,
+            model,
+        } => drain_command(&route, provider, model, *max_jobs),
+        Command::Rollback { action } => close_rollback(&route, action, args.lock_timeout_ms),
+        Command::Check => check(&route),
     }
 }
 
@@ -386,4 +451,104 @@ fn eval_command(mode: eval::Mode) -> anyhow::Result<Option<Value>> {
     );
     anyhow::ensure!(ok, "memory eval gate failed");
     Ok(None)
+}
+
+fn drain_command(
+    route: &Route,
+    provider: &str,
+    model: &str,
+    max_jobs: usize,
+) -> anyhow::Result<Option<Value>> {
+    let selected = danso::app::provider_from_parts(provider, model, None, 120)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let report = runtime.block_on(async {
+        let mut usage = danso::usage::Usage::default();
+        let mut selected = selected;
+        memory::distill::extract::drain(
+            route,
+            &mut selected,
+            &mut usage,
+            max_jobs,
+            120_000,
+            chrono::Utc::now(),
+        )
+        .await
+    })?;
+    Ok(Some(serde_json::to_value(&report)?))
+}
+
+fn close_rollback(
+    route: &Route,
+    action: &str,
+    lock_timeout_ms: u64,
+) -> anyhow::Result<Option<Value>> {
+    let transaction = transaction::Transaction::new(&route.state_dir());
+    match transaction.rollback(paths::lock_timeout(lock_timeout_ms), action)? {
+        transaction::RollbackOutcome::RolledBack => {
+            Ok(Some(json!({ "action": action, "rolled_back": true })))
+        }
+        transaction::RollbackOutcome::AlreadyRolledBack => {
+            Ok(Some(json!({ "action": action, "rolled_back": "already" })))
+        }
+    }
+}
+
+/// Body-free scope diagnostics (§6.4/M5): counts and states only.
+fn check(route: &Route) -> anyhow::Result<Option<Value>> {
+    let file = facts::load(route)?;
+    let records: Vec<&facts::FactRecord> = file.records().collect();
+    let open = records
+        .iter()
+        .filter(|r| {
+            r.review != "superseded"
+                && r.review != "rejected"
+                && r.valid_until
+                    .as_deref()
+                    .and_then(|v| facts::parse_timestamp(v).ok())
+                    .is_none_or(|until| until > chrono::Utc::now())
+        })
+        .count();
+    let closed = records.len() - open;
+    let needs_human = records.iter().filter(|r| r.review == "needs-human").count();
+    let constraints = records.iter().filter(|r| r.kind == "constraint").count();
+    let journal_dir = route.state_dir().join("distill-journal");
+    let count_json = |dir: &std::path::Path| -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let cooldown = std::fs::read(route.state_dir().join("distill.cooldown"))
+        .ok()
+        .and_then(|payload| serde_json::from_slice::<Value>(&payload).ok());
+    let transaction = transaction::Transaction::new(&route.state_dir());
+    let rollback_state = transaction.status()?;
+    Ok(Some(json!({
+        "scope": route.scope(),
+        "facts": {
+            "records": records.len(),
+            "open": open,
+            "closed": closed,
+            "needs_human": needs_human,
+            "constraints": constraints,
+        },
+        "journal": {
+            "pending": count_json(&journal_dir),
+            "dead": count_json(&journal_dir.join("dead")),
+            "cooldown": cooldown,
+        },
+        "rollback": rollback_state,
+        "files": {
+            "memory_md": route.memories_dir().join("MEMORY.md").exists(),
+            "user_md": route.memories_dir().join("USER.md").exists(),
+            "resume": route.resume_file().exists(),
+            "working_state": route.working_state_file().exists(),
+        },
+    })))
 }
