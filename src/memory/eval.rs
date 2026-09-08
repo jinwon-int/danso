@@ -190,8 +190,8 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
 
 /// Materialize one suite's fixtures into a fresh route.
 fn setup(route: &Route, mode: Mode) -> Result<()> {
-    paths::ensure_private_dir(&route.memories_dir())?;
-    paths::ensure_private_dir(&route.state_dir())?;
+    paths::require_private_dir(&route.memories_dir())?;
+    paths::require_private_dir(&route.state_dir())?;
     match mode {
         Mode::Scenario => {
             write_private(&route.memories_dir().join("MEMORY.md"), SCENARIO_MEMORY)?;
@@ -379,7 +379,7 @@ pub fn run(mode: Mode, work_dir: &Path) -> Result<Value> {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    paths::ensure_private_dir(&run_dir)?;
+    paths::require_private_dir(&run_dir)?;
     let route = Route::new(&run_dir, "global")?;
     setup(&route, mode)?;
 

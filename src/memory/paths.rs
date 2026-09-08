@@ -1,9 +1,10 @@
 //! Owner-only filesystem primitives and scope routing for the memory state
 //! tree (issue #52 §3/§6.1). Rust port of the audited ccc-node `secure_fs`
 //! invariants plus the canonical scope validator from the #52 design:
-//! symlink/hardlink rejection, forced 0700 directories and 0600 regular
-//! files owned by the current user, bounded reads, fsync + atomic replace
-//! writes, and exclusive locking with a deadline.
+//! symlink/hardlink rejection, 0700 directories and 0600 regular files
+//! owned by the current user (created at those modes; existing modes are
+//! judged fail-closed, never auto-corrected), bounded reads, fsync + atomic
+//! replace writes, and exclusive locking with a deadline.
 
 use anyhow::{Result, ensure};
 use std::path::{Path, PathBuf};
@@ -122,13 +123,16 @@ fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// Create a directory (recursively) for the memory tree without following
-/// symlinks (ccc `_validate_existing_directory_components` contract):
-/// ancestor components must be root- or self-owned and must not be
-/// group/other-writable unless they carry the sticky bit (so a 1777 /tmp is
-/// a trusted ancestor and is never chmod'd or created); the final component
-/// must be process-owned and is tightened to 0700.
-pub fn ensure_private_dir(path: &Path) -> Result<()> {
+/// Require a private directory for the memory tree without following
+/// symlinks, and never correct an existing mode (fail-closed judging per the
+/// #52 design constraint on issue comment 5579843297):
+/// missing components are created at 0700; existing components are judged,
+/// never chmod'd — ancestor components must be root- or self-owned and must
+/// not be group/other-writable unless they carry the sticky bit (so a 1777
+/// /tmp is a trusted ancestor); the final component must be process-owned
+/// and exactly 0700, and a mismatch is an error the caller must resolve by
+/// hand.
+pub fn require_private_dir(path: &Path) -> Result<()> {
     use std::fs::{create_dir, set_permissions};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     ensure!(path.is_absolute(), "memory path must be absolute");
@@ -155,15 +159,12 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
                         "memory directory must be owned by the current user: {}",
                         current.display()
                     );
-                    if meta.mode() & 0o777 != 0o700 {
-                        set_permissions(&current, std::fs::Permissions::from_mode(0o700))?;
-                        let after = std::fs::symlink_metadata(&current)?;
-                        ensure!(
-                            after.mode() & 0o777 == 0o700,
-                            "memory directory mode could not be tightened: {}",
-                            current.display()
-                        );
-                    }
+                    ensure!(
+                        meta.mode() & 0o777 == 0o700,
+                        "memory directory must already have mode 0700; refusing to correct it by hand: {} ({:04o})",
+                        current.display(),
+                        meta.mode() & 0o777
+                    );
                 } else {
                     ensure!(
                         meta.uid() == 0 || meta.uid() == euid(),
@@ -435,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_private_dir_does_not_tighten_root_or_tmp() {
+    fn require_private_dir_does_not_tighten_root_or_tmp() {
         use std::os::unix::fs::MetadataExt;
         let root_before = std::fs::metadata("/").unwrap().mode() & 0o777;
         let tmp_before = std::fs::metadata("/tmp").unwrap().mode() & 0o777;
@@ -445,7 +446,7 @@ mod tests {
         );
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("a/b");
-        ensure_private_dir(&dir).unwrap();
+        require_private_dir(&dir).unwrap();
         assert_eq!(std::fs::metadata("/").unwrap().mode() & 0o777, root_before);
         assert_eq!(
             std::fs::metadata("/tmp").unwrap().mode() & 0o777,
@@ -455,17 +456,36 @@ mod tests {
     }
 
     #[test]
+    fn existing_wrong_mode_final_is_refused_never_corrected() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("pre");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let before = std::fs::metadata(&dir).unwrap().mode() & 0o777;
+        assert!(
+            require_private_dir(&dir).is_err(),
+            "a mode mismatch must be judged, not corrected"
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().mode() & 0o777,
+            before,
+            "the mode must be left untouched"
+        );
+    }
+
+    #[test]
     fn private_dirs_are_owner_only_and_symlinks_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("a/b");
-        ensure_private_dir(&dir).unwrap();
+        require_private_dir(&dir).unwrap();
         let meta = std::fs::metadata(&dir).unwrap();
         use std::os::unix::fs::MetadataExt;
         assert_eq!(meta.mode() & 0o777, 0o700);
 
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
-        assert!(ensure_private_dir(&link).is_err());
+        assert!(require_private_dir(&link).is_err());
         atomic_write(&dir.join("f"), b"data\n", "probe").unwrap();
         assert!(read_bounded(&link.join("f"), 10, "probe").is_err());
     }
