@@ -15,8 +15,8 @@ fn route_in(dir: &Path, scope: &str) -> Route {
 }
 
 fn setup_tree(route: &Route) {
-    paths::ensure_private_dir(&route.memories_dir()).unwrap();
-    paths::ensure_private_dir(&route.state_dir()).unwrap();
+    paths::require_private_dir(&route.memories_dir()).unwrap();
+    paths::require_private_dir(&route.state_dir()).unwrap();
 }
 
 fn write_private(path: &std::path::Path, contents: &str) {
