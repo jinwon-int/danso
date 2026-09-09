@@ -130,7 +130,10 @@ fn default_root() -> PathBuf {
 
 pub fn route(args: &MemoryArgs) -> anyhow::Result<Route> {
     let scope = args.scope.as_deref().unwrap_or("global");
-    Route::new(&default_root(), scope)
+    // `--memory-dir` is explicit per-invocation configuration; it wins over
+    // the DANSO_MEMORY_DIR environment and the ~/.danso default (§8).
+    let root = args.memory_dir.clone().unwrap_or_else(default_root);
+    Route::new(&root, scope)
 }
 
 /// Early configuration validation — failures exit 2 (configuration), while
@@ -595,4 +598,37 @@ fn check(route: &Route) -> anyhow::Result<Option<Value>> {
             "working_state": route.working_state_file().exists(),
         },
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `--memory-dir` flag was silently ignored (route() only read the
+    /// environment/default); it is explicit per-invocation configuration.
+    #[test]
+    fn memory_dir_flag_overrides_env_and_default_root() {
+        let args = MemoryArgs::try_parse_from([
+            "danso",
+            "search",
+            "query",
+            "--memory-dir",
+            "/tmp/danso-flag-root",
+        ])
+        .unwrap();
+        assert_eq!(
+            route(&args).unwrap().root(),
+            PathBuf::from("/tmp/danso-flag-root")
+        );
+
+        // SAFETY(unsafe): this test binary's only reader/writer of
+        // DANSO_MEMORY_DIR.
+        unsafe { std::env::set_var("DANSO_MEMORY_DIR", "/tmp/danso-env-root") };
+        let args = MemoryArgs::try_parse_from(["danso", "search", "query"]).unwrap();
+        assert_eq!(
+            route(&args).unwrap().root(),
+            PathBuf::from("/tmp/danso-env-root")
+        );
+        unsafe { std::env::remove_var("DANSO_MEMORY_DIR") };
+    }
 }
