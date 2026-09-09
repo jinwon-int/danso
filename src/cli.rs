@@ -84,6 +84,13 @@ pub struct Args {
     /// max_tokens, OpenAI max_output_tokens, GLM max_tokens.
     #[arg(long, value_parser = clap::value_parser!(u32))]
     pub max_output_tokens: Option<u32>,
+    /// GLM thinking toggle: enabled | disabled (default enabled; issue #70 A).
+    #[arg(long, value_parser = ["enabled", "disabled"])]
+    pub glm_thinking: Option<String>,
+    /// GLM endpoint preset: general | coding (default general; issue #70 B).
+    /// An explicit DANSO_GLM_BASE_URL wins but must not contradict the preset.
+    #[arg(long, value_parser = ["general", "coding"])]
+    pub glm_endpoint: Option<String>,
     /// Opt in to checkpoint compaction above this serialized request size (8192..393216).
     #[arg(long)]
     pub compact_at_bytes: Option<usize>,
@@ -196,6 +203,8 @@ impl Args {
             backend,
             max_turns: self.max_turns,
             max_output_tokens: self.max_output_tokens,
+            glm_thinking: self.glm_thinking.clone(),
+            glm_endpoint: self.glm_endpoint.clone(),
             compact_at_bytes: self.compact_at_bytes,
             timeout_seconds,
             provider_timeout_seconds: self.provider_timeout_seconds,

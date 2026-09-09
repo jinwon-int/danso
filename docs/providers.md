@@ -10,7 +10,7 @@ acceptance remains pending; no API access is inferred from a model name.
 | --- | --- | --- | --- | --- |
 | `anthropic` | Anthropic Messages | `ANTHROPIC_API_KEY` | `DANSO_ANTHROPIC_BASE_URL` | `https://api.anthropic.com` (`/v1/messages`) |
 | `openai` | OpenAI Responses | `OPENAI_API_KEY` | `DANSO_OPENAI_BASE_URL` | `https://api.openai.com/v1` (`/responses`) |
-| `glm` | Z.AI Chat Completions | `ZAI_API_KEY` | `DANSO_GLM_BASE_URL` | `https://api.z.ai/api/paas/v4` (`/chat/completions`) |
+| `glm` | Z.AI Chat Completions | `ZAI_API_KEY` | `DANSO_GLM_BASE_URL` | preset, see "GLM profiles" below (`/chat/completions`) |
 
 Supply credentials through your existing environment mechanism. The original API-key adapters do not read login files. The separate opt-in
 `openai-codex` adapter below reads an explicitly selected Codex file; no adapter
@@ -37,6 +37,34 @@ target/debug/danso --provider glm --model YOUR_GLM_MODEL \
   --session /path/to/sessions/glm.jsonl -p 'Explain this repository'
 ```
 
+## GLM profiles (issue #70 C)
+
+`--glm-endpoint <general|coding>` (env `DANSO_GLM_ENDPOINT`, default
+`general`) selects a documented preset: `general` →
+`https://api.z.ai/api/paas/v4`, `coding` → `https://api.z.ai/api/coding/paas/v4`.
+An explicit `DANSO_GLM_BASE_URL` wins, but when both are set and disagree the
+invocation fails closed as a configuration error. `--glm-thinking
+<enabled|disabled>` (env `DANSO_GLM_THINKING`, default `enabled`) toggles the
+GLM `thinking` body field.
+
+| Profile | Recommended invocation | Notes |
+| --- | --- | --- |
+| `glm-5.3-flash` | `scripts/danso-glm` (≡ `--provider glm --model glm-5.3-flash --glm-endpoint coding --reasoning-effort low --max-turns 48 --compact-at-bytes 131072 --provider-timeout-seconds 120`) | Fast lane used for the 2026-09-06 compaction measurement (docs/compaction.md). Apply `--repeat-limit 3` when it repeats identical reads. |
+| `glm-5.3` | `--provider glm --model glm-5.3 --glm-endpoint general --reasoning-effort medium` | Thinking-enabled default profile. |
+
+Context window and maximum output tokens are model/service claims that Danso
+does not verify: out-of-range output caps surface as the provider's own 400
+without automatic adjustment (issue #69 A). Confirm current values against
+Z.AI's model documentation before sizing requests; the 2026-09-09 measurement
+environment could not reach docs.z.ai to pin them here. The coding-plan quota
+windows (5h/weekly) are operator-managed upstream; a 429 ends the invocation
+without retry and its `DANSO_PROVIDER http_status=429` record is available to
+the bridge for quota bookkeeping.
+
+`scripts/danso-glm` execs danso with the flash profile above; `ZAI_API_KEY`
+must exist in the environment and `DANSO_GLM_MODEL` optionally swaps the
+model. Extra arguments are forwarded, so a later `--model` in argv wins.
+
 ## Protocol details and limits
 
 - OpenAI uses non-streaming Responses with `store: false`, the configured
@@ -52,11 +80,14 @@ target/debug/danso --provider glm --model YOUR_GLM_MODEL \
   any tool executes. An OpenAI session missing its preserved output fails closed.
 - GLM uses non-streaming Chat Completions with the configured output-token cap
   (default 16384, `--max-output-tokens`) and
-  `thinking: {type: "enabled", clear_thinking: false}`. This targets the GLM-4.5+
+  `thinking: {type: "enabled"|"disabled", clear_thinking: false}`
+  (`--glm-thinking`; issue #70 A). This targets the GLM-4.5+
   thinking/tool-capable protocol. Returned `reasoning_content` is stored in
   `dansoGlmReasoning` and forwarded verbatim. It is not rendered as final text.
   Tool arguments accept both JSON strings and the object form shown in Z.AI's
-  API reference. Only consistent `stop`/`tool_calls` finishes are accepted.
+  API reference. Consistent `stop`/`tool_calls`/`length` finishes are accepted;
+  a terminal `length` finish maps to the shared `max_tokens` diagnosis
+  (issue #69 B).
 - `--reasoning-effort` is optional for OpenAI/GLM and otherwise leaves the service
   default intact. Accepted spellings are `none`, `minimal`, `low`, `medium`,
   `high`, `xhigh`, `max`; actual support depends on the chosen model/service.

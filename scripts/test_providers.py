@@ -323,6 +323,37 @@ class Providers(Fixture):
         self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn('configuration', p.stderr)
 
+    def test_glm_thinking_toggle_length_diagnosis_and_endpoint_conflicts(self):
+        # Default body keeps thinking enabled (issue #70 A).
+        self.responses.append((200, response('glm')))
+        p = self.run_cli('glm')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.requests[-1]['thinking'], {'type': 'enabled', 'clear_thinking': False})
+        # --glm-thinking disabled reaches the wire body.
+        self.responses.append((200, response('glm')))
+        p = self.run_cli('glm', '--glm-thinking', 'disabled')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.requests[-1]['thinking'], {'type': 'disabled', 'clear_thinking': False})
+        # A terminal `length` finish maps onto the shared max_tokens diagnosis
+        # (issue #70 A + #69 B).
+        truncated = response('glm')
+        truncated['choices'][0]['finish_reason'] = 'length'
+        self.responses.append((200, truncated))
+        p = self.run_cli('glm')
+        self.assertEqual(p.returncode, 3, p.stderr)
+        records = [l for l in p.stderr.splitlines() if l.startswith('DANSO_PROVIDER=')]
+        self.assertEqual(len(records), 1, p.stderr)
+        record = json.loads(records[0].split('=', 1)[1])
+        self.assertEqual(record['reason'], 'max_tokens')
+        self.assertEqual(record['output_tokens_max'], 16384)
+        # Unknown presets and preset/base conflicts fail closed (issue #70 B).
+        self.responses.append((200, response('glm')))
+        p = self.run_cli('glm', '--glm-endpoint', 'staging')
+        self.assertEqual(p.returncode, 2, p.stderr)
+        p = self.run_cli('glm', '--glm-endpoint', 'coding')
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn('conflicts', p.stderr)
+
     def test_openai_saved_output_cannot_disagree_with_history(self):
         self.responses.append((200, response('openai')))
         p = self.run_cli('openai')
