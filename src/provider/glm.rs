@@ -86,6 +86,7 @@ impl Glm {
             super::MAX_OUTPUT_TOKENS_DEFAULT,
             true,
             180,
+            3,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -97,9 +98,10 @@ impl Glm {
         max_output_tokens: u32,
         thinking: bool,
         timeout_seconds: u64,
+        retries: u32,
     ) -> Result<Self> {
         Ok(Self {
-            http: Http::new(base, "chat/completions", &key, timeout_seconds)?,
+            http: Http::new(base, "chat/completions", &key, timeout_seconds, retries)?,
             model,
             effort,
             max_output_tokens,
@@ -287,6 +289,7 @@ mod tests {
                 4096,
                 thinking,
                 60,
+                0,
             )
             .unwrap()
             .body(&ModelRequest {

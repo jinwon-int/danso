@@ -4,6 +4,7 @@ use crate::{
     contracts::{EventSink, SessionStore},
     failure::{Kind, at},
     memory,
+    provider::RetryPolicy,
     runtime::{self, RunInput},
     session::Session,
     tools,
@@ -60,6 +61,9 @@ pub struct RunConfig {
     pub compact_at_bytes: Option<usize>,
     pub timeout_seconds: u64,
     pub provider_timeout_seconds: u64,
+    /// Retries after the first provider attempt for retryable transport
+    /// timeouts and 429/5xx statuses (issue #67 B); 0..=5, 0 disables.
+    pub provider_retries: u32,
     pub tool_timeout_seconds: u64,
     /// Optional host-only HOME for child development tools. The native HOME
     /// remains the source for provider auth and context discovery.
@@ -83,11 +87,13 @@ pub fn provider_from_parts(
     model: &str,
     reasoning_effort: Option<&str>,
     provider_timeout_seconds: u64,
+    provider_retries: u32,
     max_output_tokens: Option<u32>,
     glm_thinking: Option<&str>,
     glm_endpoint: Option<&str>,
 ) -> Result<crate::provider::Selected> {
     let max_output_tokens = crate::provider::resolve_max_output_tokens(max_output_tokens)?;
+    let retries = RetryPolicy::new(provider_retries)?.retries;
     let effort = reasoning_effort.map(str::to_string);
     ensure!(!model.trim().is_empty(), "model must not be empty");
     if let Some(effort) = &effort {
@@ -108,6 +114,7 @@ pub fn provider_from_parts(
                 &base,
                 effort,
                 provider_timeout_seconds,
+                retries,
             )?,
         ));
     }
@@ -151,6 +158,7 @@ pub fn provider_from_parts(
                     &base,
                     max_output_tokens,
                     provider_timeout_seconds,
+                    retries,
                 )?,
             ))
         }
@@ -162,6 +170,7 @@ pub fn provider_from_parts(
                 effort,
                 max_output_tokens,
                 provider_timeout_seconds,
+                retries,
             )?,
         )),
         "glm" => {
@@ -175,6 +184,7 @@ pub fn provider_from_parts(
                     max_output_tokens,
                     thinking,
                     provider_timeout_seconds,
+                    retries,
                 )?,
             ))
         }
@@ -389,6 +399,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         &args.model,
         args.reasoning_effort.as_deref(),
         args.provider_timeout_seconds,
+        args.provider_retries,
         args.max_output_tokens,
         args.glm_thinking.as_deref(),
         args.glm_endpoint.as_deref(),

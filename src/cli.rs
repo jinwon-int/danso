@@ -105,6 +105,11 @@ pub struct Args {
     /// Total time per provider request, including response body (1..300 seconds).
     #[arg(long, default_value_t = 180)]
     pub provider_timeout_seconds: u64,
+    /// Retries after the first attempt for connect/pre-header timeouts and
+    /// 429/500/502/503/504 statuses (0..5, default 3). A provider request
+    /// precedes every tool effect, so retrying never repeats one (#67 B).
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(0..=5))]
+    pub provider_retries: u32,
     /// Per-tool wall time. Host defaults to 900 seconds (maximum 3600);
     /// bubblewrap defaults to 30 seconds (maximum 300).
     #[arg(long)]
@@ -214,6 +219,7 @@ impl Args {
             compact_at_bytes: self.compact_at_bytes,
             timeout_seconds,
             provider_timeout_seconds: self.provider_timeout_seconds,
+            provider_retries: self.provider_retries,
             tool_timeout_seconds,
             tool_home: self.tool_home.clone(),
             long_task: long.then(|| danso::runtime::LongTaskRun {

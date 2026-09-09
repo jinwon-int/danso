@@ -14,7 +14,7 @@ pub struct Anthropic {
 }
 impl Anthropic {
     pub fn new(model: String, key: String, base: &str) -> Result<Self> {
-        Self::new_with_timeout(model, key, base, super::MAX_OUTPUT_TOKENS_DEFAULT, 180)
+        Self::new_with_timeout(model, key, base, super::MAX_OUTPUT_TOKENS_DEFAULT, 180, 3)
     }
     pub fn new_with_timeout(
         model: String,
@@ -22,6 +22,7 @@ impl Anthropic {
         base: &str,
         max_output_tokens: u32,
         timeout_seconds: u64,
+        retries: u32,
     ) -> Result<Self> {
         // Anthropic authenticates with x-api-key rather than a Bearer token,
         // but every other transport rule (HTTPS-or-loopback, no credentials,
@@ -35,6 +36,7 @@ impl Anthropic {
             &key,
             &key,
             timeout_seconds,
+            retries,
         )?;
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(

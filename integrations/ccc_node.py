@@ -96,7 +96,7 @@ FAILURE_CATEGORIES = {
     'compaction', 'request_budget', 'output', 'runtime', 'run_timeout', 'interrupted',
 }
 TRANSPORT_PHASES = {'connect', 'before_response_headers', 'response_body'}
-TRANSPORT_KEYS = {'version', 'phase', 'elapsed_ms', 'request_bytes'}
+TRANSPORT_KEYS = {'version', 'phase', 'elapsed_ms', 'request_bytes', 'attempts'}
 PROVIDER_REASONS = {
     'http_status', 'invalid_json', 'response_too_large', 'stream_ended',
     'invalid_stream', 'unsupported_stream_event', 'response_failed',
@@ -266,9 +266,12 @@ def _transport(text, category, code):
                 or type(diagnostic['elapsed_ms']) is not int
                 or not 0 <= diagnostic['elapsed_ms'] <= 2**64 - 1
                 or type(diagnostic['request_bytes']) is not int
-                or not 0 <= diagnostic['request_bytes'] <= 512 * 1024):
+                or not 0 <= diagnostic['request_bytes'] <= 512 * 1024
+                or type(diagnostic['attempts']) is not int
+                or not 1 <= diagnostic['attempts'] <= 2**32 - 1):
             raise ValueError('invalid transport diagnostic')
-        return (diagnostic['phase'], diagnostic['elapsed_ms'], diagnostic['request_bytes'])
+        return (diagnostic['phase'], diagnostic['elapsed_ms'], diagnostic['request_bytes'],
+                diagnostic['attempts'])
     except (ValueError, TypeError, RecursionError):
         return None
 
@@ -379,7 +382,8 @@ def _failure(stderr, code):
         pass
     transport = _transport(text, category, code)
     transport_detail = '' if transport is None else (
-        f', phase={transport[0]}, elapsed_ms={transport[1]}, request_bytes={transport[2]}')
+        f', phase={transport[0]}, elapsed_ms={transport[1]}, request_bytes={transport[2]}, '
+        f'attempts={transport[3]}')
     provider_detail = _provider_detail(text, category, code)
     label = 'timeout' if category == 'run_timeout' else category
     return ErrorEvent(code='danso_' + label, message=(
@@ -391,6 +395,7 @@ class DansoRuntime:
     """One configured model; explicit credentials and private journal directory."""
     def __init__(self, *, binary, state_directory, provider, model, environment,
                  timeout_seconds=300, provider_timeout_seconds=180, max_turns=16,
+                 provider_retries=0,
                  compact_at_bytes=None, sandbox="host", system_context_loader=None,
                  outer_timeout_seconds=None,
                  tool_home=None,
@@ -414,6 +419,8 @@ class DansoRuntime:
                 raise ValueError('invalid worker limit')
         if task_stage_requests > task_max_requests:
             raise ValueError('invalid task request budgets')
+        if type(provider_retries) is not int or not 0 <= provider_retries <= 5:
+            raise ValueError('invalid provider retry limit')
         if task_pause_after_stage is not None and (
                 type(task_pause_after_stage) is not int or not 1 <= task_pause_after_stage <= 2048):
             raise ValueError('invalid task pause point')
@@ -450,6 +457,7 @@ class DansoRuntime:
         if not self.environment.get('HOME') or not self.environment.get(PROVIDERS[provider][0]):
             raise ValueError('explicit HOME and provider credential required')
         self.timeout, self.provider_timeout, self.max_turns = timeout_seconds, provider_timeout_seconds, max_turns
+        self.provider_retries = provider_retries
         self.outer_timeout = outer_timeout_seconds
         self.long_task = long_task
         self.task_stage_requests = task_stage_requests
@@ -673,7 +681,8 @@ class DansoSession:
                 resume_stage = status.stage
             command = [r.binary, '--sandbox', r.sandbox, '--cwd', str(self.cwd), '--session', str(r.root / (self.session_id + '.jsonl')),
                        '--provider', r.provider, '--model', r.model, '--max-turns', str(r.max_turns),
-                       '--provider-timeout-seconds', str(r.provider_timeout), '-p']
+                       '--provider-timeout-seconds', str(r.provider_timeout),
+                       '--provider-retries', str(r.provider_retries), '-p']
             if r.tool_home is not None:
                 command += ['--tool-home', r.tool_home]
             if not resume_task:

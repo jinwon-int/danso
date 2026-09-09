@@ -5,6 +5,7 @@ mod chatgpt_auth;
 pub use chatgpt_auth::adopt as adopt_chatgpt_auth;
 pub mod glm;
 mod http;
+pub use http::RetryPolicy;
 pub mod openai;
 // Experimental wire foundation only. Do not enable in production until bounded
 // decoding, capability admission, durable replay and compaction are implemented.

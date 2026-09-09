@@ -20,6 +20,7 @@ impl OpenAi {
             effort,
             super::MAX_OUTPUT_TOKENS_DEFAULT,
             180,
+            3,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -30,9 +31,16 @@ impl OpenAi {
         effort: Option<String>,
         max_output_tokens: u32,
         timeout_seconds: u64,
+        retries: u32,
     ) -> Result<Self> {
         Ok(Self {
-            http: Some(Http::new(base, "responses", &key, timeout_seconds)?),
+            http: Some(Http::new(
+                base,
+                "responses",
+                &key,
+                timeout_seconds,
+                retries,
+            )?),
             chatgpt: None,
             model,
             effort,
@@ -45,13 +53,15 @@ impl OpenAi {
         base: &str,
         effort: Option<String>,
         timeout_seconds: u64,
+        retries: u32,
     ) -> Result<Self> {
         Ok(Self {
             http: None,
-            chatgpt: Some(super::chatgpt::ChatGpt::new(
+            chatgpt: Some(super::chatgpt::ChatGpt::new_with_retries(
                 auth_file,
                 base,
                 timeout_seconds,
+                retries,
             )?),
             model,
             effort,

@@ -126,9 +126,12 @@ DANSO_ERROR={"version":1,"category":"request_budget","exit_code":3}
 ```
 
 Typed native HTTP transport failures may add one optional
-`DANSO_TRANSPORT` record with exactly `version`, `phase`, `elapsed_ms`, and
-`request_bytes`. The phase is `connect`, `before_response_headers`, or
-`response_body`; the numeric fields are bounded nonnegative integers. The
+`DANSO_TRANSPORT` record with exactly `version`, `phase`, `elapsed_ms`,
+`request_bytes`, and `attempts`. The phase is `connect`,
+`before_response_headers`, or `response_body`; the numeric fields are bounded
+nonnegative integers, and `attempts` counts the HTTP attempts including the
+first (retryable timeouts and 429/5xx statuses retry up to
+`--provider-retries` times, issue #67 B). The
 adapter validates this record only for an attempted `provider` or
 `provider_timeout` failure and ignores malformed, duplicate, or absent records
 without changing terminal failure or replay behavior.

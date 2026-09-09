@@ -150,21 +150,34 @@ provider request timed out: phase=before_response_headers elapsed_ms=60001 reque
 
 `elapsed_ms` is measured from dispatch with a monotonic clock; `request_bytes`
 is the serialized JSON body length. Errors contain no URL, key, request/response
-body, or underlying exception text. Redirects, byte limits, usage accounting
-and the no-retry policy remain unchanged.
+body, or underlying exception text. Redirects, byte limits and usage accounting
+remain unchanged.
+
+## Provider retries
+
+Retryable failures — 429, 500, 502, 503, 504, and timeouts in the `connect` or
+`before_response_headers` phase — retry up to `--provider-retries` times
+(default 3, range 0..5, env-free). A capped `Retry-After` (at most 60 seconds)
+is honored; otherwise the backoff is 1s → 4s → 16s with bounded jitter. All
+other failures, including timeouts after the response headers arrived and
+every 4xx, fail on the first attempt. A provider request strictly precedes any
+tool effect, so retrying never re-executes an effect (issue #67 B); the whole
+retry sequence still lives inside the run timeout, while
+`--provider-timeout-seconds` bounds each attempt.
 
 For a typed HTTP transport failure, the CLI also emits one optional body-free
 record alongside the unchanged `DANSO_ERROR` record:
 
 ```text
-DANSO_TRANSPORT={"version":1,"phase":"response_body","elapsed_ms":60001,"request_bytes":30502}
+DANSO_TRANSPORT={"version":1,"phase":"response_body","elapsed_ms":60001,"request_bytes":30502,"attempts":1}
 ```
 
-Its exact keys are `version`, `phase`, `elapsed_ms`, and `request_bytes`.
-`phase` is one of `connect`, `before_response_headers`, or `response_body`;
-the numeric fields are nonnegative bounded integers. The record is emitted only
-for typed native HTTP transport failures, never for HTTP status or response
-validation errors. The ccc-node adapter treats it as optional and ignores a
+Its exact keys are `version`, `phase`, `elapsed_ms`, `request_bytes`, and
+`attempts`. `phase` is one of `connect`, `before_response_headers`, or
+`response_body`; the numeric fields are nonnegative bounded integers, and
+`attempts` counts the HTTP attempts made including the first (#67 B). The
+record is emitted only for typed native HTTP transport failures, never for
+HTTP status or response validation errors. The ccc-node adapter treats it as optional and ignores a
 missing or invalid record while preserving the terminal category and no-replay
 behavior.
 

@@ -48,20 +48,23 @@ pub struct TransportDiagnostic {
     elapsed_ms: u64,
     request_bytes: u64,
     timed_out: bool,
+    attempts: u64,
 }
 
 impl TransportDiagnostic {
-    pub(crate) fn new(
+    pub(crate) fn with_attempts(
         phase: TransportPhase,
         elapsed_ms: u64,
         request_bytes: u64,
         timed_out: bool,
+        attempts: u64,
     ) -> Self {
         Self {
             phase,
             elapsed_ms,
             request_bytes,
             timed_out,
+            attempts,
         }
     }
 
@@ -76,6 +79,13 @@ impl TransportDiagnostic {
     pub fn request_bytes(&self) -> u64 {
         self.request_bytes
     }
+
+    /// HTTP attempts made for this request, including the first. Retryable
+    /// transport timeouts retry up to the configured limit before this
+    /// diagnostic is raised, so the count can exceed one (#67 B).
+    pub fn attempts(&self) -> u64 {
+        self.attempts
+    }
 }
 
 impl fmt::Display for TransportDiagnostic {
@@ -87,9 +97,14 @@ impl fmt::Display for TransportDiagnostic {
         } else {
             "provider transport failed"
         };
+        let suffix = if self.attempts > 1 {
+            format!(" attempts={}", self.attempts)
+        } else {
+            String::new()
+        };
         write!(
             f,
-            "{message}: phase={} elapsed_ms={} request_bytes={}",
+            "{message}: phase={} elapsed_ms={} request_bytes={}{suffix}",
             self.phase.as_str(),
             self.elapsed_ms,
             self.request_bytes
@@ -265,6 +280,7 @@ pub fn report_transport(diagnostic: &TransportDiagnostic) {
             "phase": diagnostic.phase.as_str(),
             "elapsed_ms": diagnostic.elapsed_ms,
             "request_bytes": diagnostic.request_bytes,
+            "attempts": diagnostic.attempts,
         })
     );
 }
@@ -286,11 +302,12 @@ mod tests {
             serde_json::to_value(provider(&error).unwrap()).unwrap(),
             serde_json::json!({"reason":"invalid_stream", "http_status":null, "output_tokens_max":null})
         );
-        let transport_error = Error::new(TransportDiagnostic::new(
+        let transport_error = Error::new(TransportDiagnostic::with_attempts(
             TransportPhase::ResponseBody,
             1,
             1,
             false,
+            1,
         ));
         let error = provider_context(ProviderReason::InvalidStream)(transport_error);
         assert!(provider(&error).is_none());
@@ -312,8 +329,13 @@ mod tests {
 
     #[test]
     fn transport_record_is_bounded_and_body_free() {
-        let diagnostic =
-            TransportDiagnostic::new(TransportPhase::ResponseBody, u64::MAX, 512 * 1024, true);
+        let diagnostic = TransportDiagnostic::with_attempts(
+            TransportPhase::ResponseBody,
+            u64::MAX,
+            512 * 1024,
+            true,
+            1,
+        );
         assert_eq!(diagnostic.phase(), TransportPhase::ResponseBody);
         assert_eq!(diagnostic.elapsed_ms(), u64::MAX);
         assert_eq!(diagnostic.request_bytes(), 512 * 1024);

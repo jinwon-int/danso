@@ -57,7 +57,8 @@ class ChatGPT(Fixture):
                 'DANSO_CHATGPT_BASE_URL': f'http://127.0.0.1:{self.server.server_port}/codex'}
 
     def invoke(self, **kwargs):
-        return self.run_cli('openai-codex', **kwargs)
+        extra = kwargs.pop('extra', [])
+        return self.run_cli('openai-codex', *extra, **kwargs)
 
     def assert_private(self, proc):
         output = proc.stdout + proc.stderr
@@ -223,15 +224,27 @@ class ChatGPT(Fixture):
         self.assert_diagnostic(self.invoke(), 'stream_ended')
 
     def test_http_errors_no_retry_or_body_leak(self):
+        # 429 is retryable by default (#67 B); this contract pins the
+        # no-retry path via --provider-retries 0 alongside the other
+        # non-retryable statuses.
         for status in (401, 403, 429, 500, 302):
             self.session = self.root / f'http{status}.jsonl'
             self.responses = [(status, b'REFRESH_SECRET')]
             before = len(self.requests)
-            p = self.invoke()
+            p = self.invoke(extra=['--provider-retries', '0'])
             self.assertNotEqual(p.returncode, 0)
             self.assert_diagnostic(p, 'http_status', status)
             self.assertEqual(len(self.requests), before + 1)
             self.assert_private(p)
+
+    def test_retryable_status_retries_then_succeeds(self):
+        self.session = self.root / 'http429-retry.jsonl'
+        self.responses = [(429, b'REFRESH_SECRET', {'Retry-After': '0'}),
+                          (200, sse(response('openai')))]
+        p = self.invoke(extra=['--provider-retries', '3'])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.requests), 2)
+        self.assert_private(p)
 
     def test_terminal_alias_and_incomplete_alias_rejected(self):
         self.responses = [(200, sse(response('openai')).replace(b'response.completed', b'response.done'))]

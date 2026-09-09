@@ -323,7 +323,7 @@ class Acceptance(unittest.TestCase):
 
     def test_provider_error_and_config_error_contract(self):
         self.responses.append((429, {'error': 'do-not-print-provider-body'}))
-        p = self.run_cli('-p')
+        p = self.run_cli('-p', '--provider-retries', '0')
         self.assertEqual(p.returncode, 3, p.stderr)
         self.assertEqual(p.stdout, '')
         self.assertNotIn('do-not-print-provider-body', p.stderr)

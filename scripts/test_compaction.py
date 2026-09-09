@@ -498,7 +498,9 @@ class Compaction(fixture.Fixture):
         nonterminal = reply('glm', text=json.dumps(SUMMARY))
         nonterminal['choices'][0]['finish_reason'] = 'length'
         tool = reply('glm', [('write', {'path': 'forbidden', 'content': 'x'})])
-        for response in ((503, {}), (200, nonterminal), (200, tool), (200, {})):
+        # Status-level retry policy is qualified in test_providers.py; this
+        # test owns unsafe or failed summary RESPONSE bodies (never retried).
+        for response in ((200, nonterminal), (200, tool), (200, {})):
             self.session = self.root / f'fail-fast-{len(self.requests)}.jsonl'
             (self.repo / 'effects.txt').write_text('')
             self.responses.clear()
@@ -676,7 +678,8 @@ class Compaction(fixture.Fixture):
                     time.sleep(1.2)
                     return reply(provider)
                 self.responses.append((200, delayed))
-                p = self.run_cli(provider, '--provider-timeout-seconds', seconds)
+                p = self.run_cli(provider, '--provider-timeout-seconds', seconds,
+                                 '--provider-retries', '0')
                 self.assertEqual(p.returncode, expected, p.stderr)
                 self.assertEqual(len(self.requests), before + 1)
                 if expected:
@@ -708,7 +711,7 @@ class Compaction(fixture.Fixture):
                     time.sleep(1.2)
                 return response
             self.responses[:] = [(200, serve)] * 50
-            p = self.run_cli(provider, '--provider-timeout-seconds', '1')
+            p = self.run_cli(provider, '--provider-timeout-seconds', '1', '--provider-retries', '0')
             self.assertEqual(p.returncode, 3, p.stderr)
             self.assertIn('timed out', p.stderr)
             self.assertEqual(state['summaries'], 1)

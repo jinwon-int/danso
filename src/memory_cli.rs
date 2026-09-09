@@ -500,6 +500,7 @@ fn drain_command(
         model,
         None,
         120,
+        3,
         Some(max_output_tokens),
         None,
         None,

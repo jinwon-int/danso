@@ -62,11 +62,15 @@ class Fixture(unittest.TestCase):
                 owner.requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
                 owner.headers.append(dict(self.headers))
                 owner.paths.append(self.path)
-                status, body = owner.responses.pop(0) if owner.responses else (500, {})
+                entry = owner.responses.pop(0) if owner.responses else (500, {})
+                status, body = entry[0], entry[1]
+                extra_headers = entry[2] if len(entry) > 2 else {}
                 if callable(body):
                     body = body(owner.requests[-1])
                 data = body if isinstance(body, bytes) else json.dumps(body).encode()
                 self.send_response(status)
+                for name, value in extra_headers.items():
+                    self.send_header(name, value)
                 if status == 302:
                     self.send_header('Location', f'http://127.0.0.1:{owner.server.server_port}/redirected')
                 self.send_header('Content-Length', str(len(data)))
@@ -95,10 +99,10 @@ class Fixture(unittest.TestCase):
         return {'PATH': '/usr/bin:/bin', 'HOME': str(self.home), key_name: 'synthetic-key',
                 f'DANSO_{prefix}_BASE_URL': f'http://127.0.0.1:{self.server.server_port}/api'}
 
-    def run_cli(self, provider, *extra, env=None):
+    def run_cli(self, provider, *extra, env=None, timeout=15):
         return subprocess.run([str(BIN), *self.execution_args, '--cwd', str(self.repo), '--session', str(self.session),
                                '--provider', provider, '--model', 'fixture', *extra, '-p', 'do task'],
-                              capture_output=True, text=True, timeout=15, env=env or self.env(provider))
+                              capture_output=True, text=True, timeout=timeout, env=env or self.env(provider))
 
     def usage(self, p):
         a = [json.loads(l.split('=', 1)[1]) for l in p.stderr.splitlines() if l.startswith('DANSO_USAGE=')]
@@ -197,9 +201,11 @@ class Providers(Fixture):
                     self.assertEqual(p.returncode, 3, p.stderr)
                     self.assertFalse((self.repo / 'must-not-exist').exists())
 
-    def test_http_errors_bounds_and_no_redirect_or_retry(self):
+    def test_http_errors_bounds_and_no_redirect(self):
+        # Non-retryable failures (redirect, malformed or oversized responses)
+        # still end the invocation on the first attempt.
         for provider in ('openai', 'glm'):
-            for status, body in ((429, b'SENSITIVE_BODY'), (302, b'SENSITIVE_BODY'), (200, b'{' + b'x' * (1024 * 1024)), (200, b'not json')):
+            for status, body in ((302, b'SENSITIVE_BODY'), (200, b'{' + b'x' * (1024 * 1024)), (200, b'not json')):
                 with self.subTest(provider=provider, status=status, size=len(body)):
                     self.session = self.root / f'http-{len(self.requests)}.jsonl'
                     count = len(self.requests)
@@ -210,6 +216,17 @@ class Providers(Fixture):
                     self.assertNotIn('SENSITIVE_BODY', p.stderr)
                     self.assertNotIn('synthetic-key', p.stderr)
                     self.assertEqual(self.usage(p)['requests'], 0)
+
+    def test_non_retryable_auth_error_ends_on_first_attempt(self):
+        for provider in ('openai', 'glm'):
+            with self.subTest(provider=provider):
+                self.session = self.root / f'http-auth-{provider}.jsonl'
+                count = len(self.requests)
+                self.responses.append((401, b'SENSITIVE_BODY'))
+                p = self.run_cli(provider)
+                self.assertEqual(p.returncode, 3, p.stderr)
+                self.assertEqual(len(self.requests), count + 1)
+                self.assertNotIn('SENSITIVE_BODY', p.stderr)
 
     def test_config_and_history_errors_before_dispatch(self):
         for provider in ('openai', 'glm'):
@@ -364,6 +381,44 @@ class Providers(Fixture):
         p = self.run_cli('openai')
         self.assertEqual(p.returncode, 2, p.stderr)
         self.assertEqual(len(self.requests), 1)
+
+
+    def test_retryable_status_retries_then_succeeds_without_duplicate_journal(self):
+        for provider in ('openai', 'glm'):
+            with self.subTest(provider=provider):
+                self.responses.clear(); self.requests.clear()
+                self.session = self.root / f'{provider}-retry.jsonl'
+                self.responses.extend([
+                    (429, {}, {'Retry-After': '0'}),
+                    (200, response(provider, text='RETRIED-OK')),
+                ])
+                p = self.run_cli(provider)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(p.stdout.strip(), 'RETRIED-OK')
+                self.assertEqual(len(self.requests), 2)
+                # The refused attempt left no assistant message: the journal
+                # holds exactly the user prompt and the final answer.
+                entries = list(map(json.loads, self.session.read_text().splitlines()))
+                self.assertEqual([e['message']['role'] for e in entries if 'message' in e], ['user', 'assistant'])
+
+    def test_retry_exhaustion_fails_after_configured_attempts(self):
+        self.responses.clear(); self.requests.clear()
+        self.responses.extend([(503, {}) for _ in range(4)])
+        p = self.run_cli('glm', timeout=60)
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertEqual(len(self.requests), 4)
+
+    def test_provider_retries_zero_disables_retrying(self):
+        self.responses.clear(); self.requests.clear()
+        self.responses.extend([(429, {}, {'Retry-After': '0'}), (200, response('openai'))])
+        p = self.run_cli('openai', '--provider-retries', '0')
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertEqual(len(self.requests), 1)
+
+    def test_provider_retries_bounds_are_configuration_errors(self):
+        for bound in ('6', '-1'):
+            p = self.run_cli('openai', '--provider-retries', bound)
+            self.assertEqual(p.returncode, 2, p.stderr)
 
 
 if __name__ == '__main__':
