@@ -140,12 +140,16 @@ pub enum ProviderReason {
     ResponseFailed,
     ResponseIncomplete,
     ResponseError,
+    /// The provider stopped at its output token cap (issue #69 B):
+    /// `stop_reason=max_tokens` / `stopReason=length` with no tool calls.
+    MaxTokens,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ProviderDiagnostic {
     reason: ProviderReason,
     http_status: Option<u16>,
+    output_tokens_max: Option<u32>,
 }
 
 impl ProviderDiagnostic {
@@ -155,6 +159,12 @@ impl ProviderDiagnostic {
     pub fn http_status(&self) -> Option<u16> {
         self.http_status
     }
+
+    /// Closed-vocabulary reason (tests and ccc-node validation read this;
+    /// the record itself is already body-free JSON).
+    pub fn reason(&self) -> ProviderReason {
+        self.reason
+    }
 }
 
 impl fmt::Display for ProviderDiagnostic {
@@ -162,6 +172,9 @@ impl fmt::Display for ProviderDiagnostic {
         write!(f, "provider response failure: {:?}", self.reason)?;
         if let Some(status) = self.http_status {
             write!(f, " HTTP {status}")?;
+        }
+        if let Some(cap) = self.output_tokens_max {
+            write!(f, " output token cap {cap}; raise --max-output-tokens")?;
         }
         Ok(())
     }
@@ -179,6 +192,7 @@ pub fn provider_error(reason: ProviderReason) -> Error {
     Error::new(ProviderDiagnostic {
         reason,
         http_status: None,
+        output_tokens_max: None,
     })
 }
 
@@ -186,6 +200,18 @@ pub fn http_status_error(status: reqwest::StatusCode) -> Error {
     Error::new(ProviderDiagnostic {
         reason: ProviderReason::HttpStatus,
         http_status: Some(status.as_u16()),
+        output_tokens_max: None,
+    })
+}
+
+/// The response stopped at the output token cap (issue #69 B): terminal
+/// `length` stop with no tool calls. Body-free diagnostic carries the cap;
+/// the display text names the flag that raises it.
+pub fn max_tokens_error(output_tokens_max: u32) -> Error {
+    Error::new(ProviderDiagnostic {
+        reason: ProviderReason::MaxTokens,
+        http_status: None,
+        output_tokens_max: Some(output_tokens_max),
     })
 }
 
@@ -204,6 +230,7 @@ pub fn report_provider(diagnostic: &ProviderDiagnostic) {
         "DANSO_PROVIDER={}",
         serde_json::json!({
             "version": 1, "reason": diagnostic.reason, "http_status": diagnostic.http_status,
+            "output_tokens_max": diagnostic.output_tokens_max,
         })
     );
 }
@@ -257,7 +284,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(provider(&error).unwrap()).unwrap(),
-            serde_json::json!({"reason":"invalid_stream", "http_status":null})
+            serde_json::json!({"reason":"invalid_stream", "http_status":null, "output_tokens_max":null})
         );
         let transport_error = Error::new(TransportDiagnostic::new(
             TransportPhase::ResponseBody,

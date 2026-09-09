@@ -39,8 +39,9 @@ target/debug/danso --provider glm --model YOUR_GLM_MODEL \
 
 ## Protocol details and limits
 
-- OpenAI uses non-streaming Responses with `store: false`, a 4096 output-token
-  budget, and `include: ["reasoning.encrypted_content"]`. It exposes only local
+- OpenAI uses non-streaming Responses with `store: false`, the configured
+  output-token cap (default 16384, `--max-output-tokens`; issue #69 A), and
+  `include: ["reasoning.encrypted_content"]`. It exposes only local
   function tools. Tool schemas use `strict: false` to preserve optional builtin
   parameters. Hosted tools are not enabled.
 - The complete supported OpenAI output sequence (message, function call,
@@ -49,7 +50,8 @@ target/debug/danso --provider glm --model YOUR_GLM_MODEL \
   before resending it. Responses must be completed; unsupported output items,
   missing opaque reasoning, malformed calls and incomplete batches fail before
   any tool executes. An OpenAI session missing its preserved output fails closed.
-- GLM uses non-streaming Chat Completions with a 4096 output-token budget and
+- GLM uses non-streaming Chat Completions with the configured output-token cap
+  (default 16384, `--max-output-tokens`) and
   `thinking: {type: "enabled", clear_thinking: false}`. This targets the GLM-4.5+
   thinking/tool-capable protocol. Returned `reasoning_content` is stored in
   `dansoGlmReasoning` and forwarded verbatim. It is not rendered as final text.

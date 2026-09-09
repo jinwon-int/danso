@@ -22,7 +22,7 @@ def response():
 
 
 def request():
-    return {'model': 'gpt-6-astra', 'reasoning': {'effort': 'medium'}, 'max_output_tokens': 4096,
+    return {'model': 'gpt-6-astra', 'reasoning': {'effort': 'medium'}, 'max_output_tokens': 16384,
             'store': False, 'input': 'PRIVATE_TASK', 'tools': []}
 
 

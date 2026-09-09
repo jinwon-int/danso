@@ -207,7 +207,8 @@ class ChatGPT(Fixture):
                  if line.startswith('DANSO_PROVIDER=')]
         self.assertEqual(len(lines), 1, process.stderr)
         self.assertEqual(json.loads(lines[0]), {
-            'version': 1, 'reason': reason, 'http_status': status})
+            'version': 1, 'reason': reason, 'http_status': status,
+            'output_tokens_max': None})
         self.assertEqual(process.returncode, 3)
 
     def test_terminal_failure_diagnostics_are_body_free(self):

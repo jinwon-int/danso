@@ -49,6 +49,9 @@ pub struct RunConfig {
     pub memory_distill: memory::DistillMode,
     pub backend: Backend,
     pub max_turns: u32,
+    /// Explicit `--max-output-tokens`; env and default resolve in
+    /// `provider_from_parts` (issue #69 A).
+    pub max_output_tokens: Option<u32>,
     pub compact_at_bytes: Option<usize>,
     pub timeout_seconds: u64,
     pub provider_timeout_seconds: u64,
@@ -64,13 +67,17 @@ pub struct RunConfig {
 }
 
 /// Build a production provider from explicit parts (shared by `danso run`
-/// and the memory drain CLI; credentials come from the environment).
+/// and the memory drain CLI; credentials come from the environment). The
+/// output token cap resolves from the explicit flag, then
+/// `DANSO_MAX_OUTPUT_TOKENS`, then the default (issue #69 A).
 pub fn provider_from_parts(
     provider: &str,
     model: &str,
     reasoning_effort: Option<&str>,
     provider_timeout_seconds: u64,
+    max_output_tokens: Option<u32>,
 ) -> Result<crate::provider::Selected> {
+    let max_output_tokens = crate::provider::resolve_max_output_tokens(max_output_tokens)?;
     let effort = reasoning_effort.map(str::to_string);
     ensure!(!model.trim().is_empty(), "model must not be empty");
     if let Some(effort) = &effort {
@@ -125,6 +132,7 @@ pub fn provider_from_parts(
                     model.to_string(),
                     key,
                     &base,
+                    max_output_tokens,
                     provider_timeout_seconds,
                 )?,
             ))
@@ -135,6 +143,7 @@ pub fn provider_from_parts(
                 key,
                 &base,
                 effort,
+                max_output_tokens,
                 provider_timeout_seconds,
             )?,
         )),
@@ -144,6 +153,7 @@ pub fn provider_from_parts(
                 key,
                 &base,
                 effort,
+                max_output_tokens,
                 provider_timeout_seconds,
             )?,
         )),
@@ -354,6 +364,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         &args.model,
         args.reasoning_effort.as_deref(),
         args.provider_timeout_seconds,
+        args.max_output_tokens,
     )?;
     let limits =
         tools::resource_limits(args.backend, Duration::from_secs(args.tool_timeout_seconds));

@@ -92,6 +92,7 @@ class Compaction(fixture.Fixture):
 
     def assert_budget_requests(self, provider, requests, total):
         summaries = 0
+        reserve = max(3, total // 10)
         for index, body in enumerate(requests):
             system = (body['system'] if provider == 'anthropic' else
                       body['instructions'] if provider == 'openai' else body['messages'][0]['content'])
@@ -99,8 +100,15 @@ class Compaction(fixture.Fixture):
                 summaries += 1
                 self.assertNotIn('Runtime request budget for this run:', system)
                 continue
+            remaining = total - index
+            if remaining > reserve:
+                # Lenient phase (issue #69 D): factual only, no rush.
+                counters = re.findall(r'Request budget: remaining=(\d+) of (\d+) \(summary_requests=(\d+)\)\.', system)
+                self.assertEqual(counters, [(str(remaining), str(total), str(summaries))])
+                self.assertNotIn('Prioritize unfinished edits', system)
+                continue
             counters = re.findall(r'Runtime request budget for this run: remaining=(\d+), total=(\d+), summary_requests=(\d+)\.', system)
-            self.assertEqual(counters, [(str(total - index), str(total), str(summaries))])
+            self.assertEqual(counters, [(str(remaining), str(total), str(summaries))])
             self.assertIn('Remaining includes this request', system)
             self.assertIn('no follow-up model request', system)
             self.assertIn('report incomplete work and omitted checks honestly', system)

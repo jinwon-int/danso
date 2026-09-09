@@ -9,16 +9,26 @@ pub struct OpenAi {
     chatgpt: Option<super::chatgpt::ChatGpt>,
     model: String,
     effort: Option<String>,
+    max_output_tokens: u32,
 }
 impl OpenAi {
     pub fn new(model: String, key: String, base: &str, effort: Option<String>) -> Result<Self> {
-        Self::new_with_timeout(model, key, base, effort, 180)
+        Self::new_with_timeout(
+            model,
+            key,
+            base,
+            effort,
+            super::MAX_OUTPUT_TOKENS_DEFAULT,
+            180,
+        )
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_timeout(
         model: String,
         key: String,
         base: &str,
         effort: Option<String>,
+        max_output_tokens: u32,
         timeout_seconds: u64,
     ) -> Result<Self> {
         Ok(Self {
@@ -26,6 +36,7 @@ impl OpenAi {
             chatgpt: None,
             model,
             effort,
+            max_output_tokens,
         })
     }
     pub fn new_chatgpt(
@@ -44,6 +55,7 @@ impl OpenAi {
             )?),
             model,
             effort,
+            max_output_tokens: super::MAX_OUTPUT_TOKENS_DEFAULT,
         })
     }
     fn body(&self, request: &ModelRequest<'_>) -> Result<Value> {
@@ -56,7 +68,7 @@ impl OpenAi {
             })
             .collect();
         let mut body = json!({"model":self.model,"instructions":request.system,"input":history(request.messages)?,
-            "tools":tools,"store":false,"include":["reasoning.encrypted_content"],"max_output_tokens":4096});
+            "tools":tools,"store":false,"include":["reasoning.encrypted_content"],"max_output_tokens":self.max_output_tokens});
         if let Some(effort) = &self.effort {
             body["reasoning"] = json!({"effort":effort});
         }
@@ -68,6 +80,9 @@ impl OpenAi {
     }
 }
 impl Provider for OpenAi {
+    fn max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
+    }
     fn validate_history(&self, messages: &[Value]) -> Result<()> {
         history(messages).map(|_| ())
     }
@@ -245,6 +260,7 @@ mod image_admission_tests {
             chatgpt: None,
             model: "synthetic-model".into(),
             effort: None,
+            max_output_tokens: crate::provider::MAX_OUTPUT_TOKENS_DEFAULT,
         };
         let secret = "PRIVATE_SYNTHETIC_IMAGE_DO_NOT_ECHO";
         for role in ["user", "toolResult", "assistant"] {

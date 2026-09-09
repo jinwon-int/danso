@@ -112,7 +112,7 @@ class DispatchGate:
     component cannot claim that an arbitrary process used only this gateway.
     """
     def __init__(self, upstream, evidence, *, model, effort='medium', request_limit=4,
-                 wall_seconds=30, request_seconds=10, output_tokens=4096):
+                 wall_seconds=30, request_seconds=10, output_tokens=16384):
         require(type(upstream) is tuple and len(upstream) == 2 and upstream[0] == '127.0.0.1')
         require(type(upstream[1]) is int and 1 <= upstream[1] <= 65535)
         require(type(model) is str and 0 < len(model) <= 128)

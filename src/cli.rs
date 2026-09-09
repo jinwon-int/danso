@@ -77,8 +77,13 @@ pub struct Args {
     /// Deprecated alias for --sandbox host. Cannot be combined with --sandbox.
     #[arg(long, conflicts_with = "sandbox")]
     pub unsafe_no_sandbox: bool,
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 48)]
     pub max_turns: u32,
+    /// Output token cap per provider response (256..=131072, default 16384;
+    /// range enforced fail-closed in provider_from_parts). Maps to Anthropic
+    /// max_tokens, OpenAI max_output_tokens, GLM max_tokens.
+    #[arg(long, value_parser = clap::value_parser!(u32))]
+    pub max_output_tokens: Option<u32>,
     /// Opt in to checkpoint compaction above this serialized request size (8192..393216).
     #[arg(long)]
     pub compact_at_bytes: Option<usize>,
@@ -146,7 +151,7 @@ impl Args {
         let timeout_seconds = self.timeout_seconds.unwrap_or(if long {
             danso::long_task::MAX_WALL_SECONDS
         } else {
-            300
+            1800
         });
         danso::app::RunConfig {
             prompt: self.prompt.clone().unwrap_or_default(),
@@ -190,6 +195,7 @@ impl Args {
             },
             backend,
             max_turns: self.max_turns,
+            max_output_tokens: self.max_output_tokens,
             compact_at_bytes: self.compact_at_bytes,
             timeout_seconds,
             provider_timeout_seconds: self.provider_timeout_seconds,
@@ -296,6 +302,51 @@ mod tests {
         assert_eq!(
             parse(&["--provider-timeout-seconds", "42"]).provider_timeout_seconds,
             42
+        );
+    }
+
+    /// Issue #69 C: longer default budgets for real work. Explicit flags
+    /// still win; the long-task wall default is unchanged.
+    #[test]
+    fn budget_defaults_are_extended_and_flags_still_win() {
+        let config = parse(&[]).config();
+        assert_eq!(config.max_turns, 48);
+        assert_eq!(config.timeout_seconds, 1800);
+        let config = parse(&["--max-turns", "16", "--timeout-seconds", "60"]).config();
+        assert_eq!(config.max_turns, 16);
+        assert_eq!(config.timeout_seconds, 60);
+        assert_eq!(
+            parse(&["--long-task"]).config().timeout_seconds,
+            danso::long_task::MAX_WALL_SECONDS
+        );
+    }
+
+    /// Issue #69 A: the flag is optional and passed through; range and env
+    /// resolution happen fail-closed in provider_from_parts.
+    #[test]
+    fn max_output_tokens_flag_is_optional_and_preserved() {
+        assert_eq!(parse(&[]).config().max_output_tokens, None);
+        assert_eq!(
+            parse(&["--max-output-tokens", "32768"])
+                .config()
+                .max_output_tokens,
+            Some(32768)
+        );
+        // In-range parsing succeeds; the 256..=131072 range is enforced
+        // fail-closed at provider construction (see provider::mod tests).
+        assert_eq!(
+            try_parse(&["--max-output-tokens", "0"])
+                .unwrap()
+                .config()
+                .max_output_tokens,
+            Some(0)
+        );
+        assert_eq!(
+            try_parse(&["--max-output-tokens", "999999999"])
+                .unwrap()
+                .config()
+                .max_output_tokens,
+            Some(999999999)
         );
     }
 

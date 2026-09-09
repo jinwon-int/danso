@@ -473,7 +473,19 @@ pub async fn run(
                 )));
             }
         }
-        let mut system = budget_system(&base_system, budget_total, remaining, summary_requests);
+        let final_phase = budget_final_phase(
+            input.long_task.is_some(),
+            &long_ledger,
+            remaining,
+            budget_total,
+        );
+        let mut system = budget_system(
+            &base_system,
+            budget_total,
+            remaining,
+            summary_requests,
+            final_phase,
+        );
         async {
             if let Some(limit) = input.compact_at_bytes {
                 let before = provider
@@ -538,8 +550,19 @@ pub async fn run(
                             refreshed, input.execution_context
                         );
                     }
-                    system =
-                        budget_system(&base_system, budget_total, remaining, summary_requests);
+                    let final_phase = budget_final_phase(
+                        input.long_task.is_some(),
+                        &long_ledger,
+                        remaining,
+                        budget_total,
+                    );
+                    system = budget_system(
+                        &base_system,
+                        budget_total,
+                        remaining,
+                        summary_requests,
+                        final_phase,
+                    );
                     let compacted = crate::compaction::checkpoint_messages(&summary, &messages)?;
                     let after = provider
                         .request_bytes(&ModelRequest {
@@ -674,9 +697,12 @@ pub async fn run(
         }
         if calls.is_empty() {
             if message["stopReason"] != "stop" {
-                return Err(at(Kind::Provider)(anyhow::anyhow!(
-                    "provider response truncated"
-                )));
+                // Terminal `length` with no tool calls (issue #69 B): the
+                // response hit the configured output token cap. Keep the
+                // provider category; the diagnostic carries the cap and the
+                // flag that raises it.
+                let cap = provider.max_output_tokens();
+                return Err(at(Kind::Provider)(crate::failure::max_tokens_error(cap)));
             }
             if input.long_task.is_some() {
                 long_ledger.complete(session).map_err(at(Kind::Session))?;
@@ -797,10 +823,52 @@ pub async fn run(
 }
 
 /// Run-local guidance, never journal history: resume receives a fresh budget.
-fn budget_system(base: &str, total: u32, remaining: u32, summaries: u32) -> String {
-    format!(
-        "{base}\nRuntime request budget for this run: remaining={remaining}, total={total}, summary_requests={summaries}. Remaining includes this request; each model request consumes one slot, including checkpoint fragments and repair attempts. Future compaction also consumes these slots. This is a request limit, not a token or time allowance. Prioritize unfinished edits, required checks, and an accurate final report; avoid repeating reads unless information is missing or state changed. Reserve a request after tools to inspect their results and report. If remaining=1, there is no follow-up model request after any tools you call. Never skip required validation silently or claim unexecuted checks passed; report incomplete work and omitted checks honestly."
-    )
+/// Two phases (issue #69 D): factual while `remaining` is above the reserve,
+/// prioritize-and-report once it reaches the reserve window. Long-task runs
+/// stay lenient until a stage boundary is near (`stage_final`).
+fn budget_system(
+    base: &str,
+    total: u32,
+    remaining: u32,
+    summaries: u32,
+    final_phase: bool,
+) -> String {
+    let guidance = if final_phase {
+        format!(
+            "Runtime request budget for this run: remaining={remaining}, total={total}, summary_requests={summaries}. Remaining includes this request; each model request consumes one slot, including checkpoint fragments and repair attempts. Future compaction also consumes these slots. This is a request limit, not a token or time allowance. Prioritize unfinished edits, required checks, and an accurate final report; avoid repeating reads unless information is missing or state changed. Reserve a request after tools to inspect their results and report. If remaining=1, there is no follow-up model request after any tools you call. Never skip required validation silently or claim unexecuted checks passed; report incomplete work and omitted checks honestly."
+        )
+    } else {
+        format!(
+            "Request budget: remaining={remaining} of {total} (summary_requests={summaries}). Each model request, including checkpoint fragments, consumes one. Use as many steps as the task needs; do not shortcut validation to save requests."
+        )
+    };
+    format!("{base}\n{guidance}")
+}
+
+/// The reserve window (issue #69 C/D): the tail of the budget in which the
+/// guidance switches to prioritize-and-report.
+fn budget_reserve(total: u32) -> u32 {
+    (total / 10).max(3)
+}
+
+/// Long-task runs stay lenient until a stage boundary is near; short runs
+/// switch at the reserve window of the run budget (issue #69 D).
+fn budget_final_phase(
+    long_task: bool,
+    ledger: &crate::long_task::Ledger,
+    remaining: u32,
+    total: u32,
+) -> bool {
+    if long_task {
+        ledger.limits.is_some_and(|limits| {
+            limits.stage_requests.saturating_sub(ledger.stage_requests)
+                <= u64::from(budget_reserve(
+                    limits.stage_requests.min(u32::MAX as u64) as u32
+                ))
+        })
+    } else {
+        remaining <= budget_reserve(total)
+    }
 }
 
 pub(crate) fn tool_calls(message: &Value) -> Result<Vec<ToolCall>> {
@@ -818,4 +886,50 @@ pub(crate) fn tool_calls(message: &Value) -> Result<Vec<ToolCall>> {
             Ok(call)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod budget_guidance_tests {
+    use super::*;
+
+    #[test]
+    fn reserve_is_ten_percent_with_a_floor_of_three() {
+        assert_eq!(budget_reserve(16), 3);
+        assert_eq!(budget_reserve(48), 4);
+        assert_eq!(budget_reserve(100), 10);
+    }
+
+    #[test]
+    fn short_run_is_lenient_above_reserve_and_final_within_it() {
+        let base = "BASE";
+        // 48-request budget: reserve is 4, so remaining=5 stays lenient.
+        let lenient = budget_system(base, 48, 5, 1, false);
+        assert!(lenient.starts_with("BASE\nRequest budget: remaining=5 of 48"));
+        assert!(
+            !lenient.contains("Prioritize"),
+            "lenient phase must not rush the model"
+        );
+        // remaining=4 (at the reserve) switches to the prioritize-and-report text.
+        let final_phase = budget_system(base, 48, 4, 1, true);
+        assert!(final_phase.contains("Prioritize unfinished edits"));
+        assert!(final_phase.contains("remaining=4"));
+    }
+
+    #[test]
+    fn long_task_stays_lenient_until_a_stage_boundary_is_near() {
+        let mut ledger = crate::long_task::Ledger {
+            limits: Some(crate::long_task::Limits::defaults()),
+            ..Default::default()
+        };
+        // Far from the 16-request stage boundary: lenient.
+        ledger.stage_requests = 8;
+        assert!(!budget_final_phase(true, &ledger, 900, 1024));
+        // Within the reserve window of the stage boundary (16-3=13): final.
+        ledger.stage_requests = 13;
+        assert!(budget_final_phase(true, &ledger, 900, 1024));
+        // Short runs ignore the ledger and use the run-budget reserve.
+        ledger.stage_requests = 13;
+        assert!(!budget_final_phase(false, &ledger, 40, 48));
+        assert!(budget_final_phase(false, &ledger, 4, 48));
+    }
 }

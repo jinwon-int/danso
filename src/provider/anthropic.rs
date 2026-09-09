@@ -10,15 +10,17 @@ pub struct Anthropic {
     http: Http,
     headers: reqwest::header::HeaderMap,
     model: String,
+    max_output_tokens: u32,
 }
 impl Anthropic {
     pub fn new(model: String, key: String, base: &str) -> Result<Self> {
-        Self::new_with_timeout(model, key, base, 180)
+        Self::new_with_timeout(model, key, base, super::MAX_OUTPUT_TOKENS_DEFAULT, 180)
     }
     pub fn new_with_timeout(
         model: String,
         key: String,
         base: &str,
+        max_output_tokens: u32,
         timeout_seconds: u64,
     ) -> Result<Self> {
         // Anthropic authenticates with x-api-key rather than a Bearer token,
@@ -43,6 +45,7 @@ impl Anthropic {
             http,
             headers,
             model,
+            max_output_tokens,
         })
     }
     fn body(&self, request: &ModelRequest<'_>) -> Result<Value> {
@@ -51,11 +54,14 @@ impl Anthropic {
             .iter()
             .map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.parameters}))
             .collect();
-        let body = json!({"model":self.model,"max_tokens":4096,"system":request.system,"messages":provider_messages(request.messages)?,"tools":definitions});
+        let body = json!({"model":self.model,"max_tokens":self.max_output_tokens,"system":request.system,"messages":provider_messages(request.messages)?,"tools":definitions});
         Ok(body)
     }
 }
 impl Provider for Anthropic {
+    fn max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
+    }
     fn validate_history(&self, messages: &[Value]) -> Result<()> {
         provider_messages(messages).map(|_| ())
     }

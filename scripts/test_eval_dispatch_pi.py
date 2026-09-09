@@ -16,7 +16,7 @@ class PiInterop(GateTests):
         workspace = self.root/'workspace'; workspace.mkdir()
         config = self.root/'pi-config'; config.mkdir(mode=0o700)
         settings = {'providers':{'openai':{'baseUrl':f'http://127.0.0.1:{gate.port}/v1',
-                    'apiKey':gate.token,'modelOverrides':{'gpt-6-astra':{'maxTokens':4096}}}}}
+                    'apiKey':gate.token,'modelOverrides':{'gpt-6-astra':{'maxTokens':16384}}}}}
         path = config/'models.json'; path.write_text(json.dumps(settings)); path.chmod(0o600)
         process = await asyncio.create_subprocess_exec('/usr/bin/node',str(cli),'-p',
             '--provider','openai','--model','gpt-6-astra','--thinking','medium','--no-session',

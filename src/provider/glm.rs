@@ -8,22 +8,32 @@ pub struct Glm {
     http: Http,
     model: String,
     effort: Option<String>,
+    max_output_tokens: u32,
 }
 impl Glm {
     pub fn new(model: String, key: String, base: &str, effort: Option<String>) -> Result<Self> {
-        Self::new_with_timeout(model, key, base, effort, 180)
+        Self::new_with_timeout(
+            model,
+            key,
+            base,
+            effort,
+            super::MAX_OUTPUT_TOKENS_DEFAULT,
+            180,
+        )
     }
     pub fn new_with_timeout(
         model: String,
         key: String,
         base: &str,
         effort: Option<String>,
+        max_output_tokens: u32,
         timeout_seconds: u64,
     ) -> Result<Self> {
         Ok(Self {
             http: Http::new(base, "chat/completions", &key, timeout_seconds)?,
             model,
             effort,
+            max_output_tokens,
         })
     }
     fn body(&self, request: &ModelRequest<'_>) -> Result<Value> {
@@ -38,7 +48,7 @@ impl Glm {
             })
             .collect();
         let mut body = json!({"model":self.model,"messages":messages,"tools":tools,"stream":false,
-            "max_tokens":4096,"thinking":{"type":"enabled","clear_thinking":false}});
+            "max_tokens":self.max_output_tokens,"thinking":{"type":"enabled","clear_thinking":false}});
         if let Some(effort) = &self.effort {
             body["reasoning_effort"] = json!(effort);
         }
@@ -46,6 +56,9 @@ impl Glm {
     }
 }
 impl Provider for Glm {
+    fn max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
+    }
     fn validate_history(&self, messages: &[Value]) -> Result<()> {
         history(messages).map(|_| ())
     }
