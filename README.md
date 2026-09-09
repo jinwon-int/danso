@@ -41,7 +41,9 @@ The model adapter is mock-tested; live provider acceptance remains pending.
 See [the opt-in live acceptance workflow](docs/live-acceptance.md) for the
 scenario, offline verification and authorized execution command.
 Choose GPT or GLM with `--provider openai` / `--provider glm`; see
-[provider configuration and examples](docs/providers.md).
+[provider configuration and examples](docs/providers.md). For the Z.AI coding
+endpoint, `scripts/danso-glm` applies the documented glm-5.3-flash profile
+(`--glm-endpoint`, `--glm-thinking` are also available as plain flags).
 
 ## Supervised first use
 

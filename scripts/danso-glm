@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# GLM profile wrapper (issue #70 C): applies the documented glm-5.3-flash
+# coding profile (docs/providers.md "GLM profiles"). Keys are only ever read
+# from the environment — never passed as argv. Extra arguments are forwarded
+# to danso after the profile flags, so a repeated flag in argv wins.
+#
+#   ZAI_API_KEY=... danso-glm --cwd /path/to/repo --session /path/s.jsonl 'do task'
+#
+# Environment:
+#   ZAI_API_KEY        (required) Z.AI API key
+#   DANSO_GLM_MODEL    optional model override (default glm-5.3-flash)
+#   DANSO_BIN          optional danso binary path
+set -euo pipefail
+
+: "${ZAI_API_KEY:?ZAI_API_KEY is required in the environment}"
+model="${DANSO_GLM_MODEL:-glm-5.3-flash}"
+here="$(cd "$(dirname "$0")" && pwd)"
+if [[ -n "${DANSO_BIN:-}" ]]; then
+    danso="$DANSO_BIN"
+elif command -v danso >/dev/null 2>&1; then
+    danso="$(command -v danso)"
+else
+    danso="$here/../target/release/danso"
+fi
+
+exec "$danso" \
+    --provider glm \
+    --model "$model" \
+    --glm-endpoint coding \
+    --reasoning-effort low \
+    --max-turns 48 \
+    --compact-at-bytes 131072 \
+    --provider-timeout-seconds 120 \
+    "$@"

@@ -52,6 +52,9 @@ pub struct RunConfig {
     /// Explicit `--max-output-tokens`; env and default resolve in
     /// `provider_from_parts` (issue #69 A).
     pub max_output_tokens: Option<u32>,
+    /// GLM-only options resolved in `provider_from_parts` (issue #70 A/B).
+    pub glm_thinking: Option<String>,
+    pub glm_endpoint: Option<String>,
     pub compact_at_bytes: Option<usize>,
     pub timeout_seconds: u64,
     pub provider_timeout_seconds: u64,
@@ -69,13 +72,18 @@ pub struct RunConfig {
 /// Build a production provider from explicit parts (shared by `danso run`
 /// and the memory drain CLI; credentials come from the environment). The
 /// output token cap resolves from the explicit flag, then
-/// `DANSO_MAX_OUTPUT_TOKENS`, then the default (issue #69 A).
+/// `DANSO_MAX_OUTPUT_TOKENS`, then the default (issue #69 A). GLM-only
+/// options (`glm_thinking` enabled|disabled, `glm_endpoint` general|coding)
+/// resolve flags → env → defaults and fail closed on conflicts (issue #70 A/B).
+#[allow(clippy::too_many_arguments)]
 pub fn provider_from_parts(
     provider: &str,
     model: &str,
     reasoning_effort: Option<&str>,
     provider_timeout_seconds: u64,
     max_output_tokens: Option<u32>,
+    glm_thinking: Option<&str>,
+    glm_endpoint: Option<&str>,
 ) -> Result<crate::provider::Selected> {
     let max_output_tokens = crate::provider::resolve_max_output_tokens(max_output_tokens)?;
     let effort = reasoning_effort.map(str::to_string);
@@ -115,12 +123,19 @@ pub fn provider_from_parts(
         "glm" => (
             "ZAI_API_KEY",
             "DANSO_GLM_BASE_URL",
-            "https://api.z.ai/api/paas/v4",
+            crate::provider::glm::GLM_GENERAL_BASE_URL,
         ),
         _ => anyhow::bail!("unsupported provider"),
     };
     let key = std::env::var(key_name).with_context(|| format!("{key_name} is required"))?;
-    let base = std::env::var(base_name).unwrap_or_else(|_| default_base.into());
+    let base = if provider == "glm" {
+        // GLM resolves the endpoint preset first so an explicit base URL can
+        // be cross-checked against it (#70 B); the default below is unused.
+        let explicit = std::env::var(base_name).ok();
+        crate::provider::glm::resolve_base_url(glm_endpoint, explicit.as_deref())?
+    } else {
+        std::env::var(base_name).unwrap_or_else(|_| default_base.into())
+    };
     match provider {
         "anthropic" => {
             ensure!(
@@ -147,16 +162,20 @@ pub fn provider_from_parts(
                 provider_timeout_seconds,
             )?,
         )),
-        "glm" => Ok(crate::provider::Selected::Glm(
-            crate::provider::glm::Glm::new_with_timeout(
-                model.to_string(),
-                key,
-                &base,
-                effort,
-                max_output_tokens,
-                provider_timeout_seconds,
-            )?,
-        )),
+        "glm" => {
+            let thinking = crate::provider::glm::resolve_thinking(glm_thinking)?;
+            Ok(crate::provider::Selected::Glm(
+                crate::provider::glm::Glm::new_with_timeout(
+                    model.to_string(),
+                    key,
+                    &base,
+                    effort,
+                    max_output_tokens,
+                    thinking,
+                    provider_timeout_seconds,
+                )?,
+            ))
+        }
         _ => anyhow::bail!("unsupported provider"),
     }
 }
@@ -365,6 +384,8 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         args.reasoning_effort.as_deref(),
         args.provider_timeout_seconds,
         args.max_output_tokens,
+        args.glm_thinking.as_deref(),
+        args.glm_endpoint.as_deref(),
     )?;
     let limits =
         tools::resource_limits(args.backend, Duration::from_secs(args.tool_timeout_seconds));
