@@ -1,6 +1,7 @@
 //! Explicit file credentials (read-only or adopted managed store) and bounded SSE.
 //! No credential discovery, model-request retry, or delegated agent execution.
 use super::http::Http;
+use crate::failure::{ProviderReason, provider_context, provider_error};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -80,10 +81,14 @@ fn completed_prefix(data: &[u8]) -> Result<Option<usize>> {
 }
 
 fn terminal_response(data: &[u8]) -> Result<Value> {
-    parse_events(data)?.context("ChatGPT SSE ended without completed response")
+    parse_events(data)?.ok_or_else(|| provider_error(ProviderReason::StreamEnded))
 }
 
 fn parse_events(data: &[u8]) -> Result<Option<Value>> {
+    parse_events_inner(data).map_err(provider_context(ProviderReason::InvalidStream))
+}
+
+fn parse_events_inner(data: &[u8]) -> Result<Option<Value>> {
     let text =
         std::str::from_utf8(data).map_err(|_| anyhow::anyhow!("invalid ChatGPT SSE encoding"))?;
     let normalized = text.replace("\r\n", "\n");
@@ -108,10 +113,9 @@ fn parse_events(data: &[u8]) -> Result<Option<Value>> {
         }
         let payload = payload.join("\n");
         if payload == "[DONE]" {
-            ensure!(
-                terminal.is_some(),
-                "ChatGPT SSE ended without completed response"
-            );
+            if terminal.is_none() {
+                return Err(provider_error(ProviderReason::StreamEnded));
+            }
             continue;
         }
         ensure!(
@@ -175,8 +179,10 @@ fn parse_events(data: &[u8]) -> Result<Option<Value>> {
                     "duplicate ChatGPT output index"
                 );
             }
-            "error" | "response.failed" | "response.incomplete" => {
-                bail!("ChatGPT response failed or incomplete")
+            "error" => return Err(provider_error(ProviderReason::ResponseError)),
+            "response.failed" => return Err(provider_error(ProviderReason::ResponseFailed)),
+            "response.incomplete" => {
+                return Err(provider_error(ProviderReason::ResponseIncomplete));
             }
             "response.created"
             | "response.in_progress"
@@ -195,7 +201,7 @@ fn parse_events(data: &[u8]) -> Result<Option<Value>> {
             | "response.reasoning_text.done"
             | "response.refusal.delta"
             | "response.refusal.done" => {}
-            _ => bail!("unsupported ChatGPT SSE event"),
+            _ => return Err(provider_error(ProviderReason::UnsupportedStreamEvent)),
         }
     }
     Ok(terminal)

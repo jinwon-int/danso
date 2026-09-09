@@ -192,6 +192,9 @@ fn main() {
                         if let Some(diagnostic) = failure::transport(&e) {
                             failure::report_transport(diagnostic);
                         }
+                        if let Some(diagnostic) = failure::provider(&e) {
+                            failure::report_provider(diagnostic);
+                        }
                         code
                     },
                     Err(_) => { eprintln!("run timed out"); failure::report(Kind::RunTimeout, 124); 124 },
