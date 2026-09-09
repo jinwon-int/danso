@@ -103,6 +103,38 @@ pub fn resolve_max_output_tokens(explicit: Option<u32>) -> Result<u32> {
     Ok(value)
 }
 
+/// Bounded provider wire retries (issue #67 B): default 3, max 5, 0 disables.
+pub const PROVIDER_RETRIES_DEFAULT: u32 = 3;
+pub const PROVIDER_RETRIES_MAX: u32 = 5;
+
+/// Resolve the retry budget from an explicit flag value, the
+/// `DANSO_PROVIDER_RETRIES` environment variable, or the default. Fail
+/// closed on out-of-range or unparseable configuration.
+pub fn resolve_provider_retries(explicit: Option<u32>) -> Result<u32> {
+    let from_env = || -> Result<Option<u32>> {
+        let Some(raw) = std::env::var_os("DANSO_PROVIDER_RETRIES") else {
+            return Ok(None);
+        };
+        let raw = raw.to_string_lossy().trim().to_string();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let value: u32 = raw
+            .parse()
+            .map_err(|_| anyhow::anyhow!("DANSO_PROVIDER_RETRIES must be an integer"))?;
+        Ok(Some(value))
+    };
+    let value = match explicit {
+        Some(value) => value,
+        None => from_env()?.unwrap_or(PROVIDER_RETRIES_DEFAULT),
+    };
+    anyhow::ensure!(
+        value <= PROVIDER_RETRIES_MAX,
+        "provider retries must be 0..={PROVIDER_RETRIES_MAX}"
+    );
+    Ok(value)
+}
+
 /// Responses are terminal Pi-compatible assistant messages. An adapter validates
 /// its wire response before returning, bounds network I/O, and marks dispatch
 /// in Usage only after local request validation. No session/tool side effects.
@@ -156,6 +188,17 @@ impl Provider for Selected {
             Self::Anthropic(p) => p.complete(request, usage).await,
             Self::OpenAi(p) => p.complete(request, usage).await,
             Self::Glm(p) => p.complete(request, usage).await,
+        }
+    }
+}
+
+impl Selected {
+    /// Bounded wire-retry budget (issue #67 B); 0 disables.
+    pub fn set_retries(&mut self, retries: u32) {
+        match self {
+            Self::Anthropic(p) => p.set_retries(retries),
+            Self::OpenAi(p) => p.set_retries(retries),
+            Self::Glm(p) => p.set_retries(retries),
         }
     }
 }

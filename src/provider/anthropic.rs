@@ -48,6 +48,10 @@ impl Anthropic {
             max_output_tokens,
         })
     }
+    /// Bounded wire-retry budget (issue #67 B); 0 disables.
+    pub fn set_retries(&mut self, retries: u32) {
+        self.http.set_retries(retries);
+    }
     fn body(&self, request: &ModelRequest<'_>) -> Result<Value> {
         let mut definitions: Vec<Value> = request
             .tools

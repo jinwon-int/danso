@@ -495,7 +495,7 @@ fn drain_command(
     max_jobs: usize,
 ) -> anyhow::Result<Option<Value>> {
     let max_output_tokens = danso::provider::resolve_max_output_tokens(None)?;
-    let selected = danso::app::provider_from_parts(
+    let mut selected = danso::app::provider_from_parts(
         provider,
         model,
         None,
@@ -504,6 +504,7 @@ fn drain_command(
         None,
         None,
     )?;
+    selected.set_retries(danso::provider::resolve_provider_retries(None)?);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

@@ -106,6 +106,10 @@ impl Glm {
             thinking,
         })
     }
+    /// Bounded wire-retry budget (issue #67 B); 0 disables.
+    pub fn set_retries(&mut self, retries: u32) {
+        self.http.set_retries(retries);
+    }
     fn body(&self, request: &ModelRequest<'_>) -> Result<Value> {
         let mut messages = vec![json!({"role":"system","content":request.system.joined()})];
         messages.extend(history(request.messages)?);

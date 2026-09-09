@@ -323,7 +323,7 @@ class Acceptance(unittest.TestCase):
 
     def test_provider_error_and_config_error_contract(self):
         self.responses.append((429, {'error': 'do-not-print-provider-body'}))
-        p = self.run_cli('-p')
+        p = self.run_cli('-p', '--provider-retries', '0')
         self.assertEqual(p.returncode, 3, p.stderr)
         self.assertEqual(p.stdout, '')
         self.assertNotIn('do-not-print-provider-body', p.stderr)
@@ -400,6 +400,27 @@ class Acceptance(unittest.TestCase):
             self.requests[1]['system'][1]['text'],
             'volatile budget guidance must change as remaining drops')
 
+
+
+    def test_provider_retry_recovers_transient_429_then_succeeds(self):
+        # Issue #67 B: a 429 retries within the bounded budget and the run
+        # completes; exactly one extra wire attempt is made.
+        self.responses.append((429, {'error': 'synthetic-rate-limit'}))
+        self.final()
+        p = self.run_cli('-p')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.requests), 2)
+
+    def test_transport_attempts_surface_after_retry_budget_exhausted(self):
+        # Transport failures retry too; the diagnostic names the attempts.
+        self.env['DANSO_ANTHROPIC_BASE_URL'] = 'http://127.0.0.1:1/v1'
+        p = self.run_cli('-p', '--provider-retries', '1')
+        self.assertEqual(p.returncode, 3, p.stderr)
+        transports = [l for l in p.stderr.splitlines() if l.startswith('DANSO_TRANSPORT=')]
+        self.assertEqual(len(transports), 1, p.stderr)
+        record = json.loads(transports[0].split('=', 1)[1])
+        self.assertEqual(record['attempts'], 2)
+        self.assertEqual(record['phase'], 'connect')
 
     def test_length_stop_reports_max_tokens_diagnostic_and_cap(self):
         # Issue #69 B: stop_reason=max_tokens with no tool calls is a provider

@@ -508,7 +508,7 @@ class Compaction(fixture.Fixture):
                 response,
                 (200, reply('glm', text=json.dumps(SUMMARY))),
             ])
-            p = self.run_cli('glm')
+            p = self.run_cli('glm', '--provider-retries', '0')
             self.assertEqual(p.returncode, 3, p.stderr)
             self.assertEqual(len(self.requests) - before, 2)
             self.assertEqual(len(self.checkpoints()), 0)
@@ -676,7 +676,8 @@ class Compaction(fixture.Fixture):
                     time.sleep(1.2)
                     return reply(provider)
                 self.responses.append((200, delayed))
-                p = self.run_cli(provider, '--provider-timeout-seconds', seconds)
+                p = self.run_cli(provider, '--provider-timeout-seconds', seconds,
+                                 '--provider-retries', '0')
                 self.assertEqual(p.returncode, expected, p.stderr)
                 self.assertEqual(len(self.requests), before + 1)
                 if expected:
@@ -708,7 +709,8 @@ class Compaction(fixture.Fixture):
                     time.sleep(1.2)
                 return response
             self.responses[:] = [(200, serve)] * 50
-            p = self.run_cli(provider, '--provider-timeout-seconds', '1')
+            p = self.run_cli(provider, '--provider-timeout-seconds', '1',
+                             '--provider-retries', '0')
             self.assertEqual(p.returncode, 3, p.stderr)
             self.assertIn('timed out', p.stderr)
             self.assertEqual(state['summaries'], 1)

@@ -204,7 +204,7 @@ class Providers(Fixture):
                     self.session = self.root / f'http-{len(self.requests)}.jsonl'
                     count = len(self.requests)
                     self.responses.append((status, body))
-                    p = self.run_cli(provider)
+                    p = self.run_cli(provider, '--provider-retries', '0')
                     self.assertEqual(p.returncode, 3, p.stderr)
                     self.assertEqual(len(self.requests), count + 1)
                     self.assertNotIn('SENSITIVE_BODY', p.stderr)

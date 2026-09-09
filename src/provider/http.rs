@@ -8,6 +8,7 @@ pub struct Http {
     url: reqwest::Url,
     header: reqwest::header::HeaderName,
     key: reqwest::header::HeaderValue,
+    retries: u32,
 }
 impl Http {
     /// Bearer-authenticated transport (OpenAI, GLM).
@@ -87,7 +88,14 @@ impl Http {
             url,
             header,
             key,
+            retries: 0,
         })
+    }
+
+    /// Bounded wire-level retry budget (issue #67 B): 0 disables; the
+    /// default construction leaves retries off until configured.
+    pub fn set_retries(&mut self, retries: u32) {
+        self.retries = retries;
     }
     pub async fn post(&self, body: &Value, usage: &mut crate::usage::Usage) -> Result<Value> {
         let bytes = self
@@ -119,34 +127,61 @@ impl Http {
             "request context exceeds 512 KiB; start a new session"
         );
         let request_bytes = bytes.len();
-        let request = self
-            .client
-            .post(self.url.clone())
-            .headers(headers)
-            .header(self.header.clone(), self.key.clone())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(bytes)
-            .build()
-            .map_err(|_| anyhow::anyhow!("could not construct provider request"))?;
-        usage.attempted = true;
+        // Bounded retries (issue #67 B): only before any effect — connect /
+        // pre-header transport failures and retryable HTTP statuses (429,
+        // 500, 502, 503, 504). Response-body failures never retry, because a
+        // partial response may already have been consumed.
+        let attempts = self.retries.saturating_add(1);
+        let mut attempt: u32 = 0;
         let started = Instant::now();
-        let mut response = self.client.execute(request).await.map_err(|error| {
-            let phase = if error.is_connect() {
-                "connect"
-            } else {
-                "before_response_headers"
+        let mut response = loop {
+            attempt += 1;
+            usage.attempted = true;
+            let request = self
+                .client
+                .post(self.url.clone())
+                .headers(headers.clone())
+                .header(self.header.clone(), self.key.clone())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(bytes.clone())
+                .build()
+                .map_err(|_| anyhow::anyhow!("could not construct provider request"))?;
+            let attempt_started = Instant::now();
+            let response = match self.client.execute(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    let phase = if error.is_connect() {
+                        "connect"
+                    } else {
+                        "before_response_headers"
+                    };
+                    let diagnostic =
+                        transport_error(&error, phase, attempt_started, request_bytes, attempt);
+                    let retryable = crate::failure::transport(&diagnostic)
+                        .is_some_and(retryable_transport_phase);
+                    if attempt < attempts && retryable {
+                        tokio::time::sleep(retry_delay(attempt, None)).await;
+                        continue;
+                    }
+                    return Err(diagnostic);
+                }
             };
-            transport_error(&error, phase, started, request_bytes)
-        })?;
-        if !response.status().is_success() {
-            return Err(crate::failure::http_status_error(response.status()));
-        }
+            if !response.status().is_success() {
+                let status = response.status();
+                let retry_after = retry_after_seconds(response.headers());
+                if attempt < attempts && retryable_status(status.as_u16()) {
+                    drop(response);
+                    tokio::time::sleep(retry_delay(attempt, retry_after)).await;
+                    continue;
+                }
+                return Err(crate::failure::http_status_error(status));
+            }
+            break response;
+        };
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| transport_error(&error, "response_body", started, request_bytes))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            transport_error(&error, "response_body", started, request_bytes, attempt)
+        })? {
             if bytes.len() + chunk.len() > 1024 * 1024 {
                 return Err(crate::failure::provider_error(
                     crate::failure::ProviderReason::ResponseTooLarge,
@@ -170,6 +205,7 @@ fn transport_error(
     phase: &'static str,
     started: Instant,
     request_bytes: usize,
+    attempts: u32,
 ) -> anyhow::Error {
     let phase = match phase {
         "connect" => crate::failure::TransportPhase::Connect,
@@ -184,7 +220,8 @@ fn transport_error(
         elapsed_ms,
         request_bytes,
         error.is_timeout(),
-    );
+    )
+    .with_attempts(attempts);
     crate::failure::at(if error.is_timeout() {
         crate::failure::Kind::ProviderTimeout
     } else {
@@ -345,5 +382,82 @@ mod tests {
         );
         let rendered = error.to_string();
         assert!(!rendered.contains("PRIVATE") && !rendered.contains(&base));
+    }
+}
+
+/// Retryable provider statuses (issue #67 B): quota/rate limiting and the
+/// classic transient server errors. Other 4xx never retry.
+fn retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Only failures before any response byte was consumed retry; a
+/// response-body failure may already have delivered partial content.
+fn retryable_transport_phase(diagnostic: &crate::failure::TransportDiagnostic) -> bool {
+    diagnostic.phase() != crate::failure::TransportPhase::ResponseBody
+}
+
+/// `Retry-After` in seconds, capped at 60s; HTTP-date forms are ignored.
+fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let seconds: u64 = raw.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds.min(60)))
+}
+
+/// Exponential backoff 1s -> 4s -> 16s with roughly +-25% jitter; a
+/// Retry-After hint (already capped) replaces the schedule outright.
+fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    if let Some(delay) = retry_after {
+        return delay;
+    }
+    const SCHEDULE_MS: [u64; 3] = [1_000, 4_000, 16_000];
+    let base = SCHEDULE_MS[(attempt.max(1) as usize - 1).min(SCHEDULE_MS.len() - 1)];
+    let spread = (base / 4).max(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    Duration::from_millis(base - spread / 2 + nanos % spread)
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn retryable_status_set_is_closed_and_transient_only() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(retryable_status(status), "{status} must retry");
+        }
+        for status in [400, 401, 403, 404, 418, 302, 200] {
+            assert!(!retryable_status(status), "{status} must not retry");
+        }
+    }
+
+    #[test]
+    fn backoff_schedule_stays_within_jitter_bounds() {
+        for (attempt, base) in [(1u32, 1_000u64), (2, 4_000), (3, 16_000), (9, 16_000)] {
+            let delay = retry_delay(attempt, None);
+            let ms = delay.as_millis() as u64;
+            assert!(
+                ms >= base - base / 4 && ms <= base + base / 4,
+                "attempt {attempt}: {ms}ms outside ±25% of {base}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_is_respected_and_capped_at_sixty_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_seconds(&headers), None);
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers), Some(Duration::from_secs(7)));
+        headers.insert(reqwest::header::RETRY_AFTER, "999".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers), Some(Duration::from_secs(60)));
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "http-date-form".parse().unwrap(),
+        );
+        assert_eq!(retry_after_seconds(&headers), None);
     }
 }

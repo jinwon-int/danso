@@ -48,6 +48,7 @@ pub struct TransportDiagnostic {
     elapsed_ms: u64,
     request_bytes: u64,
     timed_out: bool,
+    attempts: u32,
 }
 
 impl TransportDiagnostic {
@@ -62,7 +63,19 @@ impl TransportDiagnostic {
             elapsed_ms,
             request_bytes,
             timed_out,
+            attempts: 1,
         }
+    }
+
+    /// Wire attempts made before this diagnostic fired (issue #67 B): 1 on
+    /// the first try, more when bounded retries ran.
+    pub fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    pub(crate) fn with_attempts(mut self, attempts: u32) -> Self {
+        self.attempts = attempts;
+        self
     }
 
     pub fn phase(&self) -> TransportPhase {
@@ -265,6 +278,7 @@ pub fn report_transport(diagnostic: &TransportDiagnostic) {
             "phase": diagnostic.phase.as_str(),
             "elapsed_ms": diagnostic.elapsed_ms,
             "request_bytes": diagnostic.request_bytes,
+            "attempts": diagnostic.attempts,
         })
     );
 }

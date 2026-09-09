@@ -512,13 +512,14 @@ class TransportDiagnostics(unittest.IsolatedAsyncioTestCase):
     def test_valid_transport_is_attached_only_to_matching_provider_failure(self):
         record = json.dumps({
             'version': 1, 'phase': 'response_body', 'elapsed_ms': 180001,
-            'request_bytes': 30502,
+            'request_bytes': 30502, 'attempts': 1,
         }, separators=(',', ':'))
         stderr = (f'DANSO_ERROR={{"version":1,"category":"provider_timeout","exit_code":3}}\n'
                   f'DANSO_TRANSPORT={record}\n').encode()
         event = _failure(stderr, 3)
         self.assertEqual(event.code, 'danso_provider_timeout')
-        self.assertIn('phase=response_body, elapsed_ms=180001, request_bytes=30502', event.message)
+        self.assertIn('phase=response_body, elapsed_ms=180001, request_bytes=30502, attempts=1',
+                      event.message)
         self.assertNotIn('DANSO_TRANSPORT', event.message)
         self.assertIsNone(_transport(stderr.decode(), 'provider_timeout', 2))
 
@@ -538,7 +539,10 @@ class TransportDiagnostics(unittest.IsolatedAsyncioTestCase):
             '{"version":1,"phase":"response_body","elapsed_ms":true,"request_bytes":1}',
             '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":524289}',
             '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"request_bytes":2}',
+            '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"attempts":0}',
+            '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"attempts":"1"}',
             '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1',
+
         ]
         for record in records:
             with self.subTest(record=record):
