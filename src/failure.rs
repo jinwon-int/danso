@@ -127,6 +127,78 @@ pub fn transport(error: &Error) -> Option<&TransportDiagnostic> {
         .find_map(|cause| cause.downcast_ref::<TransportDiagnostic>())
 }
 
+/// Closed vocabulary: never populate diagnostics from provider-controlled text.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReason {
+    HttpStatus,
+    InvalidJson,
+    ResponseTooLarge,
+    StreamEnded,
+    InvalidStream,
+    UnsupportedStreamEvent,
+    ResponseFailed,
+    ResponseIncomplete,
+    ResponseError,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderDiagnostic {
+    reason: ProviderReason,
+    http_status: Option<u16>,
+}
+
+impl fmt::Display for ProviderDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "provider response failure: {:?}", self.reason)?;
+        if let Some(status) = self.http_status {
+            write!(f, " HTTP {status}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProviderDiagnostic {}
+
+pub fn provider(error: &Error) -> Option<&ProviderDiagnostic> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderDiagnostic>())
+}
+
+pub fn provider_error(reason: ProviderReason) -> Error {
+    Error::new(ProviderDiagnostic {
+        reason,
+        http_status: None,
+    })
+}
+
+pub fn http_status_error(status: reqwest::StatusCode) -> Error {
+    Error::new(ProviderDiagnostic {
+        reason: ProviderReason::HttpStatus,
+        http_status: Some(status.as_u16()),
+    })
+}
+
+pub fn provider_context(reason: ProviderReason) -> impl FnOnce(Error) -> Error {
+    move |error| {
+        if provider(&error).is_some() || transport(&error).is_some() {
+            error
+        } else {
+            provider_error(reason)
+        }
+    }
+}
+
+pub fn report_provider(diagnostic: &ProviderDiagnostic) {
+    eprintln!(
+        "DANSO_PROVIDER={}",
+        serde_json::json!({
+            "version": 1, "reason": diagnostic.reason, "http_status": diagnostic.http_status,
+        })
+    );
+}
+
 pub fn at(kind: Kind) -> impl FnOnce(Error) -> Error {
     move |error| {
         if category(&error).is_some() {
@@ -164,6 +236,31 @@ pub fn report_transport(diagnostic: &TransportDiagnostic) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_diagnostic_survives_category_without_copying_error_text() {
+        let error = provider_context(ProviderReason::InvalidStream)(anyhow::anyhow!("PRIVATE"));
+        let error = at(Kind::Provider)(error).context("outer PRIVATE context");
+        let error = provider_context(ProviderReason::ResponseError)(error);
+        assert_eq!(category(&error), Some(Kind::Provider));
+        assert_eq!(
+            provider(&error).unwrap().reason,
+            ProviderReason::InvalidStream
+        );
+        assert_eq!(
+            serde_json::to_value(provider(&error).unwrap()).unwrap(),
+            serde_json::json!({"reason":"invalid_stream", "http_status":null})
+        );
+        let transport_error = Error::new(TransportDiagnostic::new(
+            TransportPhase::ResponseBody,
+            1,
+            1,
+            false,
+        ));
+        let error = provider_context(ProviderReason::InvalidStream)(transport_error);
+        assert!(provider(&error).is_none());
+        assert!(transport(&error).is_some());
+    }
+
     #[test]
     fn typed_categories_survive_context_and_ignore_untrusted_text() {
         let error = anyhow::anyhow!("PRIVATE provider_timeout compaction request_budget");

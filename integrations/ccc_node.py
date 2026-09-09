@@ -97,6 +97,12 @@ FAILURE_CATEGORIES = {
 }
 TRANSPORT_PHASES = {'connect', 'before_response_headers', 'response_body'}
 TRANSPORT_KEYS = {'version', 'phase', 'elapsed_ms', 'request_bytes'}
+PROVIDER_REASONS = {
+    'http_status', 'invalid_json', 'response_too_large', 'stream_ended',
+    'invalid_stream', 'unsupported_stream_event', 'response_failed',
+    'response_incomplete', 'response_error',
+}
+PROVIDER_KEYS = {'version', 'reason', 'http_status'}
 TASK_PROGRESS_STATES = {'checkpoint', 'paused', 'completed', 'blocked'}
 TASK_PROGRESS_KEYS = {
     'version', 'state', 'stage', 'requests', 'reported_tokens', 'elapsed_seconds',
@@ -199,6 +205,33 @@ def _unique_object(pairs):
             raise ValueError('duplicate diagnostic key')
         result[key] = value
     return result
+
+
+def _provider_detail(text, category, code):
+    """Accept only one native, bounded diagnostic; never relay provider text."""
+    if category != 'provider' or code != 3:
+        return ''
+    lines = [line[len('DANSO_PROVIDER='):] for line in text.splitlines()
+             if line.startswith('DANSO_PROVIDER=')]
+    if len(lines) != 1:
+        return ''
+    try:
+        value = json.loads(lines[0], object_pairs_hook=_unique_object)
+        if (type(value) is not dict or set(value) != PROVIDER_KEYS
+                or type(value['version']) is not int or value['version'] != 1
+                or type(value['reason']) is not str or value['reason'] not in PROVIDER_REASONS):
+            return ''
+        status = value['http_status']
+        if value['reason'] == 'http_status':
+            # reqwest StatusCode accepts all three-digit codes, including extensions.
+            if type(status) is not int or not 100 <= status <= 999 or 200 <= status <= 299:
+                return ''
+            return f", reason=http_status, http_status={status}"
+        if status is not None:
+            return ''
+        return f", reason={value['reason']}"
+    except (ValueError, TypeError, RecursionError):
+        return ''
 
 
 def _transport(text, category, code):
@@ -336,9 +369,10 @@ def _failure(stderr, code):
     transport = _transport(text, category, code)
     transport_detail = '' if transport is None else (
         f', phase={transport[0]}, elapsed_ms={transport[1]}, request_bytes={transport[2]}')
+    provider_detail = _provider_detail(text, category, code)
     label = 'timeout' if category == 'run_timeout' else category
     return ErrorEvent(code='danso_' + label, message=(
-        f'Worker failed: category={category}, exit_code={code}{counts}{transport_detail}. '
+        f'Worker failed: category={category}, exit_code={code}{counts}{transport_detail}{provider_detail}. '
         'Reported usage may omit failed requests; not a total attempt count. No automatic replay.'))
 
 
@@ -801,7 +835,7 @@ class DansoSession:
             events.append(failure)
         else:
             if any(line.startswith(prefix) for line in stderr.splitlines()
-                   for prefix in (b'DANSO_ERROR=', b'DANSO_TRANSPORT=')):
+                   for prefix in (b'DANSO_ERROR=', b'DANSO_TRANSPORT=', b'DANSO_PROVIDER=')):
                 raise ValueError('failure diagnostic on successful exit')
             text = stdout.decode('utf-8').strip()
             usage = _usage(stderr.decode('utf-8'))

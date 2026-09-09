@@ -189,14 +189,37 @@ class ChatGPT(Fixture):
                  b'event: response.failed\n' + good,
                  b'data: {"type":"response.output_item.done","item":{"type":"function_call"}}\n\n',
                  b'x' * (1024 * 1024 + 1)]
+        reasons = ['invalid_stream', 'stream_ended', 'response_failed',
+                   'unsupported_stream_event', 'invalid_stream', 'invalid_stream',
+                   'response_too_large']
         for i, data in enumerate(cases):
             with self.subTest(i=i):
                 self.session = self.root / f'failure{i}.jsonl'
                 self.responses = [(200, data)]
                 p = self.invoke()
                 self.assertNotEqual(p.returncode, 0)
+                self.assert_diagnostic(p, reasons[i])
                 self.assertFalse((self.repo / 'unsafe').exists())
                 self.assert_private(p)
+
+    def assert_diagnostic(self, process, reason, status=None):
+        lines = [line.split('=', 1)[1] for line in process.stderr.splitlines()
+                 if line.startswith('DANSO_PROVIDER=')]
+        self.assertEqual(len(lines), 1, process.stderr)
+        self.assertEqual(json.loads(lines[0]), {
+            'version': 1, 'reason': reason, 'http_status': status})
+        self.assertEqual(process.returncode, 3)
+
+    def test_terminal_failure_diagnostics_are_body_free(self):
+        for kind, reason in [('error', 'response_error'),
+                             ('response.incomplete', 'response_incomplete')]:
+            self.session = self.root / f'{reason}.jsonl'
+            self.responses = [(200, ('data: ' + json.dumps({
+                'type': kind, 'error': 'REFRESH_SECRET'}) + '\n\n').encode())]
+            self.assert_diagnostic(self.invoke(), reason)
+        self.session = self.root / 'ended.jsonl'
+        self.responses = [(200, b'data: {"type":"response.created"}\n\n')]
+        self.assert_diagnostic(self.invoke(), 'stream_ended')
 
     def test_http_errors_no_retry_or_body_leak(self):
         for status in (401, 403, 429, 500, 302):
@@ -205,6 +228,7 @@ class ChatGPT(Fixture):
             before = len(self.requests)
             p = self.invoke()
             self.assertNotEqual(p.returncode, 0)
+            self.assert_diagnostic(p, 'http_status', status)
             self.assertEqual(len(self.requests), before + 1)
             self.assert_private(p)
 

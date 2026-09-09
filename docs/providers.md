@@ -300,3 +300,30 @@ refresh token or delete a pending marker to force another exchange. Recovery
 from an ambiguous remote rotation requires fresh authentication, not a guessed
 local rollback. Operational adoption and rollout are separate from synthetic
 fixture tests and require the operator-authorized scope.
+
+
+HTTP status and ChatGPT SSE failures may additionally emit:
+
+```text
+DANSO_PROVIDER={"version":1,"reason":"http_status","http_status":429}
+```
+
+The exact keys are `version`, `reason`, and `http_status`. Reasons are the
+closed native enum `http_status`, `invalid_json`, `response_too_large`,
+`stream_ended`, `invalid_stream`, `unsupported_stream_event`, `response_failed`,
+`response_incomplete`, and `response_error`. `http_status` is a non-2xx,
+three-digit status accepted by reqwest (100..999), and is null for every other
+reason. No response body, remote error code/message, URL, or credential is
+copied into this record. `invalid_stream` includes malformed or inconsistent
+SSE frames and terminal responses; `stream_ended` means no completed response
+was present at a valid stream boundary or at `[DONE]`.
+
+The adapter accepts exactly one valid record only with category `provider` and
+exit code 3. Missing, malformed, duplicate, or inconsistent optional records
+are ignored. Any reserved failure record on exit 0 is an adapter error.
+Older binaries remain supported without the extra detail. Usage counts and
+terminal failure behavior are unchanged; there is no automatic replay or new
+retry. These fields describe the observed failure, not its underlying cause;
+previous failures without this metadata cannot be diagnosed retroactively.
+Auth-store errors and other response-processing failures may still carry only
+the existing category.

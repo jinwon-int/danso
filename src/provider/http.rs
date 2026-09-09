@@ -1,5 +1,5 @@
 //! Bounded, credential-safe transport shared by the Bearer-authenticated adapters.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -93,7 +93,9 @@ impl Http {
         let bytes = self
             .post_bytes(body, usage, reqwest::header::HeaderMap::new())
             .await?;
-        serde_json::from_slice(&bytes).context("invalid provider JSON")
+        serde_json::from_slice(&bytes).map_err(|_| {
+            crate::failure::provider_error(crate::failure::ProviderReason::InvalidJson)
+        })
     }
     pub async fn post_bytes(
         &self,
@@ -136,21 +138,20 @@ impl Http {
             };
             transport_error(&error, phase, started, request_bytes)
         })?;
-        ensure!(
-            response.status().is_success(),
-            "provider request failed: HTTP {}",
-            response.status().as_u16()
-        );
+        if !response.status().is_success() {
+            return Err(crate::failure::http_status_error(response.status()));
+        }
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|error| transport_error(&error, "response_body", started, request_bytes))?
         {
-            ensure!(
-                bytes.len() + chunk.len() <= 1024 * 1024,
-                "provider response exceeds 1 MiB"
-            );
+            if bytes.len() + chunk.len() > 1024 * 1024 {
+                return Err(crate::failure::provider_error(
+                    crate::failure::ProviderReason::ResponseTooLarge,
+                ));
+            }
             bytes.extend_from_slice(&chunk);
             if let Some(end) = terminal(&bytes)? {
                 ensure!(end <= bytes.len(), "invalid terminal response boundary");

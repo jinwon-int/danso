@@ -147,8 +147,8 @@ Caller-initiated interruption still takes precedence as `danso_cancelled`.
 It validates the version, exact fields, allowed enum, and matching nonzero exit
 code. Missing/duplicate/malformed/unknown diagnostics fall back to `danso_failed`
 (or the existing exit-124 timeout); arbitrary error text is never forwarded.
-The error message includes only the enum, numeric exit code and valid matching
-usage counters. `reported_requests` counts accumulated provider usage records,
+The error message includes only validated native enums, numeric exit code,
+optional transport/provider details, and valid matching usage counters. `reported_requests` counts accumulated provider usage records,
 not every attempted HTTP request; reported tokens may omit failed/unreported
 requests. No cost is inferred. Errors never become completion events or retries.
 
@@ -164,3 +164,30 @@ ccc-node contract in `tests/fixtures/ccc_node/`; its README records provenance.
 `CCC_NODE_SOURCE=/path/to/ccc-node python3 scripts/test_ccc_node.py` checks the
 same suite against that checkout's real contract. No Telegram send, provider
 API call, service restart or fleet change is part of this suite.
+
+
+HTTP status and ChatGPT SSE failures may additionally emit:
+
+```text
+DANSO_PROVIDER={"version":1,"reason":"http_status","http_status":429}
+```
+
+The exact keys are `version`, `reason`, and `http_status`. Reasons are the
+closed native enum `http_status`, `invalid_json`, `response_too_large`,
+`stream_ended`, `invalid_stream`, `unsupported_stream_event`, `response_failed`,
+`response_incomplete`, and `response_error`. `http_status` is a non-2xx,
+three-digit status accepted by reqwest (100..999), and is null for every other
+reason. No response body, remote error code/message, URL, or credential is
+copied into this record. `invalid_stream` includes malformed or inconsistent
+SSE frames and terminal responses; `stream_ended` means no completed response
+was present at a valid stream boundary or at `[DONE]`.
+
+The adapter accepts exactly one valid record only with category `provider` and
+exit code 3. Missing, malformed, duplicate, or inconsistent optional records
+are ignored. Any reserved failure record on exit 0 is an adapter error.
+Older binaries remain supported without the extra detail. Usage counts and
+terminal failure behavior are unchanged; there is no automatic replay or new
+retry. These fields describe the observed failure, not its underlying cause;
+previous failures without this metadata cannot be diagnosed retroactively.
+Auth-store errors and other response-processing failures may still carry only
+the existing category.
