@@ -125,6 +125,7 @@ fn input() -> RunInput<'static> {
         compact_at_bytes: None,
         refresh_context: None,
         long_task: None,
+        repeat_limit: 0,
         pause_requested: None,
     }
 }

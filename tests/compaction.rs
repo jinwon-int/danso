@@ -98,6 +98,7 @@ async fn checkpoint_persistence_failure_prevents_next_provider_request() {
             compact_at_bytes: Some(8192),
             refresh_context: None,
             long_task: None,
+            repeat_limit: 0,
             pause_requested: None,
         },
         &mut provider,

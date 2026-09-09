@@ -55,6 +55,8 @@ pub struct RunConfig {
     /// GLM-only options resolved in `provider_from_parts` (issue #70 A/B).
     pub glm_thinking: Option<String>,
     pub glm_endpoint: Option<String>,
+    /// Short-mode identical-batch guard (issue #70 D); 0 disables.
+    pub repeat_limit: u32,
     pub compact_at_bytes: Option<usize>,
     pub timeout_seconds: u64,
     pub provider_timeout_seconds: u64,
@@ -184,6 +186,10 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     ensure!(
         (1..=128).contains(&args.max_turns),
         "max-turns must be 1..128"
+    );
+    ensure!(
+        args.repeat_limit == 0 || (2..=8).contains(&args.repeat_limit),
+        "repeat-limit must be 0 or 2..=8"
     );
     ensure!(
         (1..=if args.long_task.is_some() {
@@ -458,6 +464,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
                 compact_at_bytes: args.compact_at_bytes,
                 refresh_context: refresh_context.as_deref(),
                 long_task,
+                repeat_limit: args.repeat_limit,
                 pause_requested: args.pause_requested.as_deref(),
             },
             &mut provider,
