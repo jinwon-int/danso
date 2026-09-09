@@ -67,7 +67,7 @@ impl OpenAi {
             "description":t.description,"parameters":t.parameters,"strict":false})
             })
             .collect();
-        let mut body = json!({"model":self.model,"instructions":request.system,"input":history(request.messages)?,
+        let mut body = json!({"model":self.model,"instructions":request.system.joined(),"input":history(request.messages)?,
             "tools":tools,"store":false,"include":["reasoning.encrypted_content"],"max_output_tokens":self.max_output_tokens});
         if let Some(effort) = &self.effort {
             body["reasoning"] = json!({"effort":effort});
@@ -270,7 +270,7 @@ mod image_admission_tests {
             })];
             let original = messages.clone();
             let request = ModelRequest {
-                system: "synthetic instructions",
+                system: crate::provider::SystemParts::single("synthetic instructions"),
                 messages: &messages,
                 tools: &[],
             };

@@ -49,12 +49,28 @@ impl Anthropic {
         })
     }
     fn body(&self, request: &ModelRequest<'_>) -> Result<Value> {
-        let definitions: Vec<Value> = request
+        let mut definitions: Vec<Value> = request
             .tools
             .iter()
             .map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.parameters}))
             .collect();
-        let body = json!({"model":self.model,"max_tokens":self.max_output_tokens,"system":request.system,"messages":provider_messages(request.messages)?,"tools":definitions});
+        // Issue #69 E: the stable system prefix and the last tool definition
+        // carry the two ephemeral cache marks (limit 4); the volatile budget
+        // guidance lands after the cached prefix, so only it is re-read.
+        if let Some(last_tool) = definitions.last_mut() {
+            last_tool["cache_control"] = json!({"type":"ephemeral"});
+        }
+        let mut system_blocks = Vec::<Value>::new();
+        if !request.system.stable.is_empty() {
+            system_blocks.push(json!({
+                "type":"text","text":request.system.stable,
+                "cache_control":{"type":"ephemeral"}
+            }));
+        }
+        if !request.system.volatile.is_empty() {
+            system_blocks.push(json!({"type":"text","text":request.system.volatile}));
+        }
+        let body = json!({"model":self.model,"max_tokens":self.max_output_tokens,"system":system_blocks,"messages":provider_messages(request.messages)?,"tools":definitions});
         Ok(body)
     }
 }
@@ -289,5 +305,79 @@ mod tests {
         let m = assistant(&response, "m", &t).unwrap();
         assert_eq!(m["usage"]["input"], 10);
         assert_eq!(m["usage"]["totalTokens"], 20);
+    }
+}
+
+#[cfg(test)]
+mod cache_split_tests {
+    use super::*;
+    use crate::provider::SystemParts;
+
+    /// Issue #69 E: the stable system block and the last tool definition
+    /// carry the two ephemeral marks; the volatile block stays uncached.
+    #[test]
+    fn system_split_renders_cache_marked_blocks() {
+        let adapter = Anthropic::new("m".into(), "k".into(), "https://api.example.com").unwrap();
+        let tools = vec![crate::contracts::ToolDefinition {
+            name: "read".into(),
+            description: "fixture".into(),
+            parameters: json!({"type":"object"}),
+        }];
+        let body = adapter
+            .body(&ModelRequest {
+                system: SystemParts {
+                    stable: "STABLE_PREFIX",
+                    volatile: "VOLATILE_GUIDANCE",
+                },
+                messages: std::slice::from_ref(&json!({
+                    "role":"user","content":[{"type":"text","text":"hi"}]
+                })),
+                tools: &tools,
+            })
+            .unwrap();
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0]["text"], json!("STABLE_PREFIX"));
+        assert_eq!(system[0]["cache_control"], json!({"type":"ephemeral"}));
+        assert_eq!(system[1]["text"], json!("VOLATILE_GUIDANCE"));
+        assert!(system[1].get("cache_control").is_none());
+        let wire_tools = body["tools"].as_array().unwrap();
+        assert_eq!(wire_tools[0]["cache_control"], json!({"type":"ephemeral"}));
+        // request_bytes serializes the block form, so compaction budget
+        // checks measure exactly what the adapter puts on the wire.
+        let bytes = crate::provider::Provider::request_bytes(
+            &adapter,
+            &ModelRequest {
+                system: SystemParts {
+                    stable: "STABLE_PREFIX",
+                    volatile: "VOLATILE_GUIDANCE",
+                },
+                messages: std::slice::from_ref(&json!({
+                    "role":"user","content":[{"type":"text","text":"hi"}]
+                })),
+                tools: &tools,
+            },
+        )
+        .unwrap();
+        assert!(bytes > 0);
+    }
+
+    /// No tools and no volatile tail: a single marked block, no tool mark.
+    #[test]
+    fn minimal_request_carries_only_the_system_mark() {
+        let adapter = Anthropic::new("m".into(), "k".into(), "https://api.example.com").unwrap();
+        let body = adapter
+            .body(&ModelRequest {
+                system: SystemParts::single("ONLY"),
+                messages: std::slice::from_ref(&json!({
+                    "role":"user","content":[{"type":"text","text":"hi"}]
+                })),
+                tools: &[],
+            })
+            .unwrap();
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["cache_control"], json!({"type":"ephemeral"}));
+        assert!(body["tools"].as_array().unwrap().is_empty());
     }
 }

@@ -24,6 +24,15 @@ def call(name, args, id='call1'):
     return {'type': 'tool_use', 'id': id, 'name': name, 'input': args}
 
 
+def system_text(body):
+    """Anthropic renders the #69 E system split as text blocks; OpenAI-style
+    fixtures keep a plain string."""
+    system = body['system']
+    if isinstance(system, list):
+        return ''.join(block.get('text', '') for block in system)
+    return system
+
+
 class Acceptance(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='danso-e2e-')
@@ -152,9 +161,9 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(len(self.results()), 4)
         self.assertTrue(all(not r['isError'] for r in self.results()))
         self.assertEqual([d['name'] for d in self.requests[0]['tools']], ['read', 'bash', 'edit', 'write'])
-        self.assertIn('PROJECT_SENTINEL', self.requests[0]['system'])
-        self.assertIn('SKILL_SENTINEL', self.requests[0]['system'])
-        self.assertNotIn('FULL_BODY_HIDDEN', self.requests[0]['system'])
+        self.assertIn('PROJECT_SENTINEL', system_text(self.requests[0]))
+        self.assertIn('SKILL_SENTINEL', system_text(self.requests[0]))
+        self.assertNotIn('FULL_BODY_HIDDEN', system_text(self.requests[0]))
         usage = self.usage(p)
         self.assertEqual(usage['requests'], 2)
         self.assertEqual(usage['totalTokens'], 36)
@@ -345,8 +354,52 @@ class Acceptance(unittest.TestCase):
         self.assertIn('"category":"request_budget"', errors[0])
         self.assertEqual(len(self.requests), 4)
         for body in self.requests[:3]:
-            self.assertNotIn('Identical tool batch', body['system'])
-        self.assertIn('Identical tool batch repeated 3 times', self.requests[3]['system'])
+            self.assertNotIn('Identical tool batch', system_text(body))
+        self.assertIn('Identical tool batch repeated 3 times', system_text(self.requests[3]))
+        # The cached stable prefix is byte-identical across all requests (#69 E).
+        stables = [json.dumps(r['system'][0], sort_keys=True) for r in self.requests]
+        self.assertEqual(len(set(stables)), 1)
+
+    def test_system_split_cache_marks_stable_stability_and_budget_receipt(self):
+        # Issue #69 E: the Anthropic system renders as two text blocks — the
+        # stable prefix and the volatile budget guidance — and exactly the
+        # stable block plus the last tool carry ephemeral cache marks.
+        self.final()
+        p = self.run_cli('-p')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        body = self.requests[0]
+        system = body['system']
+        self.assertIsInstance(system, list)
+        self.assertEqual(len(system), 2)
+        self.assertTrue(system[0]['text'].startswith('You are a headless coding worker'))
+        self.assertEqual(system[0]['cache_control'], {'type': 'ephemeral'})
+        self.assertTrue(system[1]['text'].startswith('Request budget:'))
+        self.assertNotIn('cache_control', system[1])
+        marked_tools = [t for t in body['tools'] if 'cache_control' in t]
+        self.assertEqual(len(marked_tools), 1)
+        self.assertEqual(marked_tools[0]['name'], 'write')
+        # Issue #69 F: one body-free budget receipt with the closed shape.
+        budgets = [l for l in p.stderr.splitlines() if l.startswith('DANSO_BUDGET=')]
+        self.assertEqual(len(budgets), 1, p.stderr)
+        self.assertEqual(json.loads(budgets[0].split('=', 1)[1]), {
+            'version': 1, 'requests_used': 1, 'requests_total': 48,
+            'summary_requests': 0, 'output_tokens_max': 16384,
+            'length_stops': 0, 'continuations': 0})
+
+    def test_cached_stable_block_is_byte_identical_across_requests(self):
+        # Two requests (tool turn + final): the marked stable block must be
+        # byte-identical; only the volatile guidance tail changes.
+        self.tool('bash', {'command': 'printf cached'})
+        p = self.run_cli('-p')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.requests), 2)
+        stable = [json.dumps(r['system'][0], sort_keys=True) for r in self.requests]
+        self.assertEqual(stable[0], stable[1])
+        self.assertNotEqual(
+            self.requests[0]['system'][1]['text'],
+            self.requests[1]['system'][1]['text'],
+            'volatile budget guidance must change as remaining drops')
+
 
     def test_length_stop_reports_max_tokens_diagnostic_and_cap(self):
         # Issue #69 B: stop_reason=max_tokens with no tool calls is a provider

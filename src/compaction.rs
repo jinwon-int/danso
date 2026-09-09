@@ -1,7 +1,7 @@
 //! Append-only model checkpoints. Summaries are historical data, never authority.
 use crate::failure::{Kind, at};
 use crate::{
-    provider::{ModelRequest, Provider},
+    provider::{ModelRequest, Provider, SystemParts},
     usage::Usage,
 };
 use anyhow::{Context, Result, ensure};
@@ -199,7 +199,7 @@ pub async fn summarize(
             let bytes = provider
                 .request_bytes(&ModelRequest {
                     // Reserve the longer repair prompt before choosing a fragment.
-                    system: &repair_system,
+                    system: SystemParts::single(&repair_system),
                     messages: &candidate,
                     tools: &[],
                 })
@@ -227,7 +227,11 @@ pub async fn summarize(
             let response = provider
                 .complete(
                     ModelRequest {
-                        system: if repairing { &repair_system } else { &system },
+                        system: SystemParts::single(if repairing {
+                            &repair_system
+                        } else {
+                            &system
+                        }),
                         messages: &input,
                         tools: &[],
                     },

@@ -49,7 +49,7 @@ pub async fn extract(
         let response = provider
             .complete(
                 crate::provider::ModelRequest {
-                    system: &system,
+                    system: crate::provider::SystemParts::single(&system),
                     messages: &messages,
                     tools: &[],
                 },
