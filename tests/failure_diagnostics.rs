@@ -118,3 +118,62 @@ async fn provider_sizing_failure_keeps_category_at_every_compaction_boundary() {
         );
     }
 }
+
+/// Issue #69 B: a terminal `length` stop with no tool calls keeps the
+/// provider category and carries the body-free `max_tokens` diagnostic with
+/// the configured cap.
+#[tokio::test]
+async fn length_stop_reports_max_tokens_diagnostic_with_cap() {
+    struct LengthStop;
+    impl Provider for LengthStop {
+        fn validate_history(&self, _: &[Value]) -> Result<()> {
+            Ok(())
+        }
+        fn max_output_tokens(&self) -> u32 {
+            12345
+        }
+        async fn complete(&mut self, _: ModelRequest<'_>, _: &mut Usage) -> Result<Value> {
+            Ok(
+                json!({"role":"assistant", "stopReason":"length", "content":[{"type":"text", "text":"PARTIAL"}]}),
+            )
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+    let mut provider = LengthStop;
+    let error = runtime::run(
+        RunInput {
+            no_tools: false,
+            prompt: "write a long report",
+            context: "",
+            execution_context: "",
+            max_turns: 2,
+            compact_at_bytes: None,
+            refresh_context: None,
+            long_task: None,
+            pause_requested: None,
+        },
+        &mut provider,
+        &EmptyExecutor,
+        &mut session,
+        &mut Sink,
+        &mut Usage::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(failure::category(&error), Some(Kind::Provider));
+    let diagnostic = failure::provider(&error).expect("max_tokens diagnostic");
+    assert_eq!(diagnostic.reason(), failure::ProviderReason::MaxTokens);
+    let record = serde_json::to_value(diagnostic).unwrap();
+    assert_eq!(record["output_tokens_max"], json!(12345));
+    assert_eq!(record["http_status"], json!(null));
+    // The journal keeps the partial assistant message for later continuation,
+    // but the error display never echoes provider-controlled text.
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"stopReason\":\"length\"")
+    );
+    assert!(!format!("{error:#}").contains("PARTIAL"));
+}

@@ -625,19 +625,37 @@ class ProviderDiagnostics(unittest.TestCase):
                        'invalid_stream', 'unsupported_stream_event', 'response_failed',
                        'response_incomplete', 'response_error'):
             record = 'DANSO_PROVIDER=' + json.dumps({
-                'version': 1, 'reason': reason, 'http_status': None})
+                'version': 1, 'reason': reason, 'http_status': None,
+                'output_tokens_max': None})
             event = self.failure(record)
             self.assertIn('reason=' + reason, event.message)
             self.assertNotIn('http_status=', event.message)
+            self.assertNotIn('output_tokens_max=', event.message)
             self.assertNotIn('PRIVATE', event.message)
         for status in (101, 302, 401, 403, 429, 500, 999):
             event = self.failure('DANSO_PROVIDER=' + json.dumps({
-                'version': 1, 'reason': 'http_status', 'http_status': status}))
+                'version': 1, 'reason': 'http_status', 'http_status': status,
+                'output_tokens_max': None}))
             self.assertIn(f'reason=http_status, http_status={status}', event.message)
             self.assertIn('No automatic replay.', event.message)
 
+    def test_max_tokens_reason_relays_only_positive_caps(self):
+        event = self.failure('DANSO_PROVIDER=' + json.dumps({
+            'version': 1, 'reason': 'max_tokens', 'http_status': None,
+            'output_tokens_max': 16384}))
+        self.assertIn('reason=max_tokens, output_tokens_max=16384', event.message)
+        self.assertIn('No automatic replay.', event.message)
+        for bad in ({'output_tokens_max': 0}, {'output_tokens_max': None},
+                    {'output_tokens_max': -1}, {'output_tokens_max': '16384'},
+                    {'http_status': 429, 'output_tokens_max': 16384}):
+            record = 'DANSO_PROVIDER=' + json.dumps({
+                'version': 1, 'reason': 'max_tokens', **bad})
+            event = self.failure(record)
+            self.assertNotIn('max_tokens', event.message, bad)
+
     def test_malformed_records_and_wrong_categories_do_not_leak(self):
-        valid = {'version': 1, 'reason': 'http_status', 'http_status': 429}
+        valid = {'version': 1, 'reason': 'http_status', 'http_status': 429,
+                 'output_tokens_max': None}
         malformed = [None, [], {}, {**valid, 'version': True},
                      {**valid, 'reason': []}, {**valid, 'reason': 'PRIVATE'},
                      {**valid, 'extra': 'PRIVATE'}, {**valid, 'http_status': True},

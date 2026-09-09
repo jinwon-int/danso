@@ -331,6 +331,21 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(p.stdout, '')
         self.usage(p)
 
+    def test_length_stop_reports_max_tokens_diagnostic_and_cap(self):
+        # Issue #69 B: stop_reason=max_tokens with no tool calls is a provider
+        # failure whose diagnostic names the cap and the flag that raises it.
+        self.responses.append((200, reply([{'type': 'text', 'text': 'PARTIAL'}], stop='max_tokens')))
+        p = self.run_cli('-p')
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertEqual(p.stdout, '')
+        self.assertNotIn('PARTIAL', p.stderr)
+        diagnostics = [l for l in p.stderr.splitlines() if l.startswith('DANSO_PROVIDER=')]
+        self.assertEqual(len(diagnostics), 1, p.stderr)
+        record = json.loads(diagnostics[0].split('=', 1)[1])
+        self.assertEqual(record['reason'], 'max_tokens')
+        self.assertEqual(record['output_tokens_max'], 16384)
+        self.assertIn('--max-output-tokens', p.stderr)
+
     def test_run_timeout_contract(self):
         self.tool('bash', {'command': 'sleep 10'})
         p = self.run_cli('--timeout-seconds', '1')

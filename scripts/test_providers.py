@@ -292,6 +292,37 @@ class Providers(Fixture):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual((self.repo / 'object-args').read_text(), 'ok')
 
+    def test_output_token_cap_maps_per_provider_flag_and_env(self):
+        # Default 16384 (issue #69 A).
+        self.responses.append((200, response('glm')))
+        p = self.run_cli('glm')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.requests[0]['max_tokens'], 16384)
+        # Explicit flag maps to GLM max_tokens.
+        self.responses.append((200, response('glm')))
+        p = self.run_cli('glm', '--max-output-tokens', '8192')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.requests[1]['max_tokens'], 8192)
+        # OpenAI maps the same flag to max_output_tokens.
+        self.responses.append((200, response('openai')))
+        p = self.run_cli('openai', '--max-output-tokens', '2048')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.requests[2]['max_output_tokens'], 2048)
+        # Environment default, flag precedence, and fail-closed range.
+        env = self.env('glm')
+        env['DANSO_MAX_OUTPUT_TOKENS'] = '4096'
+        self.responses.append((200, response('glm')))
+        p = self.run_cli('glm', env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.requests[3]['max_tokens'], 4096)
+        env['DANSO_MAX_OUTPUT_TOKENS'] = 'not-a-number'
+        p = self.run_cli('glm', env=env)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn('configuration', p.stderr)
+        p = self.run_cli('glm', '--max-output-tokens', '128')
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn('configuration', p.stderr)
+
     def test_openai_saved_output_cannot_disagree_with_history(self):
         self.responses.append((200, response('openai')))
         p = self.run_cli('openai')

@@ -100,9 +100,9 @@ TRANSPORT_KEYS = {'version', 'phase', 'elapsed_ms', 'request_bytes'}
 PROVIDER_REASONS = {
     'http_status', 'invalid_json', 'response_too_large', 'stream_ended',
     'invalid_stream', 'unsupported_stream_event', 'response_failed',
-    'response_incomplete', 'response_error',
+    'response_incomplete', 'response_error', 'max_tokens',
 }
-PROVIDER_KEYS = {'version', 'reason', 'http_status'}
+PROVIDER_KEYS = {'version', 'reason', 'http_status', 'output_tokens_max'}
 TASK_PROGRESS_STATES = {'checkpoint', 'paused', 'completed', 'blocked'}
 TASK_PROGRESS_KEYS = {
     'version', 'state', 'stage', 'requests', 'reported_tokens', 'elapsed_seconds',
@@ -222,12 +222,23 @@ def _provider_detail(text, category, code):
                 or type(value['reason']) is not str or value['reason'] not in PROVIDER_REASONS):
             return ''
         status = value['http_status']
+        cap = value['output_tokens_max']
+        if cap is not None and (type(cap) is not int or cap < 0):
+            return ''
         if value['reason'] == 'http_status':
             # reqwest StatusCode accepts all three-digit codes, including extensions.
             if type(status) is not int or not 100 <= status <= 999 or 200 <= status <= 299:
                 return ''
+            if cap is not None:
+                return ''
             return f", reason=http_status, http_status={status}"
-        if status is not None:
+        if value['reason'] == 'max_tokens':
+            # Output-token cap stop (issue #69 B): a positive cap rides with
+            # the reason; without one the record is not relayed.
+            if status is not None or type(cap) is not int or cap <= 0:
+                return ''
+            return f", reason=max_tokens, output_tokens_max={cap}"
+        if status is not None or cap is not None:
             return ''
         return f", reason={value['reason']}"
     except (ValueError, TypeError, RecursionError):
