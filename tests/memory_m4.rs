@@ -10,9 +10,12 @@ use danso::memory::{
     facts::{self, Candidate},
     transaction::{self, CommitMeta, Transaction},
 };
+use danso::provider::{ModelRequest, Provider};
+use danso::usage::Usage;
 use serde_json::{Value, json};
 use sha2::Digest;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn write_private(path: &Path, contents: &[u8]) {
     use std::io::Write;
@@ -498,4 +501,159 @@ fn check_diagnostics_are_body_free() {
     let texts: Vec<&str> = file.records().map(|r| r.text.as_str()).collect();
     let _ = texts;
     // The CLI test in memory_cli coverage asserts the JSON shape.
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the #65 §1.1–1.4 blocking defects: read-write
+// configuration, newest-first extraction input, budget-fit selection, and
+// HTTP-status-aware failure classification.
+// ---------------------------------------------------------------------------
+
+fn session_lines(session_id: &str, count: usize, body_bytes: usize) -> String {
+    let mut lines = format!(
+        "{{\"type\":\"session\",\"version\":3,\"id\":\"{session_id}\",\"timestamp\":\"2026-09-08T00:00:00Z\"}}\n"
+    );
+    for i in 0..count {
+        let body = "x".repeat(body_bytes);
+        lines.push_str(&format!(
+            "{{\"type\":\"message\",\"id\":\"m{i:03}\",\"message\":{{\"role\":\"user\",\"content\":\"m{i:03} {body}\",\"timestamp\":{}}}}}\n",
+            1_788_825_600_000i64 + (i as i64) * 60_000
+        ));
+    }
+    lines
+}
+
+/// §1.2: a 60-message session yields the NEWEST 50, newest message first.
+#[test]
+fn extraction_input_selects_newest_messages_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.jsonl");
+    write_private(
+        &session_path,
+        session_lines("550e8400-e29b-41d4-a716-446655440000", 60, 16).as_bytes(),
+    );
+    let (input, _, _) = journal_super_build(&session_path, 32768).unwrap();
+    assert_eq!(input["message_count"], json!(50));
+    assert_eq!(input["truncated"], json!(true));
+    let messages = input["messages"].as_array().unwrap();
+    let first = messages[0]["text"].as_str().unwrap();
+    let last = messages[49]["text"].as_str().unwrap();
+    assert!(
+        first.starts_with("m059 "),
+        "newest message first, got {first}"
+    );
+    assert!(last.starts_with("m010 "), "oldest kept is m010, got {last}");
+}
+
+/// §1.3: a session whose messages exceed the budget produces a valid,
+/// budget-fitting input by dropping the oldest messages instead of failing.
+#[test]
+fn extraction_input_fits_budget_by_dropping_oldest() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.jsonl");
+    // Ten 6 KiB messages: 60 KiB total, far above the 32 KiB budget.
+    write_private(
+        &session_path,
+        session_lines("550e8400-e29b-41d4-a716-446655440000", 10, 6 * 1024).as_bytes(),
+    );
+    let (input, _, _) = journal_super_build(&session_path, 32768).unwrap();
+    let serialized = serde_json::to_vec(&input).unwrap();
+    assert!(
+        serialized.len() <= 32768,
+        "input must fit its budget, got {}",
+        serialized.len()
+    );
+    assert_eq!(input["truncated"], json!(true));
+    assert!(
+        input["message_count"].as_u64().unwrap() < 10,
+        "oldest dropped"
+    );
+    let messages = input["messages"].as_array().unwrap();
+    assert!(messages[0]["text"].as_str().unwrap().starts_with("m009 "));
+}
+
+/// §1.1: read-write is a valid memory configuration now that M4 ships.
+#[test]
+fn read_write_mode_passes_configuration_validation() {
+    let config = memory::MemoryConfig {
+        mode: memory::MemoryMode::ReadWrite,
+        root: Some(PathBuf::from("/tmp/danso-memory-test")),
+        scope: "global".into(),
+        max_bytes: memory::snapshot::SNAPSHOT_MAX_BYTES_DEFAULT,
+        ..Default::default()
+    };
+    assert!(config.validate().is_ok());
+}
+
+/// §1.4: drain records the HTTP-status-derived failure class (429 →
+/// rate_limited, 401 → auth_unavailable + cooldown) instead of Other.
+#[tokio::test]
+async fn drain_classifies_provider_http_failures() {
+    struct FailingHttpStatus {
+        status: reqwest::StatusCode,
+        calls: AtomicUsize,
+    }
+    impl Provider for FailingHttpStatus {
+        fn validate_history(&self, _: &[Value]) -> Result<()> {
+            Ok(())
+        }
+        async fn complete(&mut self, _: ModelRequest<'_>, _: &mut Usage) -> Result<Value> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(danso::failure::http_status_error(self.status))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let session_path = dir.path().join("session.jsonl");
+    let lines = session_lines("550e8400-e29b-41d4-a716-446655440000", 4, 16);
+    write_private(&session_path, lines.as_bytes());
+    let outcome = journal::enqueue(&route, &session_path, "explicit", now()).unwrap();
+    let job_id = match outcome {
+        journal::EnqueueOutcome::Enqueued { job_id } => job_id,
+        other => panic!("expected enqueue, got {other:?}"),
+    };
+
+    for (status, expected_class, expect_cooldown) in [
+        (
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            false,
+        ),
+        (reqwest::StatusCode::UNAUTHORIZED, "auth_unavailable", true),
+    ] {
+        let outcome = journal::enqueue(&route, &session_path, "explicit", now()).unwrap();
+        let job_id = match outcome {
+            journal::EnqueueOutcome::Enqueued { job_id } => job_id,
+            journal::EnqueueOutcome::AlreadyPending { .. } => job_id.clone(),
+            other => panic!("expected enqueue or pending, got {other:?}"),
+        };
+        let mut provider = FailingHttpStatus {
+            status,
+            calls: AtomicUsize::new(0),
+        };
+        let mut usage = Usage::default();
+        let report = danso::memory::distill::extract::drain(
+            &route,
+            &mut provider,
+            &mut usage,
+            1,
+            1000,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.failed, 1, "job must fail for {expected_class}");
+        let record: Value = serde_json::from_slice(
+            &std::fs::read(journal::journal_dir(&route).join(format!("{job_id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["last_error_class"], json!(expected_class));
+        let cooldown = journal::cooldown_path(&route);
+        assert_eq!(
+            cooldown.is_file(),
+            expect_cooldown,
+            "cooldown presence for {expected_class}"
+        );
+        std::fs::remove_file(journal::journal_dir(&route).join(format!("{job_id}.json"))).ok();
+    }
 }

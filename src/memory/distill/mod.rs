@@ -18,7 +18,6 @@ use super::scan;
 pub const EXTRACTION_INPUT_BUDGET: usize = 32768;
 pub const MAX_MESSAGES: usize = 50;
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
-pub const MAX_TOTAL_BYTES: usize = 64 * 1024;
 pub const MAX_FACTS: usize = 12;
 pub const MAX_WIKI_CANDIDATES: usize = 3;
 pub const MAX_EVIDENCE: usize = 16;
@@ -53,9 +52,12 @@ pub struct FactDraft {
 
 /// Build the extraction input from a session journal (§4.6): text blocks of
 /// user/assistant messages only (compaction checkpoints ride along), latest
-/// 50, 8 KiB per message, 64 KiB total, last 7 days, credentials redacted.
+/// 50, 8 KiB per message, last 7 days, credentials redacted. Messages are
+/// selected newest-first (§4.6), and the per-message 8 KiB trim happens
+/// before budget math so the measured input is exactly what the model sees.
 /// When the serialized input exceeds `budget_bytes` the oldest messages are
-/// dropped latest-preferring (binary search) and `truncated` is set.
+/// dropped (message-unit binary search, JSON never cut mid-payload) and
+/// `truncated` is set; the returned input always fits the budget.
 pub fn build_input(
     session_path: &std::path::Path,
     trigger: &str,
@@ -116,65 +118,65 @@ pub fn build_input(
     let now_ms = now.timestamp_millis();
     let week_ms = 7 * 24 * 3600 * 1000i64;
     messages.retain(|(timestamp, _, _)| *timestamp == 0 || now_ms - timestamp <= week_ms);
+    // Newest-first selection (§4.6): the tail of the chronological session
+    // is the most recent work, and the payload lists the newest message
+    // first. The 8 KiB per-message trim happens before budget math so the
+    // serialized input the model sees is exactly what was measured.
+    let total = messages.len();
+    messages.reverse();
     messages.truncate(MAX_MESSAGES);
-
-    // Latest-first selection under the total budget: halve the tail window
-    // until the payload fits, then trim each message to 8 KiB.
-    let mut high = messages.len();
-    let mut truncated = false;
-    let selected: Vec<(i64, String, String)> = loop {
-        let candidate: Vec<(i64, String, String)> = messages.iter().take(high).cloned().collect();
-        let mut chronological: Vec<(i64, String, String)> = candidate.clone();
-        chronological.reverse();
-        let over_total = candidate
-            .iter()
-            .map(|(_, _, text)| text.len())
-            .sum::<usize>()
-            > MAX_TOTAL_BYTES;
-        if over_total && high > 1 {
-            high /= 2;
-            truncated = true;
-            continue;
+    for (_, _, text) in messages.iter_mut() {
+        if text.len() > MAX_MESSAGE_BYTES {
+            *text = scan::truncate_utf8(text, MAX_MESSAGE_BYTES).to_string();
         }
-        break chronological
-            .into_iter()
-            .map(|(ts, role, mut text)| {
-                if text.len() > MAX_MESSAGE_BYTES {
-                    text = scan::truncate_utf8(&text, MAX_MESSAGE_BYTES).to_string();
-                }
-                (ts, role, text)
+    }
+
+    // Message-unit budget fit (§4.6): binary search the largest newest-first
+    // prefix whose serialized input fits `budget_bytes`. The JSON is never
+    // cut mid-payload, and `truncated` records any dropped messages.
+    let build = |keep: usize| -> Value {
+        let message_payload: Vec<Value> = messages[..keep]
+            .iter()
+            .map(|(timestamp, role, text)| {
+                let redacted = scan::redact_credentials(text);
+                json!({"role": role, "timestamp": timestamp, "text": redacted})
             })
             .collect();
-    };
-
-    let source_thread_hash = facts::hex_encode(&Sha256::digest(session_id.as_bytes()));
-    let message_payload: Vec<Value> = selected
-        .iter()
-        .map(|(timestamp, role, text)| {
-            let redacted = scan::redact_credentials(text);
-            json!({"role": role, "timestamp": timestamp, "text": redacted})
+        let byte_count: usize = message_payload
+            .iter()
+            .map(|m| m["text"].as_str().map(str::len).unwrap_or(0))
+            .sum();
+        let source_thread_hash = facts::hex_encode(&Sha256::digest(session_id.as_bytes()));
+        json!({
+            "schema_version": 1,
+            "provider": "danso",
+            "content_trust": "untrusted",
+            "source_thread_hash": source_thread_hash,
+            "trigger": trigger,
+            "captured_at": facts::format_timestamp(now),
+            "truncated": keep < messages.len() || total > MAX_MESSAGES,
+            "messages": message_payload,
+            "message_count": message_payload.len(),
+            "byte_count": byte_count,
         })
-        .collect();
-    let byte_count: usize = message_payload
-        .iter()
-        .map(|m| m["text"].as_str().map(str::len).unwrap_or(0))
-        .sum();
-    let input = json!({
-        "schema_version": 1,
-        "provider": "danso",
-        "content_trust": "untrusted",
-        "source_thread_hash": source_thread_hash,
-        "trigger": trigger,
-        "captured_at": facts::format_timestamp(now),
-        "truncated": truncated || message_payload.len() < messages.len(),
-        "messages": message_payload,
-        "message_count": message_payload.len(),
-        "byte_count": byte_count,
-    });
+    };
+    let fits = |keep: usize| -> Result<bool> {
+        Ok(serde_json::to_vec(&build(keep))?.len() <= budget_bytes.max(1))
+    };
     ensure!(
-        serde_json::to_vec(&input)?.len() <= budget_bytes.max(1),
-        "extraction input cannot fit its budget"
+        fits(0)?,
+        "extraction input cannot fit its budget even with no messages"
     );
+    let (mut low, mut high) = (0usize, messages.len());
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if fits(mid)? {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let input = build(low);
     Ok((input, transcript_sha256, transcript_bytes))
 }
 

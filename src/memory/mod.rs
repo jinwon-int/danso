@@ -48,8 +48,8 @@ pub fn audience_for_scope(scope: &str) -> &'static str {
     }
 }
 
-/// Local memory injection mode for a run (§8). `ReadWrite` is reserved for
-/// M4 (extraction/journal) and is rejected by `danso run` until then.
+/// Local memory injection mode for a run (§8). `ReadWrite` additionally
+/// registers distill journal entries (§4.7) on top of the read injection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MemoryMode {
     #[default]
@@ -109,10 +109,6 @@ impl MemoryConfig {
     /// configuration errors, never clamped.
     pub fn validate(&self) -> anyhow::Result<()> {
         use anyhow::ensure;
-        ensure!(
-            self.mode != MemoryMode::ReadWrite,
-            "--memory read-write is not implemented until M4 (#52)"
-        );
         ensure!(
             paths::valid_scope(&self.scope),
             "memory scope must be global, shared, or private-<32 hex>"

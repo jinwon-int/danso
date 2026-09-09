@@ -20,7 +20,7 @@ def commands(profile):
             ['cargo', 'test', '--locked'], ['cargo', 'build', '--locked'],
             ['cargo', 'build', '--release', '--locked'],
             *[[sys.executable, f'scripts/{name}'] for name in
-              ('test_e2e.py', 'test_compaction.py', 'test_providers.py',
+              ('test_e2e.py', 'test_memory.py', 'test_compaction.py', 'test_providers.py',
                'test_live_acceptance.py', 'test_dev_check.py', 'test_worker_checks.py', 'test_dev_check_host.py', 'test_ccc_node.py', 'test_progress.py', 'test_harness_eval.py', 'test_eval_case.py', 'test_eval_dispatch.py', 'test_host_execution.py', 'test_chatgpt.py', 'test_chatgpt_refresh.py')]]
 
 

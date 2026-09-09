@@ -148,6 +148,15 @@ pub struct ProviderDiagnostic {
     http_status: Option<u16>,
 }
 
+impl ProviderDiagnostic {
+    /// HTTP status when the failure came from an HTTP-level provider error.
+    /// Diagnostic-only elsewhere; the distill drain classifier reads this to
+    /// map provider failures onto retry classes (§4.7) without parsing text.
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+}
+
 impl fmt::Display for ProviderDiagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "provider response failure: {:?}", self.reason)?;

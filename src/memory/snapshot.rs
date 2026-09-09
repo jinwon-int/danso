@@ -443,7 +443,7 @@ pub fn inject_into_context(
     cwd: &std::path::Path,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    if config.mode != super::MemoryMode::Read {
+    if config.mode == super::MemoryMode::Off {
         return Ok(());
     }
     let root = config
