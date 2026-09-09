@@ -372,33 +372,68 @@ fn add(route: &Route, lock_timeout_ms: u64, input: AddInput<'_>) -> anyhow::Resu
         job_id: None,
         explicit_id: input.id.map(str::to_string),
     };
-    let _lock =
-        paths::ExclusiveLock::acquire(&route.scope_lock(), paths::lock_timeout(lock_timeout_ms))?;
-    let existing = facts::load(route)?;
-    let output = facts::gate_and_render(
-        &existing,
-        vec![candidate],
-        memory::audience_for_scope(route.scope()),
-        now,
-        facts::MAX_FACTS_DEFAULT,
-    )?;
-    if !output.changed {
-        return Ok(Some(json!({ "added": false, "report": output.report })));
+    // §8/#65 §1.5: manual facts go through the rollback transaction — the
+    // single memory-rollback lock serializes them with distill commits, and
+    // the write leaves an undoable head like every other commit.
+    let transaction = transaction::Transaction::new(&route.state_dir());
+    let meta = transaction::CommitMeta {
+        provider: "danso".into(),
+        actor: "manual".into(),
+        tool: "local-memory-sink".into(),
+        diff: "mode-facts".into(),
+        session: "manual".into(),
+    };
+    let audience = memory::audience_for_scope(route.scope());
+    let mut gate_report: Option<facts::GateReport> = None;
+    let result = transaction.commit(lock_timeout_ms, &meta, |before| {
+        let mut next = before.clone();
+        for (name, current) in next.iter_mut() {
+            if name == memory::FACTS_FILE_NAME {
+                let file = facts::read(current.clone())?;
+                let output = facts::gate_and_render(
+                    &file,
+                    vec![candidate.clone()],
+                    audience,
+                    now,
+                    facts::MAX_FACTS_DEFAULT,
+                )?;
+                if output.changed {
+                    *current = Some(output.lines.concat().into_bytes());
+                }
+                gate_report = Some(output.report);
+            }
+        }
+        Ok(next)
+    })?;
+    let report = gate_report.expect("facts target processed by the add transaction");
+    // No change at all (dedup): the commit was a no-op, the fact already
+    // exists — reported as `added: false`, never an error.
+    if result.action_id.is_none() {
+        return Ok(Some(json!({ "added": false, "report": report })));
     }
-    if output.report.saved == 0 {
-        if output.report.skipped_mutable > 0 {
+    if report.saved == 0 {
+        if report.skipped_mutable > 0 {
             anyhow::bail!(
                 "mutable operational fact refused: measure it live instead of memorizing it"
             );
         }
-        if output.report.skipped_missing_reason > 0 {
+        if report.skipped_missing_reason > 0 {
             anyhow::bail!("decision facts require a because reason");
         }
         anyhow::bail!("fact refused by the write gates");
     }
-    let payload: String = output.lines.concat();
-    paths::atomic_write(&route.facts_file(), payload.as_bytes(), "memory facts")?;
-    Ok(Some(json!({ "added": true, "report": output.report })))
+    if let Some(action_id) = result.action_id {
+        memory::audit::record(
+            route,
+            &memory::audit::Event::Commit {
+                action_id,
+                changed: vec![memory::FACTS_FILE_NAME.to_string()],
+                facts_added: report.saved,
+            },
+        );
+        return Ok(Some(json!({ "added": true, "report": report })));
+    }
+    Ok(Some(json!({ "added": false, "report": report })))
 }
 
 fn search(

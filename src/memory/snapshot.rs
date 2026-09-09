@@ -339,7 +339,7 @@ pub fn assemble(route: &Route, options: &SnapshotOptions) -> Result<String> {
 
     // 5. local hot with the dynamic budget (§5.1):
     //    alloc = max(3000, max_bytes − 1000 − mem − (resume + working_state)).
-    let used = body.len() + working_block.len();
+    let used = body.len();
     let alloc = LOCAL_HOT_FLOOR.max(max_bytes.saturating_sub(BUDGET_SLACK + used));
     let hot = local_hot_block(route, options.query, alloc, options.now)?;
     body.push_str(&hot);
@@ -471,6 +471,7 @@ pub fn inject_into_context(
 #[cfg(test)]
 mod tests {
     use super::super::MemoryConfig;
+    use super::super::facts::Candidate;
     use super::*;
 
     fn setup_route(dir: &std::path::Path) -> Route {
@@ -501,6 +502,76 @@ mod tests {
             stale_days: STALE_DAYS_DEFAULT,
             now: facts::parse_timestamp("2026-09-08T12:00:00Z").unwrap(),
         }
+    }
+
+    fn seed_facts(route: &Route, count: usize, text_bytes: usize) {
+        let now = facts::parse_timestamp("2026-09-08T12:00:00Z").unwrap();
+        let candidates = (0..count)
+            .map(|i| Candidate {
+                kind: "preference".into(),
+                text: format!("f{i:02} {}", "x".repeat(text_bytes)),
+                because: None,
+                quote: None,
+                source_rank: 1,
+                observed_at: facts::format_timestamp(now),
+                entities: vec!["user".into()],
+                tags: vec!["manual".into()],
+                valid_from: None,
+                valid_until: None,
+                transcript: None,
+                manual: true,
+                job_id: None,
+                explicit_id: None,
+            })
+            .collect();
+        let file = facts::load(route).unwrap();
+        let out =
+            facts::gate_and_render(&file, candidates, "private", now, facts::MAX_FACTS_DEFAULT)
+                .unwrap();
+        let payload: String = out.lines.concat();
+        write(&route.facts_file(), &payload);
+    }
+
+    /// §5.1/#65 §2: the dynamic local-hot budget counts the working-state
+    /// block once. Double-counting it would shrink the hot block by twice
+    /// the working state's size.
+    #[test]
+    fn working_state_is_counted_once_in_the_dynamic_budget() {
+        let make = |dir: &std::path::Path, working: Option<&str>| {
+            let route = setup_route(dir);
+            seed_facts(&route, 20, 260);
+            if let Some(working) = working {
+                write(&route.working_state_file(), working);
+            }
+            route
+        };
+        let dir_a = tempfile::tempdir().unwrap();
+        let route_a = make(dir_a.path(), None);
+        let dir_b = tempfile::tempdir().unwrap();
+        let working = format!("## objective\n{}\n", "w".repeat(1500));
+        let route_b = make(dir_b.path(), Some(&working));
+
+        let options = SnapshotOptions {
+            max_bytes: 8192,
+            ..opts(None)
+        };
+        let body_a = assemble(&route_a, &options).unwrap();
+        let body_b = assemble(&route_b, &options).unwrap();
+        let hot_a = body_a.split("## Local hot memory").nth(1).unwrap().len();
+        let hot_b = body_b.split("## Local hot memory").nth(1).unwrap().len();
+        let delta = (hot_a - hot_b) as i64;
+        assert!(
+            hot_a > hot_b,
+            "hot block must shrink when a working state exists ({hot_a} vs {hot_b})"
+        );
+        // The hot block truncates at line boundaries (~290 B/line here), so a
+        // single-counted working block (~1.6 KiB) costs at most one stray
+        // line of budget; double-counting it would cost ≥ 2 × working − line
+        // (~1.9 KiB measured). The bound sits squarely between the two.
+        assert!(
+            delta <= 900,
+            "the working block must be counted once, not twice (delta {delta})"
+        );
     }
 
     #[test]

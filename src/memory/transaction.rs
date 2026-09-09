@@ -270,7 +270,9 @@ impl Transaction {
                 if !is_lower_hex(value, 64) {
                     anyhow::bail!("rollback manifest hash is invalid");
                 }
-                if !exists && value != absent_hash() {}
+                if !exists && value != absent_hash() {
+                    anyhow::bail!("rollback manifest absent-file hash is invalid");
+                }
             }
         }
         // Action-directory entry allowlist and pre-image presence rules.

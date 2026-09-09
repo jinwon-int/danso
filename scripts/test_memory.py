@@ -50,6 +50,7 @@ class Acceptance(unittest.TestCase):
         self.session = self.root / 'session.jsonl'
         self.requests = []
         self.extraction_status = 200
+        self.wiki_candidates = []
         owner = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -78,6 +79,7 @@ class Acceptance(unittest.TestCase):
                             'trigger': payload['trigger'],
                             'distilled_at': payload['captured_at'],
                         }
+                        response['wiki_candidates'] = owner.wiki_candidates
                         data = json.dumps(reply([{'type': 'text', 'text': json.dumps(response)}])).encode()
                     self.send_response(status)
                     self.send_header('Content-Type', 'application/json')
@@ -165,6 +167,57 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         return self.run_task(prompt, '--memory', 'read-write', *extra)
 
+    def audit_events(self):
+        path = self.memdir / 'global' / 'state' / 'audit.jsonl'
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+    def test_read_mode_writes_no_state(self):
+        # §8: read mode injects only — no working state, checkpoints,
+        # session archives, journal, or audit writes (#65 §2).
+        init = self.run_danso('memory', 'init')
+        self.assertEqual(init.returncode, 0, init.stderr)
+        result = self.run_task('read-only task', '--memory', 'read')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.memdir / 'global' / 'state'
+        self.assertTrue(state.is_dir())
+        for forbidden in ['working-state.md', 'checkpoints', 'session-archive',
+                          'distill-journal', 'audit.jsonl', 'resume.md']:
+            self.assertFalse((state / forbidden).exists(),
+                             f'read mode must not write {forbidden}')
+        self.assertEqual(self.journal_files(), [])
+
+    def test_run_commits_audit_and_resume_provenance(self):
+        self.wiki_candidates = [{'title': '런북 갱신',
+                                 'suggested_path': 'pages/nodes/x/RUNBOOK.md',
+                                 'summary': '요약', 'evidence_excerpt': '근거'}]
+        result = self.warmup_and_run('audited task', '--memory-distill', 'inline')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.memdir / 'global' / 'state'
+        # MemoryCommit + DistillJob ledger events (§6.4, #65 §1.6).
+        events = self.audit_events()
+        commits = [e for e in events if e['event'] == 'MemoryCommit']
+        self.assertTrue(any(e.get('facts_added') == 1 for e in commits),
+                        f'MemoryCommit with facts_added=1 expected: {events}')
+        jobs = [e for e in events if e['event'] == 'DistillJob']
+        self.assertTrue(any(e['status'] == 'committed' for e in jobs),
+                        f'DistillJob committed expected: {events}')
+        # Resume header carries the real provenance (#65 §2, §4.1).
+        resume = (state / 'resume.md').read_text()
+        header = resume.splitlines()[0]
+        self.assertIn('provider=danso', header)
+        self.assertIn('trigger=final_answer', header)
+        self.assertNotIn('trigger=run', header)
+        import re as _re
+        self.assertRegex(header, _re.compile(r'thread_hash=[0-9a-f]{64}'))
+        self.assertRegex(header, _re.compile(r'distilled_at=\d{4}-'))
+        # Wiki candidates queued locally only (§4.6, #65 §1.7).
+        queue = sorted((state / 'wiki-candidates').glob('*.json'))
+        self.assertEqual(len(queue), 1, 'one immutable queue entry')
+        entry = json.loads(queue[0].read_text())
+        self.assertEqual(entry['wiki_candidates'][0]['title'], '런북 갱신')
+
     def test_queue_mode_leaves_job_and_memory_drain_completes_it(self):
         result = self.warmup_and_run('queued task')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -187,6 +240,11 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(record['last_error_class'], 'rate_limited',
                          '429 must classify as rate_limited (#65 §1.4)')
         self.assertNotEqual(record['retry_after'], None)
+        # The failure is audited with its class (§6.4, #65 §1.6).
+        jobs = [e for e in self.audit_events() if e['event'] == 'DistillJob']
+        self.assertTrue(any(e['status'] == 'failed' and
+                            e['error_class'] == 'rate_limited' for e in jobs),
+                        f'failed DistillJob expected: {jobs}')
         # After the cooldown passes the job drains successfully.
         record['retry_after'] = '2026-01-01T00:00:00+00:00'
         path = self.journal_files()[0]
