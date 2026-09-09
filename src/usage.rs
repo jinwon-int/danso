@@ -17,6 +17,8 @@ pub struct Usage {
     summary_requests: u32,
     /// Terminal output-cap stops seen by the runtime (issue #69 F).
     length_stops: u32,
+    /// Length stops continued with a follow-up request (issue #69 B/F).
+    continuations: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -85,8 +87,12 @@ impl Usage {
         self.length_stops = self.length_stops.saturating_add(1);
     }
 
-    pub fn budget_counts(&self) -> (u32, u32) {
-        (self.summary_requests, self.length_stops)
+    pub fn record_continuation(&mut self) {
+        self.continuations = self.continuations.saturating_add(1);
+    }
+
+    pub fn budget_counts(&self) -> (u32, u32, u32) {
+        (self.summary_requests, self.length_stops, self.continuations)
     }
 }
 

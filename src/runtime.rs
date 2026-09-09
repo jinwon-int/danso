@@ -39,6 +39,12 @@ pub struct RunInput<'a> {
     /// enables the fingerprinted detection. Long-task runs ignore this and
     /// keep their immutable `task.repeat_limit` semantics.
     pub repeat_limit: u32,
+    /// Opt-in output-cap continuation budget (issue #69 B): 0 disables;
+    /// 1..=2 allows that many follow-up requests after a text-only
+    /// `length` stop. Long-task runs refuse it.
+    pub continuation_limit: u32,
+    /// Opt-in per-request progress notification (issue #69 F).
+    pub stream_requests: bool,
     /// Set by the CLI's graceful SIGUSR1 handler. The runtime only observes
     /// this flag at settled boundaries; it never interrupts a provider or
     /// tool operation.
@@ -65,6 +71,8 @@ impl<'a> RunInput<'a> {
             refresh_context: None,
             long_task: None,
             repeat_limit: 0,
+            continuation_limit: 0,
+            stream_requests: false,
             pause_requested: None,
         }
     }
@@ -442,6 +450,10 @@ pub async fn run(
     // Short-mode identical-batch guard state (issue #70 D): run-local, the
     // journal is never touched.
     let mut last_batch_fingerprint = String::new();
+    // Opt-in output-cap continuation state (issue #69 B): run-local.
+    let mut continuation_count: u32 = 0;
+    // Opt-in per-request progress (issue #69 F).
+    let mut request_sequence: u32 = 0;
     let mut batch_repeat_count: u64 = 0;
     let mut repeat_guidance: Option<String> = None;
     while remaining > 0 {
@@ -620,6 +632,12 @@ pub async fn run(
         .await
         .map_err(at(Kind::Compaction))?;
         remaining -= 1;
+        request_sequence += 1;
+        sink.emit(Event::Request {
+            sequence: request_sequence,
+            remaining,
+        })
+        .map_err(at(Kind::Output))?;
         if input.long_task.is_some()
             && pause_if_requested(&mut long_ledger, session, input.pause_requested)
                 .map_err(at(Kind::Session))?
@@ -728,6 +746,28 @@ pub async fn run(
             }
         }
         if calls.is_empty() {
+            if message["stopReason"] == "length" && continuation_count < input.continuation_limit {
+                // Issue #69 B: opt-in continuation of a text-only truncated
+                // response. The partial assistant message is already in the
+                // journal; append the continuation request and spend one
+                // more request slot.
+                continuation_count += 1;
+                usage.record_length_stop();
+                usage.record_continuation();
+                let notice = json!({
+                    "role":"user",
+                    "content":[{"type":"text","text":"Continue exactly where the previous message stopped; do not repeat text."}],
+                    "dansoContinuation":true
+                });
+                sink.emit(Event::Message(
+                    &session
+                        .append_message(notice.clone())
+                        .map_err(at(Kind::Session))?,
+                ))
+                .map_err(at(Kind::Output))?;
+                messages.push(notice);
+                continue;
+            }
             if message["stopReason"] != "stop" {
                 // Terminal `length` with no tool calls (issue #69 B): the
                 // response hit the configured output token cap. Keep the

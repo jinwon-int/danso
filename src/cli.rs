@@ -100,6 +100,14 @@ pub struct Args {
     /// failures (0..=5, default 3; issue #67 B).
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=5), default_value_t = 3)]
     pub provider_retries: u32,
+    /// Continue a text-only output-cap stop up to N times (0..=2, default
+    /// 0; issue #69 B). Unavailable in long-task mode.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=2), default_value_t = 0, conflicts_with_all = ["long_task", "resume_task"])]
+    pub continue_on_length: u32,
+    /// Emit per-request danso_request frames with --progress-jsonl
+    /// (issue #69 F).
+    #[arg(long, requires = "progress_jsonl")]
+    pub stream_requests: bool,
     /// Opt in to checkpoint compaction above this serialized request size (8192..393216).
     #[arg(long)]
     pub compact_at_bytes: Option<usize>,
@@ -216,6 +224,8 @@ impl Args {
             glm_endpoint: self.glm_endpoint.clone(),
             repeat_limit: self.repeat_limit.unwrap_or(0),
             provider_retries: self.provider_retries,
+            continuation_limit: self.continue_on_length,
+            stream_requests: self.stream_requests,
             compact_at_bytes: self.compact_at_bytes,
             timeout_seconds,
             provider_timeout_seconds: self.provider_timeout_seconds,

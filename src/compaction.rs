@@ -119,7 +119,11 @@ pub fn latest_user(messages: &[Value]) -> Result<Value> {
     messages
         .iter()
         .rev()
-        .find(|m| m["role"] == "user" && m["dansoContextSummary"] != true)
+        .find(|m| {
+            m["role"] == "user"
+                && m["dansoContextSummary"] != true
+                && m["dansoContinuation"] != true
+        })
         .cloned()
         .context("compaction requires a current user request")
 }
