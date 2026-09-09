@@ -57,6 +57,10 @@ pub struct RunConfig {
     pub glm_endpoint: Option<String>,
     /// Bounded wire-level retry budget (0..=5; issue #67 B).
     pub provider_retries: u32,
+    /// Opt-in output-cap continuation budget (0..=2; issue #69 B).
+    pub continuation_limit: u32,
+    /// Opt-in per-request progress frames (issue #69 F).
+    pub stream_requests: bool,
     /// Short-mode identical-batch guard (issue #70 D); 0 disables.
     pub repeat_limit: u32,
     pub compact_at_bytes: Option<usize>,
@@ -194,6 +198,14 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         "repeat-limit must be 0 or 2..=8"
     );
     ensure!(args.provider_retries <= 5, "provider-retries must be 0..=5");
+    ensure!(
+        args.continuation_limit <= 2,
+        "continue-on-length must be 0..=2"
+    );
+    ensure!(
+        args.continuation_limit == 0 || args.long_task.is_none(),
+        "continue-on-length is unavailable in long-task mode"
+    );
     ensure!(
         (1..=if args.long_task.is_some() {
             crate::long_task::MAX_WALL_SECONDS
@@ -469,6 +481,8 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
                 refresh_context: refresh_context.as_deref(),
                 long_task,
                 repeat_limit: args.repeat_limit,
+                continuation_limit: args.continuation_limit,
+                stream_requests: args.stream_requests,
                 pause_requested: args.pause_requested.as_deref(),
             },
             &mut provider,

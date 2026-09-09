@@ -11,6 +11,7 @@ pub struct ProgressSink<S> {
     inner: S,
     enabled: bool,
     task_enabled: bool,
+    requests_enabled: bool,
     sequence: u64,
     active: Option<&'static str>,
 }
@@ -21,9 +22,15 @@ impl<S> ProgressSink<S> {
             inner,
             enabled,
             task_enabled: false,
+            requests_enabled: false,
             sequence: 0,
             active: None,
         }
+    }
+
+    pub fn with_request_progress(mut self, enabled: bool) -> Self {
+        self.requests_enabled = enabled;
+        self
     }
 
     pub fn with_task_progress(mut self, enabled: bool) -> Self {
@@ -57,6 +64,16 @@ impl<S: EventSink> EventSink for ProgressSink<S> {
                         .ok_or_else(|| anyhow::anyhow!("tool progress without start"))?;
                     Some(json!({"type":"danso_progress", "version":1,
                         "sequence":self.sequence,"phase":"settled","tool":tool,"success":!is_error}))
+                }
+                Event::Request {
+                    sequence,
+                    remaining,
+                } => {
+                    if !self.requests_enabled {
+                        return Ok(());
+                    }
+                    Some(json!({"type":"danso_request", "version":1,
+                        "sequence":sequence, "remaining":remaining}))
                 }
                 _ => None,
             };
@@ -121,14 +138,15 @@ pub fn report_budget(config: &crate::app::RunConfig, usage: &Usage) {
         Some(task) => u32::try_from(task.limits.max_requests).unwrap_or(u32::MAX),
         None => config.max_turns,
     };
-    let (summary_requests, length_stops) = usage.budget_counts();
+    let (summary_requests, length_stops, continuations) = usage.budget_counts();
     let cap = crate::provider::resolve_max_output_tokens(config.max_output_tokens).unwrap_or(0);
     eprintln!(
-        "DANSO_BUDGET={{\"version\":1,\"requests_used\":{},\"requests_total\":{},\"summary_requests\":{},\"output_tokens_max\":{},\"length_stops\":{},\"continuations\":0}}",
+        "DANSO_BUDGET={{\"version\":1,\"requests_used\":{},\"requests_total\":{},\"summary_requests\":{},\"output_tokens_max\":{},\"length_stops\":{},\"continuations\":{}}}",
         usage.snapshot().requests,
         requests_total,
         summary_requests,
         cap,
-        length_stops
+        length_stops,
+        continuations
     );
 }

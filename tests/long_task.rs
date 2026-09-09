@@ -148,6 +148,8 @@ fn input<'a>(prompt: &'a str, task: LongTaskRun) -> RunInput<'a> {
         refresh_context: None,
         long_task: Some(task),
         repeat_limit: 0,
+        continuation_limit: 0,
+        stream_requests: false,
         pause_requested: None,
     }
 }
@@ -665,6 +667,8 @@ async fn short_mode_repeat_guard_guides_once_then_terminates() {
         refresh_context: None,
         long_task: None,
         repeat_limit: 3,
+        continuation_limit: 0,
+        stream_requests: false,
         pause_requested: None,
     };
     let error = runtime::run(

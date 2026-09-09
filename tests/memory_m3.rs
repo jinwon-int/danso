@@ -199,6 +199,7 @@ impl EventSink for Collecting {
             Event::Compaction(_) => "compaction",
             Event::FinalAnswer(_) => "final",
             Event::ToolStarted(_) => "tool-started",
+            Event::Request { .. } => "request",
             Event::ToolSettled { .. } => "tool-settled",
             Event::Task(_) => "task",
         };
@@ -244,6 +245,8 @@ async fn run_inner(route: &Route, session_path: &Path) -> anyhow::Result<()> {
             refresh_context: None,
             long_task: None,
             repeat_limit: 0,
+            continuation_limit: 0,
+            stream_requests: false,
             pause_requested: None,
         },
         &mut provider,

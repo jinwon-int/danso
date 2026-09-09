@@ -161,7 +161,8 @@ fn main() {
         config.pause_requested = Some(Arc::clone(&pause_requested));
     }
     let mut sink = ProgressSink::new(PrintSink(args.output_mode()), args.progress_jsonl)
-        .with_task_progress(args.task_progress);
+        .with_task_progress(args.task_progress)
+        .with_request_progress(args.stream_requests);
     let code = runtime.block_on(async {
         let pause_listener = if config.long_task.is_some() {
             use tokio::signal::unix::{SignalKind, signal};

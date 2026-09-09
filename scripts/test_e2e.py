@@ -24,6 +24,13 @@ def call(name, args, id='call1'):
     return {'type': 'tool_use', 'id': id, 'name': name, 'input': args}
 
 
+def e_ok(line):
+    try:
+        return json.loads(line).get('type') == 'message'
+    except json.JSONDecodeError:
+        return False
+
+
 def system_text(body):
     """Anthropic renders the #69 E system split as text blocks; OpenAI-style
     fixtures keep a plain string."""
@@ -421,6 +428,43 @@ class Acceptance(unittest.TestCase):
         record = json.loads(transports[0].split('=', 1)[1])
         self.assertEqual(record['attempts'], 2)
         self.assertEqual(record['phase'], 'connect')
+
+    def test_continue_on_length_joins_turn_and_counts_budget(self):
+        # Issue #69 B: an opt-in continuation journals the partial assistant
+        # message plus a continuation user message; -p prints only the last
+        # piece and the budget receipt counts the continuation.
+        self.responses.append((200, reply([{'type': 'text', 'text': 'PARTIAL1'}], stop='max_tokens')))
+        self.final()
+        p = self.run_cli('-p', '--continue-on-length', '1')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), 'done')
+        entries = [json.loads(l) for l in self.session.read_text().splitlines()
+                   if e_ok(l)]
+        kinds = [(e['message']['role'], e['message'].get('dansoContinuation') is True)
+                 for e in entries if e.get('type') == 'message']
+        self.assertEqual(kinds, [('user', False), ('assistant', False),
+                                 ('user', True), ('assistant', False)])
+        continuation = [m for m in self.requests[1]['messages']
+                        if m.get('role') == 'user'
+                        and 'Continue exactly' in json.dumps(m.get('content'))]
+        self.assertEqual(len(continuation), 1)
+        budgets = [l for l in p.stderr.splitlines() if l.startswith('DANSO_BUDGET=')]
+        self.assertEqual(len(budgets), 1, p.stderr)
+        record = json.loads(budgets[0].split('=', 1)[1])
+        self.assertEqual(record['requests_used'], 2)
+        self.assertEqual(record['length_stops'], 1)
+        self.assertEqual(record['continuations'], 1)
+
+    def test_stream_requests_emits_per_request_frames(self):
+        # Issue #69 F: opt-in danso_request frames sequence every model request.
+        self.tool('bash', {'command': 'printf ok'})
+        p = self.run_cli('--progress-jsonl', '--stream-requests')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        frames = [json.loads(l) for l in p.stdout.splitlines()
+                  if l.startswith('{') and '"danso_request"' in l]
+        self.assertEqual([f['sequence'] for f in frames], [1, 2])
+        self.assertEqual([f['remaining'] for f in frames], [47, 46])
+        self.assertEqual(frames[0]['version'], 1)
 
     def test_length_stop_reports_max_tokens_diagnostic_and_cap(self):
         # Issue #69 B: stop_reason=max_tokens with no tool calls is a provider

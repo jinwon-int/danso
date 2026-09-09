@@ -99,6 +99,8 @@ async fn checkpoint_persistence_failure_prevents_next_provider_request() {
             refresh_context: None,
             long_task: None,
             repeat_limit: 0,
+            continuation_limit: 0,
+            stream_requests: false,
             pause_requested: None,
         },
         &mut provider,
@@ -294,4 +296,129 @@ async fn multibyte_ledger_splits_on_code_point_boundaries() {
     // Print the split so the same test on another revision can be compared.
     let sizes: Vec<usize> = provider.fragments.iter().map(|f| f.len()).collect();
     println!("FRAGMENT_SIZES={sizes:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #69 B: opt-in continuation of a text-only output-cap stop.
+// ---------------------------------------------------------------------------
+
+/// The continuation notice is invisible to `latest_user`, so a checkpoint
+/// keeps the ORIGINAL user request beside it, never the notice.
+#[test]
+fn latest_user_skips_continuation_notices() {
+    let messages = vec![
+        json!({"role":"user","content":[{"type":"text","text":"real task"}]}),
+        json!({"role":"assistant","content":[{"type":"text","text":"PARTIAL"}],"stopReason":"length"}),
+        json!({"role":"user","content":[{"type":"text","text":"Continue exactly where the previous message stopped; do not repeat text."}],"dansoContinuation":true}),
+    ];
+    let latest = compaction::latest_user(&messages).unwrap();
+    assert_eq!(
+        latest["content"][0]["text"],
+        json!("real task"),
+        "the continuation notice must not become the pinned request"
+    );
+    // A real (non-continuation) later user message still wins.
+    let messages = vec![
+        json!({"role":"user","content":[{"type":"text","text":"real task"}]}),
+        json!({"role":"user","content":[{"type":"text","text":"follow-up"}]}),
+        json!({"role":"user","content":[{"type":"text","text":"x"}],"dansoContinuation":true}),
+    ];
+    let latest = compaction::latest_user(&messages).unwrap();
+    assert_eq!(latest["content"][0]["text"], json!("follow-up"));
+}
+
+#[tokio::test]
+async fn continuation_of_length_stop_journals_notice_and_final_answer_is_last_piece() {
+    use std::cell::Cell;
+    struct LengthThenStop {
+        calls: Cell<usize>,
+    }
+    impl Provider for LengthThenStop {
+        fn validate_history(&self, _: &[Value]) -> Result<()> {
+            Ok(())
+        }
+        async fn complete(&mut self, _: ModelRequest<'_>, _: &mut Usage) -> Result<Value> {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            if n == 0 {
+                Ok(
+                    json!({"role":"assistant","content":[{"type":"text","text":"PARTIAL"}],"stopReason":"length"}),
+                )
+            } else {
+                Ok(
+                    json!({"role":"assistant","content":[{"type":"text","text":"done-final"}],"stopReason":"stop"}),
+                )
+            }
+        }
+    }
+    struct NoTools;
+    impl ToolExecutor for NoTools {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            vec![]
+        }
+        async fn preflight(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn execute(&self, _: &ToolCall) -> Result<ToolOutcome> {
+            unreachable!()
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+    let mut provider = LengthThenStop {
+        calls: Cell::new(0),
+    };
+    let mut usage = Usage::default();
+    let outcome = runtime::run(
+        RunInput {
+            no_tools: true,
+            prompt: "write a long report",
+            context: "",
+            execution_context: "",
+            max_turns: 4,
+            compact_at_bytes: None,
+            refresh_context: None,
+            long_task: None,
+            repeat_limit: 0,
+            continuation_limit: 1,
+            stream_requests: false,
+            pause_requested: None,
+        },
+        &mut provider,
+        &NoTools,
+        &mut session,
+        &mut Sink,
+        &mut usage,
+    )
+    .await;
+    assert!(outcome.is_ok(), "{outcome:?}");
+    // The journal is the truth: partial assistant + continuation notice + final.
+    let entries: Vec<Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|e: &Value| e["type"] == "message")
+        .collect();
+    let roles: Vec<(&str, bool)> = entries
+        .iter()
+        .map(|e| {
+            (
+                e["message"]["role"].as_str().unwrap(),
+                e["message"]["dansoContinuation"] == json!(true),
+            )
+        })
+        .collect();
+    assert_eq!(
+        roles,
+        vec![
+            ("user", false),
+            ("assistant", false),
+            ("user", true),
+            ("assistant", false)
+        ]
+    );
+    // The budget receipt counts the length stop and the continuation.
+    let (summaries, length_stops, continuations) = usage.budget_counts();
+    assert_eq!((summaries, length_stops, continuations), (0, 1, 1));
 }

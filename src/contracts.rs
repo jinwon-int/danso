@@ -78,6 +78,11 @@ pub enum Event<'a> {
     FinalAnswer(&'a Value),
     /// Body-free opt-in long-task checkpoint notification.
     Task(&'a Value),
+    /// Opt-in per-model-request notification (issue #69 F): body-free.
+    Request {
+        sequence: u32,
+        remaining: u32,
+    },
     /// Emitted only after the corresponding operation marker is durable.
     ToolStarted(&'a str),
     ToolSettled {
