@@ -96,6 +96,10 @@ pub struct Args {
     /// Long-task runs use --task-repeat-limit instead.
     #[arg(long, conflicts_with_all = ["long_task", "resume_task"])]
     pub repeat_limit: Option<u32>,
+    /// Bounded provider wire retries for 429/5xx and pre-header transport
+    /// failures (0..=5, default 3; issue #67 B).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=5), default_value_t = 3)]
+    pub provider_retries: u32,
     /// Opt in to checkpoint compaction above this serialized request size (8192..393216).
     #[arg(long)]
     pub compact_at_bytes: Option<usize>,
@@ -211,6 +215,7 @@ impl Args {
             glm_thinking: self.glm_thinking.clone(),
             glm_endpoint: self.glm_endpoint.clone(),
             repeat_limit: self.repeat_limit.unwrap_or(0),
+            provider_retries: self.provider_retries,
             compact_at_bytes: self.compact_at_bytes,
             timeout_seconds,
             provider_timeout_seconds: self.provider_timeout_seconds,

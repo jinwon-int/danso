@@ -55,6 +55,8 @@ pub struct RunConfig {
     /// GLM-only options resolved in `provider_from_parts` (issue #70 A/B).
     pub glm_thinking: Option<String>,
     pub glm_endpoint: Option<String>,
+    /// Bounded wire-level retry budget (0..=5; issue #67 B).
+    pub provider_retries: u32,
     /// Short-mode identical-batch guard (issue #70 D); 0 disables.
     pub repeat_limit: u32,
     pub compact_at_bytes: Option<usize>,
@@ -191,6 +193,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         args.repeat_limit == 0 || (2..=8).contains(&args.repeat_limit),
         "repeat-limit must be 0 or 2..=8"
     );
+    ensure!(args.provider_retries <= 5, "provider-retries must be 0..=5");
     ensure!(
         (1..=if args.long_task.is_some() {
             crate::long_task::MAX_WALL_SECONDS
@@ -393,6 +396,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         args.glm_thinking.as_deref(),
         args.glm_endpoint.as_deref(),
     )?;
+    provider.set_retries(args.provider_retries);
     let limits =
         tools::resource_limits(args.backend, Duration::from_secs(args.tool_timeout_seconds));
     let backend = if args.backend.is_host() {

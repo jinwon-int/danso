@@ -56,8 +56,8 @@ class ChatGPT(Fixture):
                 'DANSO_CHATGPT_AUTH_FILE': str(self.auth),
                 'DANSO_CHATGPT_BASE_URL': f'http://127.0.0.1:{self.server.server_port}/codex'}
 
-    def invoke(self, **kwargs):
-        return self.run_cli('openai-codex', **kwargs)
+    def invoke(self, *extra, **kwargs):
+        return self.run_cli('openai-codex', *extra, **kwargs)
 
     def assert_private(self, proc):
         output = proc.stdout + proc.stderr
@@ -227,7 +227,7 @@ class ChatGPT(Fixture):
             self.session = self.root / f'http{status}.jsonl'
             self.responses = [(status, b'REFRESH_SECRET')]
             before = len(self.requests)
-            p = self.invoke()
+            p = self.invoke('--provider-retries', '0')
             self.assertNotEqual(p.returncode, 0)
             self.assert_diagnostic(p, 'http_status', status)
             self.assertEqual(len(self.requests), before + 1)

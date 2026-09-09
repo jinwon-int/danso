@@ -58,6 +58,13 @@ impl OpenAi {
             max_output_tokens: super::MAX_OUTPUT_TOKENS_DEFAULT,
         })
     }
+    /// Bounded wire-retry budget (issue #67 B); 0 disables. The ChatGPT
+    /// subscription path has no shared Http transport and ignores it.
+    pub fn set_retries(&mut self, retries: u32) {
+        if let Some(http) = self.http.as_mut() {
+            http.set_retries(retries);
+        }
+    }
     fn body(&self, request: &ModelRequest<'_>) -> Result<Value> {
         let tools: Vec<Value> = request
             .tools
