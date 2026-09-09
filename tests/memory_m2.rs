@@ -352,3 +352,58 @@ async fn margin_check_sees_memory_bytes() {
         "the margin check must see the memory bytes: {error:#}"
     );
 }
+
+/// §5.1/#65 §2: the local-hot budget charges the working-state block once.
+/// Adding a W-byte working state must shrink the hot block by roughly W —
+/// the old `body.len() + working_block.len()` double count shrank it by ~2W.
+#[test]
+fn working_block_is_budgeted_once() {
+    let facts_payload = |dir: &Path| {
+        let route = route_in(dir, "global");
+        setup_tree(&route);
+        let mut lines = String::new();
+        for i in 0..80 {
+            lines.push_str(&format!(
+                "{{\"id\":\"fact{i:02}\",\"kind\":\"context\",\"text\":\"유지할 사실 {i} — 패딩 패딩 패딩 패딩 패딩\",\"observed_at\":\"2026-09-08T11:00:00Z\",\"entities\":[\"user\"]}}\n"
+            ));
+        }
+        write_private(&route.facts_file(), lines.as_bytes());
+        route
+    };
+
+    let assemble_hot = |route: &Route, max_bytes: usize| -> usize {
+        let body = snapshot::assemble(
+            route,
+            &SnapshotOptions {
+                event: "run",
+                query: None,
+                max_bytes,
+                stale_days: snapshot::STALE_DAYS_DEFAULT,
+                now: now(),
+            },
+        )
+        .unwrap();
+        let heading = "## Local hot memory (task-conditioned cache search)\n";
+        let start = body
+            .find(heading)
+            .unwrap_or_else(|| panic!("hot block missing:\n{body}"));
+        body.len() - start
+    };
+
+    let dir_a = tempfile::tempdir().unwrap();
+    let route_a = facts_payload(dir_a.path());
+    let hot_without = assemble_hot(&route_a, 6000);
+
+    let dir_b = tempfile::tempdir().unwrap();
+    let route_b = facts_payload(dir_b.path());
+    let working = "w".repeat(1200);
+    write_private(&route_b.working_state_file(), working.as_bytes());
+    let hot_with = assemble_hot(&route_b, 6000);
+
+    let shrink = hot_without as i64 - hot_with as i64;
+    assert!(
+        (800..=1500).contains(&shrink),
+        "a 1200-byte working state must cost the hot block ~1200 bytes, got {shrink} \
+         (double charging would cost ~2400)"
+    );
+}

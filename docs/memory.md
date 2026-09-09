@@ -26,7 +26,10 @@ $DANSO_MEMORY_DIR (default ~/.danso/memory)
     state/memory-facts.jsonl          fact records, one JSON object per line (0600)
     state/resume.md                   resume pointer (0600; written from M3)
     state/working-state.md            working state (0600; written from M3)
-    state/.memory.lock                per-scope single-writer flock (0600)
+    state/.memory.lock                per-scope single-writer flock (0600;
+                                      manual add/close, distill commits, and
+                                      rollback all serialize on this one lock)
+    state/wiki-candidates/            immutable per-job wiki queue (0600)
 ```
 
 Every directory is 0700, every file 0600, owner == euid, `st_nlink == 1`,
@@ -141,11 +144,13 @@ final answer or turn-budget exhaustion (`--memory-distill queue|inline|off`;
 inline drains one job after the run). `danso memory distill --session
 <path>` enqueues explicitly; `danso memory drain` claims pending jobs and
 runs the one-turn tool-free extraction over the production provider
-(env-selected, one STRICT retry), validates the output against the ccc
+(env-selected, one STRICT retry whose request carries an explicit strict
+instruction), validates the output against the ccc
 `codex-distill-extraction-v1` contract plus the Danso `source`/`quote`
 extensions (bounds, duplicate keys, NaN/Infinity, credential and directive
-patterns, provenance identity, decision reasons), applies the §4.2 write
-gates, and commits both targets through the crash-recoverable
+patterns, provenance identity, decision reasons, source ranks 3
+user-stated / 2 measured / 1 inferred), applies the §4.2 write gates, and
+commits both targets through the crash-recoverable
 `ccc.local-memory-rollback.v1` transaction: prepared → committed with the
 pre-image retained as the single undoable head, recovery completing forward
 or restoring atomically, `danso memory rollback --action <32hex>` restoring
@@ -153,7 +158,10 @@ the newest head after a full post-image CAS check. Failures classify from
 the provider failure kind and HTTP status only (auth 6h, quota until
 01:00 UTC, rate-limit 30 min, model 6h, exponential otherwise, capped at
 4 h, dead-letter after five failures, 48 h age limit, transcript-change
-dead-letter) with a scope-wide cooldown for hard classes.
+dead-letter) with a scope-wide cooldown for hard classes. Validated wiki
+candidates land in the immutable local queue
+`state/wiki-candidates/<job_id>.json` (§4.6): the first record for a job
+is kept and never rewritten; consumption stays a human/agent review step.
 
 ## Diagnostics (§6.4, M5)
 
@@ -161,7 +169,11 @@ dead-letter) with a scope-wide cooldown for hard classes.
 (open/closed/needs-human/constraints), journal pending/dead counters, the
 cooldown state, rollback head/action counts, and file presence. The audit
 ledger `state/audit.jsonl` records `MemoryCommit` and `DistillJob` events
-(category names and counts only, 1 MiB rotation). The session id is hashed
+(category names and counts only, 1 MiB rotation) — every transaction
+commit (manual add/close and distill) is audited. Manual facts go through
+the same rollback transaction as distill commits and serialize on the
+single per-scope lock (`state/.memory.lock`), so concurrent writers can
+never interleave on one facts file. The session id is hashed
 wherever it must appear; fact bodies and raw session ids never enter
 diagnostics.
 
@@ -197,8 +209,9 @@ scope: `--scope global|shared|private-<32 hex>`. Configuration errors exit 2;
 runtime refusals exit 1. Read rules (§7): a private scope reads its own tree
 plus `shared`; `shared` and `global` never open another tree.
 
-`danso run` gains `--memory off|read|read-write` (read-write registers
-pending distill jobs; extraction runs via drain), `--memory-distill
+`danso run` gains `--memory off|read|read-write` (read = injection-only,
+§8: nothing is written; read-write registers pending distill jobs and
+writes the working state; extraction runs via drain), `--memory-distill
 queue|inline|off`, `--memory-refresh per-run|per-request` (per-request
 re-assembles the context right after each compaction through a
 memory-agnostic runtime hook), `--memory-dir`, `--memory-scope`,

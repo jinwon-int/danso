@@ -1,6 +1,7 @@
 //! Two-target crash-recoverable commits compatible with the ccc
 //! `ccc.local-memory-rollback.v1` ledger (issue #52 §4.5): the targets are
-//! exactly `memory-facts.jsonl` and `resume.md`. One exclusive lock, the
+//! exactly `memory-facts.jsonl` and `resume.md`. One exclusive scope lock
+//! (`state/.memory.lock`, shared with every other scope writer), the
 //! recovery state machine runs before every operation, the pre-image of
 //! every target becomes the single undoable head, and a previous head is
 //! superseded with its pre-images purged.
@@ -107,7 +108,11 @@ impl Transaction {
             actions_dir: state_dir.join("memory-rollback/actions"),
             ledger_path: state_dir.join("memory-rollback/ledger.jsonl"),
             head_path: state_dir.join("memory-rollback/HEAD"),
-            lock_path: state_dir.join("memory-rollback/.transaction.lock"),
+            // #65 §1.5: the scope has exactly one write lock. Manual facts
+            // (`add`/`close`), distill commits, and recovery all serialize
+            // on `state/.memory.lock` instead of a second transaction-only
+            // lock that let two writers interleave on the same facts file.
+            lock_path: state_dir.join(paths::SCOPE_LOCK_FILE),
         }
     }
 
@@ -270,7 +275,12 @@ impl Transaction {
                 if !is_lower_hex(value, 64) {
                     anyhow::bail!("rollback manifest hash is invalid");
                 }
-                if !exists && value != absent_hash() {}
+                // §4.5: an absent target's hash must be exactly the absent
+                // constant — an empty-block check here once let any 64-hex
+                // value stand in for a missing pre/post-image.
+                if !exists {
+                    ensure!(value == absent_hash(), "rollback manifest hash is invalid");
+                }
             }
         }
         // Action-directory entry allowlist and pre-image presence rules.

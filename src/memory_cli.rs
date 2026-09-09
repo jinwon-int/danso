@@ -351,6 +351,7 @@ struct AddInput<'a> {
 }
 
 fn add(route: &Route, lock_timeout_ms: u64, input: AddInput<'_>) -> anyhow::Result<Option<Value>> {
+    use danso::memory::transaction::{CommitMeta, Transaction};
     let now = chrono::Utc::now();
     let candidate = facts::Candidate {
         kind: input.kind.to_string(),
@@ -372,33 +373,68 @@ fn add(route: &Route, lock_timeout_ms: u64, input: AddInput<'_>) -> anyhow::Resu
         job_id: None,
         explicit_id: input.id.map(str::to_string),
     };
-    let _lock =
-        paths::ExclusiveLock::acquire(&route.scope_lock(), paths::lock_timeout(lock_timeout_ms))?;
-    let existing = facts::load(route)?;
-    let output = facts::gate_and_render(
-        &existing,
-        vec![candidate],
-        memory::audience_for_scope(route.scope()),
-        now,
-        facts::MAX_FACTS_DEFAULT,
-    )?;
-    if !output.changed {
-        return Ok(Some(json!({ "added": false, "report": output.report })));
-    }
-    if output.report.saved == 0 {
-        if output.report.skipped_mutable > 0 {
+    // #65 §1.5: manual facts commit through the rollback transaction under
+    // the single scope lock, so a manual write and a distill commit can no
+    // longer interleave on the same `memory-facts.jsonl`.
+    let transaction = Transaction::new(&route.state_dir());
+    let meta = CommitMeta {
+        provider: "danso".into(),
+        actor: "manual".into(),
+        tool: "local-memory-add".into(),
+        diff: "add-fact".into(),
+        session: input
+            .id
+            .map(str::to_string)
+            .unwrap_or_else(|| "manual".into()),
+    };
+    let audience = memory::audience_for_scope(route.scope());
+    let mut report: Option<facts::GateReport> = None;
+    let commit = transaction.commit(paths::lock_timeout(lock_timeout_ms), &meta, |before| {
+        let mut next = before.clone();
+        for (name, current) in next.iter_mut() {
+            if name == memory::FACTS_FILE_NAME {
+                let file = facts::read(current.clone())?;
+                let output = facts::gate_and_render(
+                    &file,
+                    vec![candidate.clone()],
+                    audience,
+                    now,
+                    facts::MAX_FACTS_DEFAULT,
+                )?;
+                if output.changed {
+                    *current = Some(output.lines.concat().into_bytes());
+                }
+                report = Some(output.report);
+            }
+        }
+        Ok(next)
+    })?;
+    let report = match report {
+        Some(report) => report,
+        None => anyhow::bail!("fact refused by the write gates"),
+    };
+    if report.saved == 0 {
+        if report.skipped_mutable > 0 {
             anyhow::bail!(
                 "mutable operational fact refused: measure it live instead of memorizing it"
             );
         }
-        if output.report.skipped_missing_reason > 0 {
+        if report.skipped_missing_reason > 0 {
             anyhow::bail!("decision facts require a because reason");
         }
         anyhow::bail!("fact refused by the write gates");
     }
-    let payload: String = output.lines.concat();
-    paths::atomic_write(&route.facts_file(), payload.as_bytes(), "memory facts")?;
-    Ok(Some(json!({ "added": true, "report": output.report })))
+    if let Some(action_id) = commit.action_id {
+        memory::audit::record(
+            route,
+            &memory::audit::Event::Commit {
+                action_id,
+                changed: vec![memory::FACTS_FILE_NAME.to_string()],
+                facts_added: report.saved,
+            },
+        );
+    }
+    Ok(Some(json!({ "added": true, "report": report })))
 }
 
 fn search(

@@ -33,11 +33,22 @@ pub const TRIGGERS: [&str; 5] = [
     "shutdown",
 ];
 
-/// One validated extraction, ready for the write gates.
+/// One validated extraction, ready for the write gates. `provenance` is the
+/// input-echoed header (#52 §4.6) — validated to match exactly — and is what
+/// `resume.md` records instead of fixed placeholders.
 pub struct ValidatedExtraction {
     pub summary: Value,
     pub facts: Vec<FactDraft>,
     pub wiki_candidates: Vec<Value>,
+    pub provenance: Provenance,
+}
+
+/// The validated `provenance` object of an extraction response.
+pub struct Provenance {
+    pub provider: String,
+    pub source_thread_hash: String,
+    pub trigger: String,
+    pub distilled_at: String,
 }
 
 /// One fact draft from `honcho[]` before the write gates.
@@ -381,8 +392,12 @@ pub fn validate_output(
                 "fact subject is invalid"
             );
         }
+        // §4.1 source ranks: 3 user-stated, 2 measured, 1 inferred. A
+        // verbatim quote (>= 8 chars) stays the verification bar for the
+        // stated/measured ranks; without one the draft falls to inferred.
         let rank = match (source, quote) {
-            (Some(_), Some(quote)) if quote.chars().count() >= 8 => 2,
+            (Some("user-stated"), Some(quote)) if quote.chars().count() >= 8 => 3,
+            (Some("measured"), Some(quote)) if quote.chars().count() >= 8 => 2,
             _ => 1,
         };
         drafts.push(FactDraft {
@@ -433,5 +448,14 @@ pub fn validate_output(
         summary,
         facts: drafts,
         wiki_candidates: wiki,
+        provenance: Provenance {
+            provider: "danso".into(),
+            source_thread_hash: source_thread_hash.to_string(),
+            trigger: trigger.to_string(),
+            distilled_at: provenance["distilled_at"]
+                .as_str()
+                .expect("validated")
+                .to_string(),
+        },
     })
 }

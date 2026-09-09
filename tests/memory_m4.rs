@@ -657,3 +657,420 @@ async fn drain_classifies_provider_http_failures() {
         std::fs::remove_file(journal::journal_dir(&route).join(format!("{job_id}.json"))).ok();
     }
 }
+
+// ---------------------------------------------------------------------------
+// #65 second PR: one scope lock, audit wiring, wiki queue, provenance header,
+// STRICT retry, rank mapping, absent-hash validation.
+// ---------------------------------------------------------------------------
+
+fn reply_with_text(text: &str) -> Value {
+    json!({
+        "model": "fixture-model",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+}
+
+/// Scripted provider: fails validation on the first call when
+/// `first_invalid` is set, then echoes the extraction input's provenance
+/// into a valid response. Records every system prompt it is given.
+struct EchoExtraction {
+    calls: AtomicUsize,
+    systems: std::sync::Mutex<Vec<String>>,
+    first_invalid: bool,
+    wiki_candidates: Value,
+}
+
+impl Provider for EchoExtraction {
+    fn validate_history(&self, _: &[Value]) -> Result<()> {
+        Ok(())
+    }
+    async fn complete(&mut self, request: ModelRequest<'_>, _: &mut Usage) -> Result<Value> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.systems.lock().unwrap().push(format!(
+            "{}|{}",
+            request.system.stable, request.system.volatile
+        ));
+        let input: Value = serde_json::from_str(
+            request.messages[request.messages.len() - 1]["content"]
+                .as_str()
+                .expect("string content"),
+        )?;
+        if self.first_invalid && call == 0 {
+            return Ok(reply_with_text("not json at all"));
+        }
+        let response = json!({
+            "schema_version": 1,
+            "provenance": {
+                "provider": input["provider"],
+                "source_thread_hash": input["source_thread_hash"],
+                "trigger": input["trigger"],
+                "distilled_at": input["captured_at"],
+            },
+            "honcho": [{"kind": "preference", "text": "에디터는 Helix", "subject": "user"}],
+            "wiki_candidates": self.wiki_candidates,
+            "resume": {"last_activity": "작업 완료", "pending_action": "",
+                       "awaiting_user": false, "open_question": "", "next_step": "",
+                       "evidence": []},
+        });
+        Ok(reply_with_text(&serde_json::to_string(&response)?))
+    }
+}
+
+fn enqueue_job(route: &Route, dir: &Path) -> String {
+    let session_path = dir.join("session.jsonl");
+    let lines = session_lines("550e8400-e29b-41d4-a716-446655440000", 4, 16);
+    write_private(&session_path, lines.as_bytes());
+    match journal::enqueue(route, &session_path, "explicit", now()).unwrap() {
+        journal::EnqueueOutcome::Enqueued { job_id } => job_id,
+        other => panic!("expected enqueue, got {other:?}"),
+    }
+}
+
+/// #65 §1.5: the scope has exactly one write lock. The transaction acquires
+/// `state/.memory.lock`, and a manual close refuses while that lock is held
+/// elsewhere instead of interleaving on the same facts file.
+#[test]
+fn scope_lock_is_the_single_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let transaction = Transaction::new(&route.state_dir());
+    transaction
+        .commit(1000, &meta("dddddddddddddddd"), |before| {
+            let mut next = before.clone();
+            for (name, current) in next.iter_mut() {
+                if name == "memory-facts.jsonl" {
+                    let file = facts::read(current.clone())?;
+                    let output = facts::gate_and_render(
+                        &file,
+                        vec![helix_candidate()],
+                        "private",
+                        now(),
+                        1000,
+                    )?;
+                    if output.changed {
+                        *current = Some(output.lines.concat().into_bytes());
+                    }
+                }
+            }
+            Ok(next)
+        })
+        .unwrap();
+    assert!(
+        route.scope_lock().exists(),
+        "the scope lock file is the lock"
+    );
+    assert!(
+        !route
+            .state_dir()
+            .join("memory-rollback/.transaction.lock")
+            .exists(),
+        "no second transaction-only lock may exist"
+    );
+    // Holding the scope lock blocks a manual close (fail closed, no wait).
+    let held = danso::memory::paths::ExclusiveLock::acquire(
+        &route.scope_lock(),
+        danso::memory::paths::lock_timeout(1000),
+    )
+    .unwrap();
+    let result = facts::close(&route, "editor-helix", now(), 50);
+    assert!(
+        result.is_err(),
+        "close must refuse while the scope lock is held"
+    );
+    drop(held);
+}
+
+fn helix_candidate() -> Candidate {
+    Candidate {
+        kind: "preference".into(),
+        text: "에디터는 Helix".into(),
+        because: None,
+        quote: None,
+        source_rank: 1,
+        observed_at: facts::format_timestamp(now()),
+        entities: vec!["user".into()],
+        tags: vec!["distilled".into()],
+        valid_from: None,
+        valid_until: None,
+        transcript: None,
+        manual: false,
+        job_id: Some("job".into()),
+        explicit_id: Some("editor-helix".into()),
+    }
+}
+
+/// #65 §1.5: a manual close goes through the rollback transaction — it
+/// leaves an undoable head, is audited, and rollback reopens the fact.
+#[test]
+fn close_is_undoable_and_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let transaction = Transaction::new(&route.state_dir());
+    transaction
+        .commit(1000, &meta("dddddddddddddddd"), |before| {
+            let mut next = before.clone();
+            for (name, current) in next.iter_mut() {
+                if name == "memory-facts.jsonl" {
+                    let file = facts::read(current.clone())?;
+                    let output = facts::gate_and_render(
+                        &file,
+                        vec![helix_candidate()],
+                        "private",
+                        now(),
+                        1000,
+                    )?;
+                    if output.changed {
+                        *current = Some(output.lines.concat().into_bytes());
+                    }
+                }
+            }
+            Ok(next)
+        })
+        .unwrap()
+        .action_id
+        .unwrap();
+
+    let outcome = facts::close(&route, "editor-helix", now(), 1000).unwrap();
+    assert_eq!(outcome, facts::CloseOutcome::Closed);
+    let head_path = route.state_dir().join("memory-rollback/HEAD");
+    let head = std::fs::read_to_string(&head_path)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head.len(), 32, "close left an undoable head");
+    let audit_path = route.state_dir().join("audit.jsonl");
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(
+        audit.contains(&format!("\"action_id\":\"{head}\"")),
+        "the close commit is audited: {audit}"
+    );
+    // Rolling the close back reopens the fact.
+    assert_eq!(
+        transaction.rollback(1000, &head).unwrap(),
+        transaction::RollbackOutcome::RolledBack
+    );
+    let reopened = facts::load(&route).unwrap();
+    let record = reopened.records().find(|r| r.id == "editor-helix").unwrap();
+    assert!(record.valid_until.is_none(), "rollback cleared valid_until");
+}
+
+/// #65 §2: an absent target's manifest hash must be exactly the absent
+/// constant — the old check was an empty block and accepted anything.
+#[test]
+fn manifest_absent_hash_must_be_the_absent_constant() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    write_private(&route.facts_file(), b"original\n");
+    let action_id = "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
+    let action_dir = route
+        .state_dir()
+        .join("memory-rollback/actions")
+        .join(action_id);
+    danso::memory::paths::require_private_dir(&action_dir).unwrap();
+    write_private(&action_dir.join("before-memory-facts.jsonl"), b"original\n");
+    let bogus_absent = "a".repeat(64);
+    let manifest = json!({
+        "schema": "ccc.local-memory-rollback.v1",
+        "action_id": action_id,
+        "state": "prepared",
+        "parent": Value::Null,
+        "provider": "danso",
+        "actor": "distill",
+        "tool": "local-memory-sink",
+        "diff": "mode-both",
+        "session": "aabbccdd00112233",
+        "created_at": "2026-09-08T12:00:00Z",
+        "targets": {
+            "memory-facts.jsonl": {
+                "before_exists": true,
+                "after_exists": true,
+                "before_hash": facts::hex_encode(&sha2::Sha256::digest(b"original\n")),
+                "after_hash": facts::hex_encode(&sha2::Sha256::digest(b"changed\n"))
+            },
+            "resume.md": {
+                "before_exists": false,
+                "after_exists": false,
+                "before_hash": bogus_absent,
+                "after_hash": bogus_absent
+            }
+        }
+    });
+    write_private(
+        &action_dir.join("manifest.json"),
+        format!("{}\n", manifest).as_bytes(),
+    );
+    let transaction = Transaction::new(&route.state_dir());
+    let result = transaction.commit(1000, &meta("dddddddddddddddd"), |before| Ok(before.clone()));
+    let error = format!("{}", result.unwrap_err());
+    assert!(
+        error.contains("rollback manifest hash is invalid"),
+        "the bogus absent hash must be refused: {error}"
+    );
+    assert_eq!(std::fs::read(route.facts_file()).unwrap(), b"original\n");
+}
+
+/// #65 §2: the single STRICT retry must change the request — the second
+/// system prompt carries the strict instruction.
+#[tokio::test]
+async fn strict_retry_changes_the_second_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let job_id = enqueue_job(&route, dir.path());
+    let mut provider = EchoExtraction {
+        calls: AtomicUsize::new(0),
+        systems: std::sync::Mutex::new(Vec::new()),
+        first_invalid: true,
+        wiki_candidates: json!([]),
+    };
+    let mut usage = Usage::default();
+    let report =
+        danso::memory::distill::extract::drain(&route, &mut provider, &mut usage, 1, 1000, now())
+            .await
+            .unwrap();
+    assert_eq!(report.extracted, 1, "the strict retry recovers");
+    let systems = provider.systems.lock().unwrap();
+    assert_eq!(systems.len(), 2, "exactly one STRICT retry");
+    assert!(!systems[0].contains("STRICT RETRY"));
+    assert!(
+        systems[1].contains("STRICT RETRY"),
+        "the retry must carry the strict instruction"
+    );
+    let pending = route
+        .state_dir()
+        .join("distill-journal")
+        .read_dir()
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+        .count();
+    assert_eq!(pending, 0, "job {job_id} completed");
+}
+
+/// #65 §2: source ranks follow the design table — 3 user-stated, 2
+/// measured, 1 inferred; the quote stays the verification bar.
+#[test]
+fn source_ranks_follow_the_design_mapping() {
+    let rank_of = |source: &str, quote: Option<&str>| -> i64 {
+        let mut item = json!({"kind": "preference", "text": "에디터는 Helix", "source": source});
+        if let Some(quote) = quote {
+            item["quote"] = json!(quote);
+        }
+        let extraction = memory::distill::validate_output(
+            &serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "provenance": {"provider": "danso", "source_thread_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "trigger": "explicit", "distilled_at": "2026-09-08T12:00:00Z"},
+                "honcho": [item],
+                "resume": {}
+            }))
+            .unwrap(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "explicit",
+            true,
+        )
+        .unwrap();
+        extraction.facts[0].source_rank
+    };
+    assert_eq!(
+        rank_of("user-stated", Some("사용자가 말한 그대로의 근거")),
+        3
+    );
+    assert_eq!(rank_of("measured", Some("직접 측정한 근거 텍스트")), 2);
+    assert_eq!(rank_of("inferred", Some("추론의 근거가 되는 텍스트")), 1);
+    assert_eq!(rank_of("user-stated", None), 1, "no quote, no stated rank");
+    assert_eq!(rank_of("user-stated", Some("짧다")), 1, "quote too short");
+}
+
+/// #65 §1.6/§1.7/§2: drain wires the audit ledger and the immutable wiki
+/// queue, and resume.md carries the echoed provenance header.
+#[tokio::test]
+async fn drain_audits_wiki_queues_and_stamps_resume_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let job_id = enqueue_job(&route, dir.path());
+    // Immutability: a pre-existing queue record is never rewritten.
+    let queue_dir = route.state_dir().join("wiki-candidates");
+    danso::memory::paths::require_private_dir(&queue_dir).unwrap();
+    write_private(
+        &queue_dir.join(format!("{job_id}.json")),
+        b"{\"schema\":\"tampered\"}",
+    );
+    let mut provider = EchoExtraction {
+        calls: AtomicUsize::new(0),
+        systems: std::sync::Mutex::new(Vec::new()),
+        first_invalid: false,
+        wiki_candidates: json!([{
+            "title": "에디터 표준",
+            "suggested_path": "pages/editor.md",
+            "summary": "Helix 표준 정리",
+            "evidence_excerpt": "에디터는 Helix"
+        }]),
+    };
+    let mut usage = Usage::default();
+    let report =
+        danso::memory::distill::extract::drain(&route, &mut provider, &mut usage, 1, 1000, now())
+            .await
+            .unwrap();
+    assert_eq!(report.extracted, 1);
+
+    // The wiki queue keeps the FIRST record for the job.
+    let queue_file = queue_dir.join(format!("{job_id}.json"));
+    let queue: Value = serde_json::from_slice(&std::fs::read(&queue_file).unwrap()).unwrap();
+    assert_eq!(queue["schema"], json!("tampered"), "never rewritten");
+
+    // The audit ledger holds both the MemoryCommit and the DistillJob.
+    let audit = std::fs::read_to_string(route.state_dir().join("audit.jsonl")).unwrap();
+    assert!(audit.contains("\"event\":\"MemoryCommit\""), "{audit}");
+    assert!(audit.contains("\"facts_added\":1"), "{audit}");
+    assert!(
+        audit.contains("\"event\":\"DistillJob\"") && audit.contains("\"status\":\"extracted\""),
+        "{audit}"
+    );
+
+    // resume.md carries the real echoed provenance, not placeholders.
+    let resume = std::fs::read_to_string(route.state_dir().join("resume.md")).unwrap();
+    let expected_hash = facts::hex_encode(&sha2::Sha256::digest(
+        "550e8400-e29b-41d4-a716-446655440000".as_bytes(),
+    ));
+    let expected_header = format!(
+        "<!-- ccc-node:distill schema=1 provider=danso thread_hash={expected_hash} trigger=explicit distilled_at={} -->",
+        facts::format_timestamp(now())
+    );
+    assert!(
+        resume.starts_with(&expected_header),
+        "resume header must be the echoed provenance:\n{expected_header}\n---\n{resume}"
+    );
+}
+
+/// #65 §1.6: a failed drain also lands a DistillJob record with the class.
+#[tokio::test]
+async fn failed_drain_is_audited_with_its_class() {
+    struct Always429;
+    impl Provider for Always429 {
+        fn validate_history(&self, _: &[Value]) -> Result<()> {
+            Ok(())
+        }
+        async fn complete(&mut self, _: ModelRequest<'_>, _: &mut Usage) -> Result<Value> {
+            Err(danso::failure::http_status_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+            ))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let _job_id = enqueue_job(&route, dir.path());
+    let mut provider = Always429;
+    let mut usage = Usage::default();
+    let report =
+        danso::memory::distill::extract::drain(&route, &mut provider, &mut usage, 1, 1000, now())
+            .await
+            .unwrap();
+    assert_eq!(report.failed, 1);
+    let audit = std::fs::read_to_string(route.state_dir().join("audit.jsonl")).unwrap();
+    assert!(
+        audit.contains("\"status\":\"failed\"")
+            && audit.contains("\"error_class\":\"rate_limited\""),
+        "{audit}"
+    );
+}

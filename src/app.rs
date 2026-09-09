@@ -449,7 +449,10 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     let mut session = session;
     // The harness records working state on compaction and at a finished run
     // (§5.3); the runtime itself stays memory-agnostic.
-    let memory_root = if args.memory.mode != memory::MemoryMode::Off {
+    // #65 §2: `--memory read` is injection-only (§8) — working state,
+    // checkpoints, and the session archive are written in read-write mode
+    // exclusively.
+    let memory_root = if args.memory.mode == memory::MemoryMode::ReadWrite {
         Some(
             args.memory
                 .root

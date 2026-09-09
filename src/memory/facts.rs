@@ -903,13 +903,16 @@ pub fn gate_and_render(
 }
 
 /// Close one fact by id (`valid_until = now`), preserving every other field.
-/// Idempotent: an already-closed fact returns `AlreadyClosed`.
+/// Idempotent: an already-closed fact returns `AlreadyClosed`. The write goes
+/// through the rollback transaction under the single scope lock (#65 §1.5:
+/// manual facts and distill commits mutually exclude on the same ledger).
 pub fn close(
     route: &paths::Route,
     fact_id: &str,
     now: DateTime<Utc>,
     lock_timeout_ms: u64,
 ) -> Result<CloseOutcome> {
+    use super::transaction::{CommitMeta, Transaction};
     ensure!(paths::valid_scope(route.scope()), "invalid scope");
     ensure!(
         fact_id
@@ -919,43 +922,73 @@ pub fn close(
             && fact_id.len() <= MAX_LABEL_BYTES,
         "fact id must be [a-z0-9-]"
     );
-    let _lock =
-        paths::ExclusiveLock::acquire(&route.scope_lock(), paths::lock_timeout(lock_timeout_ms))?;
-    let facts = load(route)?;
     let now_label = format_timestamp(now);
-    let mut changed = false;
+    let target_facts = super::transaction::TARGETS[0];
+    let transaction = Transaction::new(&route.state_dir());
+    let meta = CommitMeta {
+        provider: "danso".into(),
+        actor: "manual".into(),
+        tool: "local-memory-close".into(),
+        diff: "close-fact".into(),
+        session: fact_id.to_string(),
+    };
     let mut outcome = CloseOutcome::NotFound;
-    let mut rendered: Vec<String> = Vec::with_capacity(facts.lines.len());
-    for line in &facts.lines {
-        match line {
-            Line::Good(record) if record.id == fact_id => {
-                let already = record
-                    .valid_until
-                    .as_deref()
-                    .and_then(|raw| parse_timestamp(raw).ok())
-                    .map(|until| until <= now)
-                    .unwrap_or(false);
-                if already {
-                    outcome = CloseOutcome::AlreadyClosed;
-                    rendered.push(record.to_line());
-                } else {
-                    let mut closed = record.clone();
-                    if let Some(object) = closed.raw.as_object_mut() {
-                        object.insert("valid_until".into(), Value::from(now_label.as_str()));
+    let commit = transaction.commit(lock_timeout_ms, &meta, |before| {
+        let current = before
+            .iter()
+            .find(|(name, _)| name == target_facts)
+            .and_then(|(_, payload)| payload.clone());
+        let facts = read(current)?;
+        let mut rendered: Vec<String> = Vec::with_capacity(facts.lines.len());
+        let mut changed = false;
+        outcome = CloseOutcome::NotFound;
+        for line in &facts.lines {
+            match line {
+                Line::Good(record) if record.id == fact_id => {
+                    let already = record
+                        .valid_until
+                        .as_deref()
+                        .and_then(|raw| parse_timestamp(raw).ok())
+                        .map(|until| until <= now)
+                        .unwrap_or(false);
+                    if already {
+                        outcome = CloseOutcome::AlreadyClosed;
+                        rendered.push(record.to_line());
+                    } else {
+                        let mut closed = record.clone();
+                        if let Some(object) = closed.raw.as_object_mut() {
+                            object.insert("valid_until".into(), Value::from(now_label.as_str()));
+                        }
+                        closed.valid_until = Some(now_label.clone());
+                        rendered.push(closed.to_line());
+                        changed = true;
+                        outcome = CloseOutcome::Closed;
                     }
-                    closed.valid_until = Some(now_label.clone());
-                    rendered.push(closed.to_line());
-                    changed = true;
-                    outcome = CloseOutcome::Closed;
+                }
+                Line::Good(record) => rendered.push(record.to_line()),
+                Line::Opaque(raw) => rendered.push(format!("{raw}\n")),
+            }
+        }
+        let mut next = before.clone();
+        if changed {
+            let payload: String = rendered.concat();
+            for (name, slot) in next.iter_mut() {
+                if name == target_facts {
+                    *slot = Some(payload.clone().into_bytes());
                 }
             }
-            Line::Good(record) => rendered.push(record.to_line()),
-            Line::Opaque(raw) => rendered.push(format!("{raw}\n")),
         }
-    }
-    if changed {
-        let payload: String = rendered.concat();
-        paths::atomic_write(&route.facts_file(), payload.as_bytes(), "memory facts")?;
+        Ok(next)
+    })?;
+    if let Some(action_id) = commit.action_id {
+        super::audit::record(
+            route,
+            &super::audit::Event::Commit {
+                action_id,
+                changed: vec![target_facts.to_string()],
+                facts_added: 0,
+            },
+        );
     }
     Ok(outcome)
 }

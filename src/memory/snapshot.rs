@@ -339,7 +339,8 @@ pub fn assemble(route: &Route, options: &SnapshotOptions) -> Result<String> {
 
     // 5. local hot with the dynamic budget (§5.1):
     //    alloc = max(3000, max_bytes − 1000 − mem − (resume + working_state)).
-    let used = body.len() + working_block.len();
+    //    `working_block` is already part of `body` — count it once (#65 §2).
+    let used = body.len();
     let alloc = LOCAL_HOT_FLOOR.max(max_bytes.saturating_sub(BUDGET_SLACK + used));
     let hot = local_hot_block(route, options.query, alloc, options.now)?;
     body.push_str(&hot);
