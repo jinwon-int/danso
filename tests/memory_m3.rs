@@ -243,6 +243,7 @@ async fn run_inner(route: &Route, session_path: &Path) -> anyhow::Result<()> {
             compact_at_bytes: Some(8192),
             refresh_context: None,
             long_task: None,
+            repeat_limit: 0,
             pause_requested: None,
         },
         &mut provider,

@@ -147,6 +147,7 @@ fn input<'a>(prompt: &'a str, task: LongTaskRun) -> RunInput<'a> {
         compact_at_bytes: None,
         refresh_context: None,
         long_task: Some(task),
+        repeat_limit: 0,
         pause_requested: None,
     }
 }
@@ -615,4 +616,87 @@ fn status_is_read_only_and_rejects_expired_budget_without_provider() {
     assert_eq!(status["state"], "paused");
     assert_eq!(status["resume_allowed"], false);
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// Issue #70 D: the short-mode repeat guard guides once at the threshold and
+/// terminates on the next identical batch. Run-local: the journal records no
+/// long-task state and no task events are emitted.
+struct RecordingProvider {
+    replies: VecDeque<Value>,
+    systems: RefCell<Vec<String>>,
+}
+impl Provider for RecordingProvider {
+    fn validate_history(&self, _: &[Value]) -> Result<()> {
+        Ok(())
+    }
+    async fn complete(&mut self, request: ModelRequest<'_>, _: &mut Usage) -> Result<Value> {
+        self.systems.borrow_mut().push(request.system.to_string());
+        self.replies
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("unexpected fake provider request"))
+    }
+}
+
+#[tokio::test]
+async fn short_mode_repeat_guard_guides_once_then_terminates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+    let replies: VecDeque<Value> = ["call1", "call2", "call3", "call4"]
+        .iter()
+        .map(|id| tool_reply(id))
+        .collect();
+    let mut provider = RecordingProvider {
+        replies,
+        systems: RefCell::new(vec![]),
+    };
+    let executor = FakeExecutor {
+        calls: Rc::new(RefCell::new(vec![])),
+        outputs: RefCell::new(VecDeque::new()),
+    };
+    let mut sink = Sink::default();
+    let input = RunInput {
+        no_tools: false,
+        prompt: "probe the fixture",
+        context: "",
+        execution_context: "",
+        max_turns: 8,
+        compact_at_bytes: None,
+        refresh_context: None,
+        long_task: None,
+        repeat_limit: 3,
+        pause_requested: None,
+    };
+    let error = runtime::run(
+        input,
+        &mut provider,
+        &executor,
+        &mut session,
+        &mut sink,
+        &mut Usage::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(failure::category(&error), Some(Kind::RequestBudget));
+    assert_eq!(
+        provider.systems.borrow().len(),
+        4,
+        "guide request + terminating repeat"
+    );
+    // Requests 1-3 are guidance-free; request 4 carries the one-time notice.
+    let systems = provider.systems.borrow();
+    for system in &systems[..3] {
+        assert!(!system.contains("Identical tool batch"), "{system}");
+    }
+    assert!(
+        systems[3].contains("Identical tool batch repeated 3 times"),
+        "{}",
+        systems[3]
+    );
+    assert!(sink.task_states.is_empty(), "no long-task task events");
+    assert!(
+        session.long_task_records().unwrap().is_empty(),
+        "the guard is run-local and writes no long-task journal records"
+    );
+    // The final answer path never ran: no terminal stop reply was consumed.
 }

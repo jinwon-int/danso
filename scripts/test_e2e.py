@@ -331,6 +331,23 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(p.stdout, '')
         self.usage(p)
 
+    def test_repeat_limit_guides_once_then_ends_as_request_budget(self):
+        # Issue #70 D: identical settled batches reaching --repeat-limit get
+        # a one-time system notice; repeating once more ends the run.
+        for i in range(4):
+            self.responses.append((200, reply(
+                [call('bash', {'command': 'printf ok'}, f'probe{i}')], 'tool_use')))
+        p = self.run_cli('-p', '--repeat-limit', '3')
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertEqual(p.stdout, '')
+        errors = [l for l in p.stderr.splitlines() if l.startswith('DANSO_ERROR=')]
+        self.assertEqual(len(errors), 1, p.stderr)
+        self.assertIn('"category":"request_budget"', errors[0])
+        self.assertEqual(len(self.requests), 4)
+        for body in self.requests[:3]:
+            self.assertNotIn('Identical tool batch', body['system'])
+        self.assertIn('Identical tool batch repeated 3 times', self.requests[3]['system'])
+
     def test_length_stop_reports_max_tokens_diagnostic_and_cap(self):
         # Issue #69 B: stop_reason=max_tokens with no tool calls is a provider
         # failure whose diagnostic names the cap and the flag that raises it.

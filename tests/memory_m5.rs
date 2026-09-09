@@ -245,6 +245,7 @@ async fn per_request_refresh_re_resolves_after_compaction() {
             compact_at_bytes: Some(8192),
             refresh_context: Some(&hook),
             long_task: None,
+            repeat_limit: 0,
             pause_requested: None,
         },
         &mut provider,

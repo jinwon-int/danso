@@ -91,6 +91,11 @@ pub struct Args {
     /// An explicit DANSO_GLM_BASE_URL wins but must not contradict the preset.
     #[arg(long, value_parser = ["general", "coding"])]
     pub glm_endpoint: Option<String>,
+    /// Short-mode identical tool-batch guard: 0 disables (default), 2..8
+    /// enables detection with a one-time system notice (issue #70 D).
+    /// Long-task runs use --task-repeat-limit instead.
+    #[arg(long, conflicts_with_all = ["long_task", "resume_task"])]
+    pub repeat_limit: Option<u32>,
     /// Opt in to checkpoint compaction above this serialized request size (8192..393216).
     #[arg(long)]
     pub compact_at_bytes: Option<usize>,
@@ -205,6 +210,7 @@ impl Args {
             max_output_tokens: self.max_output_tokens,
             glm_thinking: self.glm_thinking.clone(),
             glm_endpoint: self.glm_endpoint.clone(),
+            repeat_limit: self.repeat_limit.unwrap_or(0),
             compact_at_bytes: self.compact_at_bytes,
             timeout_seconds,
             provider_timeout_seconds: self.provider_timeout_seconds,
@@ -357,6 +363,16 @@ mod tests {
                 .max_output_tokens,
             Some(999999999)
         );
+    }
+
+    /// Issue #70 D: the short-mode repeat guard is off by default and is a
+    /// short-mode-only flag — long-task keeps its own --task-repeat-limit.
+    #[test]
+    fn repeat_limit_is_short_mode_only() {
+        assert_eq!(parse(&[]).config().repeat_limit, 0);
+        assert_eq!(parse(&["--repeat-limit", "3"]).config().repeat_limit, 3);
+        assert!(try_parse(&["--repeat-limit", "3", "--long-task"]).is_err());
+        assert!(try_parse(&["--repeat-limit", "3", "--resume-task"]).is_err());
     }
 
     #[test]

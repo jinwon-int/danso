@@ -35,6 +35,10 @@ pub struct RunInput<'a> {
     /// hook owns every policy — the runtime stays memory-agnostic.
     pub refresh_context: Option<&'a dyn Fn() -> Result<String>>,
     pub long_task: Option<LongTaskRun>,
+    /// Short-mode identical-batch guard (issue #70 D): 0 disables; 2..=8
+    /// enables the fingerprinted detection. Long-task runs ignore this and
+    /// keep their immutable `task.repeat_limit` semantics.
+    pub repeat_limit: u32,
     /// Set by the CLI's graceful SIGUSR1 handler. The runtime only observes
     /// this flag at settled boundaries; it never interrupts a provider or
     /// tool operation.
@@ -60,6 +64,7 @@ impl<'a> RunInput<'a> {
             compact_at_bytes,
             refresh_context: None,
             long_task: None,
+            repeat_limit: 0,
             pause_requested: None,
         }
     }
@@ -434,6 +439,11 @@ pub async fn run(
         input.max_turns
     };
     let mut summary_requests = 0;
+    // Short-mode identical-batch guard state (issue #70 D): run-local, the
+    // journal is never touched.
+    let mut last_batch_fingerprint = String::new();
+    let mut batch_repeat_count: u64 = 0;
+    let mut repeat_guidance: Option<String> = None;
     while remaining > 0 {
         if let Some(task) = input.long_task {
             if pause_if_requested(&mut long_ledger, session, input.pause_requested)
@@ -486,6 +496,10 @@ pub async fn run(
             summary_requests,
             final_phase,
         );
+        if let Some(notice) = &repeat_guidance {
+            system.push('\n');
+            system.push_str(notice);
+        }
         async {
             if let Some(limit) = input.compact_at_bytes {
                 let before = provider
@@ -563,6 +577,10 @@ pub async fn run(
                         summary_requests,
                         final_phase,
                     );
+                    if let Some(notice) = &repeat_guidance {
+                        system.push('\n');
+                        system.push_str(notice);
+                    }
                     let compacted = crate::compaction::checkpoint_messages(&summary, &messages)?;
                     let after = provider
                         .request_bytes(&ModelRequest {
@@ -804,6 +822,28 @@ pub async fn run(
                 return Err(at(Kind::RequestBudget)(anyhow::anyhow!(
                     "long-task paused at a settled boundary"
                 )));
+            }
+        }
+        if input.long_task.is_none() && input.repeat_limit > 0 {
+            // Short-mode identical-batch guard (issue #70 D): run-local. At
+            // the threshold the next request carries a one-time system
+            // notice; repeating the same batch again ends the run.
+            let fingerprint = crate::long_task::fingerprint_batch(&batch);
+            if last_batch_fingerprint == fingerprint {
+                batch_repeat_count += 1;
+            } else {
+                last_batch_fingerprint = fingerprint;
+                batch_repeat_count = 1;
+            }
+            if batch_repeat_count >= u64::from(input.repeat_limit) {
+                if repeat_guidance.is_some() {
+                    return Err(at(Kind::RequestBudget)(anyhow::anyhow!(
+                        "repeated identical tool batch reached safety limit"
+                    )));
+                }
+                repeat_guidance = Some(format!(
+                    "Identical tool batch repeated {batch_repeat_count} times and the results did not change. Do not repeat reads or commands that cannot return new information; move to the next step of the task."
+                ));
             }
         }
     }
