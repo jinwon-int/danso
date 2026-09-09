@@ -57,9 +57,11 @@ does not verify: out-of-range output caps surface as the provider's own 400
 without automatic adjustment (issue #69 A). Confirm current values against
 Z.AI's model documentation before sizing requests; the 2026-09-09 measurement
 environment could not reach docs.z.ai to pin them here. The coding-plan quota
-windows (5h/weekly) are operator-managed upstream; a 429 ends the invocation
-without retry and its `DANSO_PROVIDER http_status=429` record is available to
-the bridge for quota bookkeeping.
+windows (5h/weekly) are operator-managed upstream. A 429 is retryable under
+the bounded wire retry (issue #67 B); once retries are exhausted the run ends
+with exit code 3 and the `DANSO_PROVIDER http_status=429` record is available
+to the bridge for quota bookkeeping. Pass `--provider-retries 0` where a
+single attempt is preferred.
 
 `scripts/danso-glm` execs danso with the flash profile above; `ZAI_API_KEY`
 must exist in the environment and `DANSO_GLM_MODEL` optionally swaps the
@@ -150,17 +152,20 @@ provider request timed out: phase=before_response_headers elapsed_ms=60001 reque
 
 `elapsed_ms` is measured from dispatch with a monotonic clock; `request_bytes`
 is the serialized JSON body length. Errors contain no URL, key, request/response
-body, or underlying exception text. Redirects, byte limits, usage accounting
-and the no-retry policy remain unchanged.
+body, or underlying exception text. Redirects, byte limits and usage accounting
+remain unchanged; retryable failures follow the bounded wire retry
+(issue #67 B, see docs/v0.md).
 
 For a typed HTTP transport failure, the CLI also emits one optional body-free
 record alongside the unchanged `DANSO_ERROR` record:
 
 ```text
-DANSO_TRANSPORT={"version":1,"phase":"response_body","elapsed_ms":60001,"request_bytes":30502}
+DANSO_TRANSPORT={"version":1,"phase":"response_body","elapsed_ms":60001,"request_bytes":30502,"attempts":1}
 ```
 
-Its exact keys are `version`, `phase`, `elapsed_ms`, and `request_bytes`.
+Its exact keys are `version`, `phase`, `elapsed_ms`, `request_bytes`, and
+`attempts` (HTTP attempts including the first; the integrations adapter
+validates 1..8).
 `phase` is one of `connect`, `before_response_headers`, or `response_body`;
 the numeric fields are nonnegative bounded integers. The record is emitted only
 for typed native HTTP transport failures, never for HTTP status or response
