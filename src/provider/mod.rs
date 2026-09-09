@@ -6,6 +6,12 @@ pub use chatgpt_auth::adopt as adopt_chatgpt_auth;
 pub mod glm;
 mod http;
 pub mod openai;
+// Experimental wire foundation only. Do not enable in production until bounded
+// decoding, capability admission, durable replay and compaction are implemented.
+#[cfg(test)]
+mod image_pixels;
+#[cfg(test)]
+mod openai_image;
 mod wire;
 
 use crate::{contracts::ToolDefinition, usage::Usage};
