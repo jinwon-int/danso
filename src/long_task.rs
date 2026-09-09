@@ -819,6 +819,17 @@ fn tokens(data: &Value) -> Result<TokenDelta> {
     Ok(result)
 }
 
+/// Lowercase hex for digest outputs: sha2 0.11 no longer implements
+/// LowerHex for the finalized hash array, and callers below assert the
+/// 64-hexdigit fingerprint contract.
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 /// Fingerprint an entire settled tool batch without retaining its body.
 pub fn fingerprint_batch(batch: &[(String, Value, bool, String)]) -> String {
     let mut hasher = Sha256::new();
@@ -832,7 +843,7 @@ pub fn fingerprint_batch(batch: &[(String, Value, bool, String)]) -> String {
         hasher.update(output.as_bytes());
         hasher.update([0xff]);
     }
-    format!("{:x}", hasher.finalize())
+    hex_lower(&hasher.finalize())
 }
 
 /// A bounded progress event for the opt-in CLI renderer.
