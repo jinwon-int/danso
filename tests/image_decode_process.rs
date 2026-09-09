@@ -259,6 +259,8 @@ fn supervised_in(
 enum CancelStage {
     BeforeSpawn,
     Ready,
+    BeforeRead,
+    AfterRead,
 }
 
 struct CancelProbe {
@@ -487,7 +489,22 @@ fn supervised_controlled(
     if ["memory", "output", "isolation", "descriptors"].contains(&mode) {
         return Ok(Vec::new());
     }
-    read_output(&mut output)
+    // The child has already been reaped. Cancellation must still prevent
+    // returning bytes, both before retained-FD validation and after the read.
+    if let Some(probe) = probe {
+        probe.checkpoint(CancelStage::BeforeRead)?;
+        if probe.cancelled() {
+            return Err("image request cancelled after cleanup");
+        }
+    }
+    let bytes = read_output(&mut output)?;
+    if let Some(probe) = probe {
+        probe.checkpoint(CancelStage::AfterRead)?;
+        if probe.cancelled() {
+            return Err("image request cancelled after cleanup");
+        }
+    }
+    Ok(bytes)
 }
 
 // Lock liveness avoids host PID discovery/reuse and does not add any sandbox
@@ -629,9 +646,14 @@ impl Drop for CancelOnDrop {
 }
 
 #[tokio::test]
-async fn aborted_waiter_preserves_owner_before_spawn_and_after_readiness() {
+async fn aborted_waiter_preserves_owner_across_decode_boundaries() {
     use std::sync::{Arc, atomic::AtomicBool, mpsc};
-    for stage in [CancelStage::BeforeSpawn, CancelStage::Ready] {
+    for stage in [
+        CancelStage::BeforeSpawn,
+        CancelStage::Ready,
+        CancelStage::BeforeRead,
+        CancelStage::AfterRead,
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -648,7 +670,11 @@ async fn aborted_waiter_preserves_owner_before_spawn_and_after_readiness() {
             let result = supervised_controlled(
                 &fixture(image::ImageFormat::Png),
                 "image/png",
-                "descendants",
+                if matches!(stage, CancelStage::BeforeRead | CancelStage::AfterRead) {
+                    "decode"
+                } else {
+                    "descendants"
+                },
                 Duration::from_secs(10),
                 &path,
                 Some(&probe),
@@ -708,13 +734,26 @@ async fn aborted_waiter_preserves_owner_before_spawn_and_after_readiness() {
         if stage == CancelStage::BeforeSpawn {
             assert_eq!(output.metadata().unwrap().len(), 0);
         }
+        if matches!(stage, CancelStage::BeforeRead | CancelStage::AfterRead) {
+            // Successful decode was available, but cancellation returned no bytes.
+            assert!(
+                !read_output(&mut output.try_clone().unwrap())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }
 
 #[test]
 fn cancellation_owner_joins_on_assertion_unwind() {
     use std::sync::{Arc, atomic::AtomicBool, mpsc};
-    for stage in [CancelStage::BeforeSpawn, CancelStage::Ready] {
+    for stage in [
+        CancelStage::BeforeSpawn,
+        CancelStage::Ready,
+        CancelStage::BeforeRead,
+        CancelStage::AfterRead,
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let observed_path = path.clone();
@@ -732,7 +771,11 @@ fn cancellation_owner_joins_on_assertion_unwind() {
             let result = supervised_controlled(
                 &fixture(image::ImageFormat::Png),
                 "image/png",
-                "descendants",
+                if matches!(stage, CancelStage::BeforeRead | CancelStage::AfterRead) {
+                    "decode"
+                } else {
+                    "descendants"
+                },
                 Duration::from_secs(10),
                 &path,
                 Some(&probe),
@@ -766,6 +809,10 @@ fn cancellation_owner_joins_on_assertion_unwind() {
         assert_eq!(done_rx.try_recv().unwrap(), (Err(expected), true));
         assert!(!lock_is_held(&output).unwrap());
         assert!(!observed_path.exists());
+        if matches!(stage, CancelStage::BeforeRead | CancelStage::AfterRead) {
+            // The retained FD witnesses real output even after TempDir removal.
+            assert!(output.metadata().unwrap().len() > 0);
+        }
     }
 }
 

@@ -62,14 +62,18 @@ persistent crash ownership. CPU termination signal attribution is not establishe
 
 An async waiter owns only a cancel-on-drop flag and result receiver. The outer
 scope owns the OS worker thread and private directory. Deterministic checkpoints
-park the owner before spawn or after the detached holder is demonstrably ready.
+park the owner before spawn, after the detached holder is demonstrably ready,
+and immediately before and after retained-FD output validation/read (using a
+real successful decoder for the read checkpoints, after child reap).
 Aborting and awaiting the waiter signals cancellation but does not transfer or
 release the owner's resources. Resuming the owner verifies no launch before
-spawn, or stop/reap and lock release after readiness; cleanup errors propagate.
+spawn, stop/reap and lock release after readiness, or rejection of decoded bytes
+at the read boundaries; cleanup errors propagate. These seams do not interrupt
+a read syscall or prove atomic cancellation versus result delivery.
 
 `CancellationOwner::Drop` signals cancellation, unblocks the checkpoint and joins
 the OS thread **before** its directory is dropped. It suppresses secondary thread
-panic propagation. A caught assertion-unwind regression at both checkpoints
+panic propagation. A caught assertion-unwind regression at all four checkpoints
 verifies cancellation, completion while the directory still exists, lock release,
 and directory removal after Drop. This supersedes the earlier fixture's
 assertion-unwind detach gap.
@@ -81,7 +85,7 @@ Waiter abort must never authorize retry or discard an unresolved owner.
 
 ## Required work before production activation
 
-1. Expand cancellation coverage into output read, kill/reap, launch races and
+1. Expand cancellation coverage into in-flight output reads, kill/reap, launch races and
    injected cleanup errors. Audit broad mounts, other inherited FD types and
    unsupported/denied close_range. Cover replacement/growth/concurrent writers,
    unexpected files and pixel-level EXIF/progressive JPEG/metadata/truncated/
