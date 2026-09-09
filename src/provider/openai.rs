@@ -194,3 +194,101 @@ fn history(messages: &[Value]) -> Result<Vec<Value>> {
     }
     Ok(input)
 }
+
+#[cfg(test)]
+mod image_admission_tests {
+    use super::*;
+
+    #[test]
+    fn experimental_images_remain_rejected_by_production_history() {
+        // Wire-foundation fixtures are deliberately not decodable pictures.
+        // Neither the API nor ChatGPT path may admit them before ingress,
+        // capability, journal and compaction gates are implemented.
+        let image = json!({"type":"image","mimeType":"image/jpeg","data":"/9j/"});
+        for role in ["user", "toolResult", "assistant"] {
+            let message = json!({
+                "role":role, "content":[image.clone()],
+                "toolCallId":"synthetic-call", "isError":false
+            });
+            assert!(history(&[message]).is_err(), "accepted image in {role}");
+        }
+    }
+
+    #[test]
+    fn mixed_image_history_fails_without_mutation_or_payload_echo() {
+        let secret = "PRIVATE_SYNTHETIC_IMAGE_DO_NOT_ECHO";
+        for role in ["user", "toolResult", "assistant"] {
+            let messages = vec![
+                json!({"role":"user","content":"previous text"}),
+                json!({
+                    "role":role, "toolCallId":"synthetic-call", "isError":false,
+                    "content":[
+                        {"type":"text","text":"caption"},
+                        {"type":"image","mimeType":"image/jpeg","data":secret}
+                    ]
+                }),
+            ];
+            let original = messages.clone();
+            let error = history(&messages).unwrap_err();
+            assert_eq!(messages, original);
+            assert!(!format!("{error:#}").contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn image_rejection_precedes_transport_resolution_and_usage_changes() {
+        // Deliberately no transport: complete must return the history error,
+        // not "missing OpenAI transport". No credentials, sockets or model calls.
+        // This exercises shared adapter entry points, not a ChatGPT HTTP capture.
+        let mut provider = OpenAi {
+            http: None,
+            chatgpt: None,
+            model: "synthetic-model".into(),
+            effort: None,
+        };
+        let secret = "PRIVATE_SYNTHETIC_IMAGE_DO_NOT_ECHO";
+        for role in ["user", "toolResult", "assistant"] {
+            let messages = vec![json!({
+                "role":role, "toolCallId":"synthetic-call", "isError":false,
+                "content":[{"type":"image","mimeType":"image/jpeg","data":secret}]
+            })];
+            let original = messages.clone();
+            let request = ModelRequest {
+                system: "synthetic instructions",
+                messages: &messages,
+                tools: &[],
+            };
+            let expected = format!("{:#}", history(&messages).unwrap_err());
+            let validation = provider.validate_history(&messages).unwrap_err();
+            let sizing = provider.request_bytes(&request).unwrap_err();
+            let mut usage = Usage::default();
+            let before = usage.summary();
+            let completion = provider.complete(request, &mut usage).await.unwrap_err();
+            for error in [validation, sizing, completion] {
+                let error = format!("{error:#}");
+                assert_eq!(error, expected);
+                assert!(!error.contains(secret));
+                assert!(!error.contains("missing OpenAI transport"));
+            }
+            assert!(!usage.attempted);
+            assert_eq!(usage.summary(), before);
+            assert_eq!(messages, original);
+        }
+    }
+
+    #[test]
+    fn text_user_and_tool_results_keep_existing_shape() {
+        let input = history(&[
+            json!({"role":"user","content":[
+                {"type":"text","text":"first"}, {"type":"text","text":"second"}
+            ]}),
+            json!({"role":"toolResult","toolCallId":"synthetic-call",
+                "isError":false,"content":"tool text"}),
+        ])
+        .unwrap();
+        assert_eq!(input[0], json!({"role":"user","content":"first\nsecond"}));
+        assert_eq!(input[1]["type"], "function_call_output");
+        let output: Value = serde_json::from_str(input[1]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output, json!({"isError":false,"output":"tool text"}));
+    }
+}

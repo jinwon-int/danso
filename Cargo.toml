@@ -22,4 +22,5 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "si
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 tempfile = "3"
