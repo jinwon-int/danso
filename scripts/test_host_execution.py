@@ -9,6 +9,13 @@ import signal
 import subprocess
 import time
 import unittest
+
+def system_text(body):
+    """Anthropic renders the #69 E system split as text blocks."""
+    system = body['system']
+    if isinstance(system, list):
+        return ''.join(block.get('text', '') for block in system)
+    return system
 import test_e2e as e2e
 import test_providers as providers
 
@@ -75,8 +82,8 @@ class Host(unittest.TestCase):
             (self.repo / 'tool-home').read_text().splitlines(),
             [str(tool_home), f'{tool_home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin'],
         )
-        self.assertIn('PRIVATE_NATIVE_HOME_SENTINEL', self.requests[0]['system'])
-        self.assertNotIn('TOOL_HOME_MUST_NOT_BE_DISCOVERED', self.requests[0]['system'])
+        self.assertIn('PRIVATE_NATIVE_HOME_SENTINEL', system_text(self.requests[0]))
+        self.assertNotIn('TOOL_HOME_MUST_NOT_BE_DISCOVERED', system_text(self.requests[0]))
 
     def test_tool_home_rejects_invalid_path_and_bubblewrap_before_provider(self):
         invalid = self.run_cli('--tool-home', str(self.root / 'bad:home'))
@@ -140,10 +147,10 @@ class Host(unittest.TestCase):
             self.final()
             result = self.run_cli('--system-context-file', str(context))
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(value, self.requests[-1]['system'])
-            self.assertNotIn('UNTRUSTED_PROJECT_SENTINEL', self.requests[-1]['system'])
+            self.assertIn(value, system_text(self.requests[-1]))
+            self.assertNotIn('UNTRUSTED_PROJECT_SENTINEL', system_text(self.requests[-1]))
             self.assertNotIn(value, self.session.read_text() + result.stdout + result.stderr)
-        self.assertNotIn('MEMORY_SENTINEL_FIRST', self.requests[-1]['system'])
+        self.assertNotIn('MEMORY_SENTINEL_FIRST', system_text(self.requests[-1]))
 
     def test_explicit_system_memory_rejects_unsafe_inputs_before_provider_or_journal(self):
         private = self.root / 'private'; private.mkdir()

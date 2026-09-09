@@ -12,6 +12,11 @@ pub struct Usage {
     cache_write: u64,
     models: Vec<String>,
     total: u64,
+    /// Compaction summary requests counted by the runtime (issue #69 F);
+    /// reported only via DANSO_BUDGET, never in DANSO_USAGE.
+    summary_requests: u32,
+    /// Terminal output-cap stops seen by the runtime (issue #69 F).
+    length_stops: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -69,6 +74,19 @@ impl Usage {
 
     pub fn summary(&self) -> Value {
         json!({"requests":self.requests,"inputTokens":self.input,"outputTokens":self.output,"cacheReadTokens":self.cache_read,"cacheWriteTokens":self.cache_write,"totalTokens":self.total,"costUsd":0,"models":self.models})
+    }
+
+    /// Run budget facts for the body-free DANSO_BUDGET record (issue #69 F).
+    pub fn record_summary_request(&mut self) {
+        self.summary_requests = self.summary_requests.saturating_add(1);
+    }
+
+    pub fn record_length_stop(&mut self) {
+        self.length_stops = self.length_stops.saturating_add(1);
+    }
+
+    pub fn budget_counts(&self) -> (u32, u32) {
+        (self.summary_requests, self.length_stops)
     }
 }
 

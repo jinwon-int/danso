@@ -107,7 +107,7 @@ impl Glm {
         })
     }
     fn body(&self, request: &ModelRequest<'_>) -> Result<Value> {
-        let mut messages = vec![json!({"role":"system","content":request.system})];
+        let mut messages = vec![json!({"role":"system","content":request.system.joined()})];
         messages.extend(history(request.messages)?);
         let tools: Vec<Value> = request
             .tools
@@ -290,7 +290,7 @@ mod tests {
             )
             .unwrap()
             .body(&ModelRequest {
-                system: "s",
+                system: crate::provider::SystemParts::single("s"),
                 messages: std::slice::from_ref(&json!({"role":"user","content":"hi"})),
                 tools: &[],
             })

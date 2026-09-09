@@ -31,7 +31,7 @@ impl Provider for ScriptedProvider {
     }
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
         self.requests.push(
-            json!({"tools":request.tools, "messages":request.messages, "system":request.system}),
+            json!({"tools":request.tools, "messages":request.messages, "system":request.system.joined()}),
         );
         usage.attempted = true;
         usage.add(

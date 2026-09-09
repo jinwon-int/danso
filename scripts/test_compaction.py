@@ -94,8 +94,11 @@ class Compaction(fixture.Fixture):
         summaries = 0
         reserve = max(3, total // 10)
         for index, body in enumerate(requests):
-            system = (body['system'] if provider == 'anthropic' else
-                      body['instructions'] if provider == 'openai' else body['messages'][0]['content'])
+            raw_system = (body['system'] if provider == 'anthropic' else
+                          body['instructions'] if provider == 'openai'
+                          else body['messages'][0]['content'])
+            system = (''.join(block.get('text', '') for block in raw_system)
+                      if isinstance(raw_system, list) else raw_system)
             if not body['tools']:
                 summaries += 1
                 self.assertNotIn('Runtime request budget for this run:', system)
@@ -242,6 +245,8 @@ class Compaction(fixture.Fixture):
                 for body in action_requests:
                     system = (body['system'] if provider == 'anthropic' else
                               body['instructions'] if provider == 'openai' else body['messages'][0]['content'])
+                    if isinstance(system, list):
+                        system = ''.join(block.get('text', '') for block in system)
                     prefix = 'Runtime working directory (JSON path data): '
                     paths = [json.loads(line[len(prefix):]) for line in system.split('\n')
                              if line.startswith(prefix)]

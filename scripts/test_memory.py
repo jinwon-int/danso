@@ -59,6 +59,7 @@ class Acceptance(unittest.TestCase):
                 system = body.get('system')
                 if isinstance(system, list):
                     system = ''.join(block.get('text', '') for block in system)
+                body['_system_text'] = system
                 if system.startswith(EXTRACTION_SYSTEM_PREFIX):
                     status = owner.extraction_status
                     if status != 200:
@@ -144,7 +145,7 @@ class Acceptance(unittest.TestCase):
         self.assertIn('에디터는 Helix', search.stdout)
         # Exactly one extraction request, and the input is newest-first.
         extractions = [r for r in self.requests
-                       if r['system'].startswith(EXTRACTION_SYSTEM_PREFIX)]
+                       if r['_system_text'].startswith(EXTRACTION_SYSTEM_PREFIX)]
         self.assertEqual(len(extractions), 1)
         content = extractions[0]['messages'][-1]['content']
         if isinstance(content, list):

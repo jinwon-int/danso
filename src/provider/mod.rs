@@ -18,8 +18,50 @@ use crate::{contracts::ToolDefinition, usage::Usage};
 use anyhow::Result;
 use serde_json::Value;
 
+/// Cache-friendly system split (issue #69 E). `stable` carries the base
+/// instructions, discovery context, memory block and execution context —
+/// byte-identical between consecutive requests unless a per-request memory
+/// refresh re-resolved it after a compaction. `volatile` carries per-request
+/// guidance; only it changes turn to turn.
+#[derive(Clone, Copy, Debug)]
+pub struct SystemParts<'a> {
+    pub stable: &'a str,
+    pub volatile: &'a str,
+}
+
+impl<'a> SystemParts<'a> {
+    /// One stable block, no volatile tail (extraction, summarizer).
+    pub fn single(text: &'a str) -> Self {
+        Self {
+            stable: text,
+            volatile: "",
+        }
+    }
+    /// How string-concat adapters (OpenAI/GLM) render the split.
+    pub fn joined(&self) -> String {
+        let mut joined = String::with_capacity(self.stable.len() + self.volatile.len() + 1);
+        joined.push_str(self.stable);
+        if !self.volatile.is_empty() {
+            joined.push('\n');
+            joined.push_str(self.volatile);
+        }
+        joined
+    }
+    /// Prefix test on the joined rendering; scripted providers use it to
+    /// discriminate request kinds (agent vs summarizer).
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        self.joined().starts_with(prefix)
+    }
+}
+
+impl std::fmt::Display for SystemParts<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.joined())
+    }
+}
+
 pub struct ModelRequest<'a> {
-    pub system: &'a str,
+    pub system: SystemParts<'a>,
     pub messages: &'a [Value],
     pub tools: &'a [ToolDefinition],
 }
@@ -70,7 +112,7 @@ pub trait Provider {
     /// Exact serialized request size for production adapters. The default is
     /// suitable only for non-wire scripted providers.
     fn request_bytes(&self, request: &ModelRequest<'_>) -> Result<usize> {
-        Ok(serde_json::to_vec(&serde_json::json!({"system":request.system,"messages":request.messages,"tools":request.tools}))?.len())
+        Ok(serde_json::to_vec(&serde_json::json!({"system":request.system.joined(),"messages":request.messages,"tools":request.tools}))?.len())
     }
     /// Configured output token cap (issue #69 A/B). Scripted providers
     /// report 0 (unknown); the runtime uses it only for the `max_tokens`

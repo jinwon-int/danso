@@ -489,22 +489,22 @@ pub async fn run(
             remaining,
             budget_total,
         );
-        let mut system = budget_system(
-            &base_system,
-            budget_total,
-            remaining,
-            summary_requests,
-            final_phase,
-        );
+        // Issue #69 E: stable = base instructions/context, volatile = the
+        // per-request budget guidance assembled here (plus the one-time
+        // repeat-guard notice, #70 D).
+        let mut guidance = budget_guidance(budget_total, remaining, summary_requests, final_phase);
         if let Some(notice) = &repeat_guidance {
-            system.push('\n');
-            system.push_str(notice);
+            guidance.push('\n');
+            guidance.push_str(notice);
         }
         async {
             if let Some(limit) = input.compact_at_bytes {
                 let before = provider
                     .request_bytes(&ModelRequest {
-                        system: &system,
+                        system: crate::provider::SystemParts {
+                            stable: &base_system,
+                            volatile: &guidance,
+                        },
                         messages: &messages,
                         tools: &definitions,
                     })
@@ -515,7 +515,10 @@ pub async fn run(
                     let latest = crate::compaction::latest_user(&messages)?;
                     let bare = provider
                         .request_bytes(&ModelRequest {
-                            system: &system,
+                            system: crate::provider::SystemParts {
+                            stable: &base_system,
+                            volatile: &guidance,
+                        },
                             messages: std::slice::from_ref(&latest),
                             tools: &definitions,
                         })
@@ -555,6 +558,9 @@ pub async fn run(
                         .await?
                     };
                     summary_requests += before_summary - remaining;
+                    for _ in 0..(before_summary - remaining) {
+                        usage.record_summary_request();
+                    }
                     // Rebuild after all summary fragments/repairs, then size the
                     // exact instructions that the next action request will use.
                     if let Some(refresh) = input.refresh_context {
@@ -570,21 +576,23 @@ pub async fn run(
                         remaining,
                         budget_total,
                     );
-                    system = budget_system(
-                        &base_system,
+                    guidance = budget_guidance(
                         budget_total,
                         remaining,
                         summary_requests,
                         final_phase,
                     );
                     if let Some(notice) = &repeat_guidance {
-                        system.push('\n');
-                        system.push_str(notice);
+                        guidance.push('\n');
+                        guidance.push_str(notice);
                     }
                     let compacted = crate::compaction::checkpoint_messages(&summary, &messages)?;
                     let after = provider
                         .request_bytes(&ModelRequest {
-                            system: &system,
+                            system: crate::provider::SystemParts {
+                            stable: &base_system,
+                            volatile: &guidance,
+                        },
                             messages: &compacted,
                             tools: &definitions,
                         })
@@ -634,7 +642,10 @@ pub async fn run(
             gated
                 .complete(
                     ModelRequest {
-                        system: &system,
+                        system: crate::provider::SystemParts {
+                            stable: &base_system,
+                            volatile: &guidance,
+                        },
                         messages: &messages,
                         tools: &definitions,
                     },
@@ -645,7 +656,10 @@ pub async fn run(
             provider
                 .complete(
                     ModelRequest {
-                        system: &system,
+                        system: crate::provider::SystemParts {
+                            stable: &base_system,
+                            volatile: &guidance,
+                        },
                         messages: &messages,
                         tools: &definitions,
                     },
@@ -720,6 +734,7 @@ pub async fn run(
                 // provider category; the diagnostic carries the cap and the
                 // flag that raises it.
                 let cap = provider.max_output_tokens();
+                usage.record_length_stop();
                 return Err(at(Kind::Provider)(crate::failure::max_tokens_error(cap)));
             }
             if input.long_task.is_some() {
@@ -866,14 +881,10 @@ pub async fn run(
 /// Two phases (issue #69 D): factual while `remaining` is above the reserve,
 /// prioritize-and-report once it reaches the reserve window. Long-task runs
 /// stay lenient until a stage boundary is near (`stage_final`).
-fn budget_system(
-    base: &str,
-    total: u32,
-    remaining: u32,
-    summaries: u32,
-    final_phase: bool,
-) -> String {
-    let guidance = if final_phase {
+/// The volatile half of the system split (issue #69 E): per-request budget
+/// guidance only; `base` stays in the cached stable block.
+fn budget_guidance(total: u32, remaining: u32, summaries: u32, final_phase: bool) -> String {
+    if final_phase {
         format!(
             "Runtime request budget for this run: remaining={remaining}, total={total}, summary_requests={summaries}. Remaining includes this request; each model request consumes one slot, including checkpoint fragments and repair attempts. Future compaction also consumes these slots. This is a request limit, not a token or time allowance. Prioritize unfinished edits, required checks, and an accurate final report; avoid repeating reads unless information is missing or state changed. Reserve a request after tools to inspect their results and report. If remaining=1, there is no follow-up model request after any tools you call. Never skip required validation silently or claim unexecuted checks passed; report incomplete work and omitted checks honestly."
         )
@@ -881,8 +892,7 @@ fn budget_system(
         format!(
             "Request budget: remaining={remaining} of {total} (summary_requests={summaries}). Each model request, including checkpoint fragments, consumes one. Use as many steps as the task needs; do not shortcut validation to save requests."
         )
-    };
-    format!("{base}\n{guidance}")
+    }
 }
 
 /// The reserve window (issue #69 C/D): the tail of the budget in which the
@@ -941,16 +951,15 @@ mod budget_guidance_tests {
 
     #[test]
     fn short_run_is_lenient_above_reserve_and_final_within_it() {
-        let base = "BASE";
         // 48-request budget: reserve is 4, so remaining=5 stays lenient.
-        let lenient = budget_system(base, 48, 5, 1, false);
-        assert!(lenient.starts_with("BASE\nRequest budget: remaining=5 of 48"));
+        let lenient = budget_guidance(48, 5, 1, false);
+        assert!(lenient.starts_with("Request budget: remaining=5 of 48"));
         assert!(
             !lenient.contains("Prioritize"),
             "lenient phase must not rush the model"
         );
         // remaining=4 (at the reserve) switches to the prioritize-and-report text.
-        let final_phase = budget_system(base, 48, 4, 1, true);
+        let final_phase = budget_guidance(48, 4, 1, true);
         assert!(final_phase.contains("Prioritize unfinished edits"));
         assert!(final_phase.contains("remaining=4"));
     }

@@ -5,7 +5,7 @@ use cli::Args;
 use danso::{
     app,
     failure::{self, Kind},
-    output::{PrintSink, ProgressSink, report_usage},
+    output::{PrintSink, ProgressSink, report_budget, report_usage},
     tools,
     usage::Usage,
 };
@@ -207,5 +207,6 @@ fn main() {
         code
     });
     report_usage(&usage);
+    report_budget(&config, &usage);
     std::process::exit(code);
 }

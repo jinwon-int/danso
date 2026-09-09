@@ -113,3 +113,22 @@ pub fn report_usage(usage: &Usage) {
     eprintln!("DANSO_USAGE={summary}");
     eprintln!("PIRI_USAGE={summary}");
 }
+
+/// Body-free run-budget receipt (issue #69 F): ignored or validated by the
+/// ccc adapter; never includes prompt or response content.
+pub fn report_budget(config: &crate::app::RunConfig, usage: &Usage) {
+    let requests_total = match &config.long_task {
+        Some(task) => u32::try_from(task.limits.max_requests).unwrap_or(u32::MAX),
+        None => config.max_turns,
+    };
+    let (summary_requests, length_stops) = usage.budget_counts();
+    let cap = crate::provider::resolve_max_output_tokens(config.max_output_tokens).unwrap_or(0);
+    eprintln!(
+        "DANSO_BUDGET={{\"version\":1,\"requests_used\":{},\"requests_total\":{},\"summary_requests\":{},\"output_tokens_max\":{},\"length_stops\":{},\"continuations\":0}}",
+        usage.snapshot().requests,
+        requests_total,
+        summary_requests,
+        cap,
+        length_stops
+    );
+}
