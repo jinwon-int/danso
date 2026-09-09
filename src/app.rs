@@ -263,7 +263,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     // re-composes the context right after a compaction.
     let cwd_for_refresh = cwd.clone();
     let refresh_context: Option<Box<dyn Fn() -> Result<String>>> = if args.memory.mode
-        == memory::MemoryMode::Read
+        != memory::MemoryMode::Off
         && args.memory.refresh == memory::RefreshMode::PerRequest
     {
         let memory_config = args.memory.clone();

@@ -278,7 +278,8 @@ pub async fn drain(
                 report.extracted += 1;
             }
             Err(error) => {
-                let class = classify(crate::failure::category(&error), None);
+                let status = crate::failure::provider(&error).and_then(|d| d.http_status());
+                let class = classify(crate::failure::category(&error), status);
                 journal::record_failure(route, &job, class, now)?;
                 report.failed += 1;
             }
@@ -304,15 +305,13 @@ async fn extract_job(
         transcript_sha256 == job.transcript_sha256,
         "transcript changed since enqueue"
     );
-    let extraction = extract(
-        provider,
-        usage,
-        &input,
-        &job.transcript_sha256,
-        &job.trigger,
-        true,
-    )
-    .await?;
+    // §4.6: the model copies `source_thread_hash` exactly out of the input,
+    // where it is sha256(session id) — not the transcript-file hash.
+    let thread_hash = input["source_thread_hash"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let extraction = extract(provider, usage, &input, &thread_hash, &job.trigger, true).await?;
     // The transcript fed to rank validation is the redacted input text.
     let transcript: String = input["messages"]
         .as_array()
