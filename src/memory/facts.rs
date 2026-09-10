@@ -380,11 +380,13 @@ impl FactRecord {
         })
     }
 
-    /// Canonical serialization of a NEW record: sorted keys, compact
-    /// separators, raw UTF-8 (never ASCII-escaped), trailing newline — the
-    /// byte format ccc writes with `sort_keys=True, ensure_ascii=False`.
+    /// Canonical serialization: sorted keys, compact separators, raw UTF-8
+    /// (never ASCII-escaped), trailing newline — the byte format ccc writes
+    /// with `sort_keys=True, ensure_ascii=False`. Unknown fields present in
+    /// the original record are preserved (`raw` is the base object; typed
+    /// fields overlay it), so rewrites never silently drop data (§4.1).
     pub fn to_line(&self) -> String {
-        let mut object = Map::new();
+        let mut object = self.raw.as_object().cloned().unwrap_or_default();
         object.insert("schema_version".into(), Value::from(self.schema_version));
         object.insert("id".into(), Value::from(self.id.as_str()));
         object.insert("kind".into(), Value::from(self.kind.as_str()));
@@ -424,6 +426,9 @@ impl FactRecord {
         // `source` is writer-specific; the raw value is preserved when set.
         match self.raw.get("source") {
             Some(source) if source.is_object() => {
+                object.insert("source".into(), source.clone());
+            }
+            Some(source) => {
                 object.insert("source".into(), source.clone());
             }
             _ => {
@@ -492,13 +497,18 @@ impl FactsFile {
 }
 
 /// Read and interpret a facts file. `Ok(None)` when absent; oversize files
-/// are an error (≤ 8 MiB read bound); unparseable lines are preserved.
+/// are an error (≤ 8 MiB read bound); unparseable JSON lines are preserved
+/// as opaque lines, but bytes that are not valid UTF-8 fail closed — a
+/// lossy rewrite would permanently replace them with replacement
+/// characters (§4.1 canonical bytes).
 pub fn read(payload: Option<Vec<u8>>) -> Result<FactsFile> {
     let Some(payload) = payload else {
         return Ok(FactsFile::default());
     };
+    let text = std::str::from_utf8(&payload)
+        .map_err(|error| anyhow::anyhow!("memory facts file is not valid UTF-8: {error}"))?;
     let mut lines = Vec::new();
-    for (index, raw) in String::from_utf8_lossy(&payload).lines().enumerate() {
+    for (index, raw) in text.lines().enumerate() {
         if raw.trim().is_empty() {
             continue;
         }

@@ -2,7 +2,7 @@
 //! idempotence and audit, and the per-request context refresh hook.
 
 use anyhow::Result;
-use danso::memory::{Route, promote};
+use danso::memory::{Route, promote, transaction};
 use danso::{
     contracts::{Event, EventSink, ToolDefinition, ToolExecutor, ToolOutcome},
     provider::{ModelRequest, Provider},
@@ -111,6 +111,20 @@ fn promotion_is_audited_and_idempotent() {
         std::fs::read_to_string(&audit)
             .unwrap()
             .contains(&result.promotion_id)
+    );
+
+    // #65 §1.5: the promotion went through the rollback transaction — it
+    // left exactly one undoable head on the shared scope and a body-free
+    // MemoryCommit ledger event.
+    let transaction = transaction::Transaction::new(&shared.state_dir());
+    let (head, actions) = transaction.status().unwrap();
+    assert_eq!(actions, 1, "one rollback action");
+    assert!(head.is_some(), "the promotion left an undoable head");
+    let audit_events = std::fs::read_to_string(shared.state_dir().join("audit.jsonl")).unwrap();
+    assert!(
+        audit_events.contains("\"event\":\"MemoryCommit\"")
+            && audit_events.contains("\"facts_added\":1"),
+        "promotion records a MemoryCommit event: {audit_events}"
     );
 }
 

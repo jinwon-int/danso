@@ -122,6 +122,12 @@ pub fn enqueue(
         super::TRIGGERS.contains(&trigger),
         "unknown distill trigger"
     );
+    // The journal stores the resolved absolute path (#65 §2): a relative
+    // --session recorded as-given would dead-letter as session-missing when
+    // drained from a different working directory.
+    let session_path = &session_path
+        .canonicalize()
+        .map_err(|error| anyhow::anyhow!("session path does not exist: {error}"))?;
     if count_exchanges(session_path)? < 3 {
         return Ok(EnqueueOutcome::Skipped {
             reason: "insufficient-content",
@@ -167,17 +173,19 @@ pub fn enqueue(
 
 fn write_private(path: &std::path::Path, contents: &[u8], max: u64) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::OpenOptionsExt;
     ensure!(
         contents.len() as u64 <= max,
         "journal record exceeds its bound"
     );
+    // The 0600 mode rides the open(2) call: create-then-chmod leaves a
+    // window where the umask decides the file's permissions (§6.1).
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(path)?;
     file.write_all(contents)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 

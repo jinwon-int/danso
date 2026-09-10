@@ -561,3 +561,57 @@ fn head_action_id(route: &Route) -> String {
         .trim()
         .to_string()
 }
+
+/// #65 §2: rewrites preserve unknown fields — `to_line` starts from the raw
+/// record and overlays the typed fields, so extra keys survive a close.
+#[test]
+fn rewrites_preserve_unknown_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = route_in(dir.path(), "global");
+    setup_tree(&route);
+    let line = concat!(
+        r#"{"confidence":0.7,"custom_note":"operator comment","durability":"durable","entities":["user"],"#,
+        r#""id":"distill-0123456789ab","kind":"preference","privacy":"private","audience":"private","#,
+        r#""review":"auto-local","schema_version":1,"source":{"type":"distill","provider":"danso"},"source_rank":1,"text":"보고서는 한국어로 쓴다"}"#,
+    );
+    write_private(&route.facts_file(), &format!("{line}\n"));
+
+    let id = "distill-0123456789ab";
+    facts::close(&route, id, pinned_now(), 1000).unwrap();
+    let rewritten = std::fs::read_to_string(route.facts_file()).unwrap();
+    assert!(
+        rewritten.contains("\"custom_note\":\"operator comment\""),
+        "unknown fields survive rewrites: {rewritten}"
+    );
+    assert!(rewritten.contains("\"valid_until\""), "close still applies");
+}
+
+/// #65 §2: facts bytes that are not valid UTF-8 fail closed instead of
+/// being lossily rewritten with replacement characters.
+#[test]
+fn invalid_utf8_facts_file_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = route_in(dir.path(), "global");
+    setup_tree(&route);
+    let mut payload = b"{\"id\":\"x\",\"text\":\"".to_vec();
+    payload.push(0xFF);
+    payload.extend_from_slice(b"\"}\n");
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(route.facts_file())
+        .unwrap();
+    file.write_all(&payload).unwrap();
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .unwrap();
+
+    let error = facts::load(&route).expect_err("invalid UTF-8 must fail closed");
+    assert!(
+        error.to_string().contains("not valid UTF-8"),
+        "unexpected error: {error}"
+    );
+    // The corrupt file is left untouched (no lossy rewrite persisted).
+    assert_eq!(std::fs::read(route.facts_file()).unwrap(), payload);
+}

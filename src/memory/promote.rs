@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::facts;
 use super::paths::{self, Route};
+use super::transaction;
 
 pub const MAX_FACTS_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
@@ -34,8 +35,12 @@ fn read_lines(path: &std::path::Path, max_bytes: u64, what: &str) -> Result<Vec<
     let Some(payload) = paths::read_bounded(path, max_bytes, what)? else {
         return Ok(Vec::new());
     };
-    let text =
-        String::from_utf8(payload).map_err(|_| anyhow::anyhow!("{what} contains invalid UTF-8"))?;
+    read_lines_from(&payload, what)
+}
+
+fn read_lines_from(payload: &[u8], what: &str) -> Result<Vec<Value>> {
+    let text = std::str::from_utf8(payload)
+        .map_err(|_| anyhow::anyhow!("{what} contains invalid UTF-8"))?;
     let mut records = Vec::new();
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -91,99 +96,125 @@ pub fn promote(
     let destination_fact_id = format!("promoted-{}", &stable[..16]);
     let shared_state = shared_route.state_dir();
 
-    let _lock = paths::ExclusiveLock::acquire(
-        &shared_route.scope_lock(),
-        paths::lock_timeout(lock_timeout_ms),
-    )?;
-    let shared_records = read_lines(
-        &shared_route.facts_file(),
-        MAX_FACTS_FILE_BYTES,
-        "shared facts",
-    )?;
-    let audit_path = shared_state.join("memory-promotion-audit.jsonl");
-    let audit_records = read_lines(&audit_path, MAX_AUDIT_BYTES, "promotion audit")?;
-
-    let existing_fact = shared_records
-        .iter()
-        .find(|r| r.get("id").and_then(Value::as_str) == Some(destination_fact_id.as_str()));
-    let existing_audit = audit_records
-        .iter()
-        .find(|r| r.get("id").and_then(Value::as_str) == Some(promotion_id.as_str()));
-
-    let completed_at = existing_audit
-        .and_then(|a| {
-            a.get("completed_at")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| facts::format_timestamp(now));
-
-    let mut destination_value = source.raw.clone();
-    let destination = destination_value
-        .as_object_mut()
-        .expect("records are objects");
-    destination.insert("id".into(), Value::from(destination_fact_id.as_str()));
-    destination.insert("review".into(), Value::from("explicit-promotion"));
-    destination.insert("privacy".into(), Value::from("shared"));
-    destination.insert("audience".into(), Value::from("shared"));
-    let promoted_at = Value::from(completed_at.as_str());
-    destination.insert("promoted_at".into(), promoted_at.clone());
-    {
-        let tags = destination
-            .entry("tags")
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Some(items) = tags.as_array_mut() {
-            for tag in ["promoted", "private-to-shared"] {
-                if !items.iter().any(|t| t.as_str() == Some(tag)) {
-                    items.push(Value::from(tag));
+    // The destination record and audit entry are rebuilt per attempt; on a
+    // repeat the original completion timestamp is kept so the equality
+    // checks stay deterministic.
+    let build = |completed_at: &str| {
+        let mut destination_value = source.raw.clone();
+        let destination = destination_value
+            .as_object_mut()
+            .expect("records are objects");
+        destination.insert("id".into(), Value::from(destination_fact_id.as_str()));
+        destination.insert("review".into(), Value::from("explicit-promotion"));
+        destination.insert("privacy".into(), Value::from("shared"));
+        destination.insert("audience".into(), Value::from("shared"));
+        destination.insert("promoted_at".into(), Value::from(completed_at));
+        {
+            let tags = destination
+                .entry("tags")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(items) = tags.as_array_mut() {
+                for tag in ["promoted", "private-to-shared"] {
+                    if !items.iter().any(|t| t.as_str() == Some(tag)) {
+                        items.push(Value::from(tag));
+                    }
                 }
             }
         }
-    }
-    destination.insert(
-        "source".into(),
-        json!({
-            "type": "private-to-shared-promotion",
-            "promotion_id": promotion_id,
+        destination.insert(
+            "source".into(),
+            json!({
+                "type": "private-to-shared-promotion",
+                "promotion_id": promotion_id,
+                "source_fact_id": fact_id,
+                "source_scope_hash": source_scope_hash,
+                "source_fact_hash": source_fact_hash,
+            }),
+        );
+        let audit = json!({
+            "id": promotion_id,
+            "destination_fact_id": destination_fact_id,
             "source_fact_id": fact_id,
             "source_scope_hash": source_scope_hash,
             "source_fact_hash": source_fact_hash,
-        }),
-    );
-    let audit = json!({
-        "id": promotion_id,
-        "destination_fact_id": destination_fact_id,
-        "source_fact_id": fact_id,
-        "source_scope_hash": source_scope_hash,
-        "source_fact_hash": source_fact_hash,
-        "completed_at": completed_at,
-    });
+            "completed_at": completed_at,
+        });
+        (destination_value, audit)
+    };
 
-    if let Some(existing) = existing_fact {
-        ensure!(
-            existing == &destination_value,
-            "existing promoted fact does not match its source"
-        );
-    }
-    if let Some(existing) = existing_audit {
-        ensure!(
-            existing == &audit,
-            "existing promotion audit does not match its source"
-        );
-    }
+    // #65 §1.5: the shared write goes through the rollback transaction —
+    // the single memory-rollback lock serializes it with distill commits and
+    // manual writes, and the promotion leaves an undoable head.
+    let transaction = transaction::Transaction::new(&shared_route.state_dir());
+    let meta = transaction::CommitMeta {
+        provider: "danso".into(),
+        actor: "manual".into(),
+        tool: "local-memory-promote".into(),
+        diff: "mode-facts".into(),
+        session: "promote".into(),
+    };
+    let audit_path = shared_state.join("memory-promotion-audit.jsonl");
+    let mut first_promotion = false;
+    let mut committed_audit: Option<Value> = None;
+    let result = transaction.commit(lock_timeout_ms, &meta, |before| {
+        let mut next = before.clone();
+        for (name, current) in next.iter_mut() {
+            if name != super::FACTS_FILE_NAME {
+                continue;
+            }
+            let shared_records =
+                read_lines_from(current.as_deref().unwrap_or(b""), "shared facts")?;
+            let audit_records = read_lines(&audit_path, MAX_AUDIT_BYTES, "promotion audit")?;
 
-    let first_promotion = existing_fact.is_none() && existing_audit.is_none();
-    if first_promotion {
-        let mut lines: Vec<String> = shared_records.iter().map(canonical_json_value).collect();
-        lines.push(canonical_json_value(&destination_value));
-        let payload = lines.join("\n") + "\n";
-        paths::atomic_write(
-            &shared_route.facts_file(),
-            payload.as_bytes(),
-            "shared facts",
-        )?;
+            let existing_fact = shared_records.iter().find(|r| {
+                r.get("id").and_then(Value::as_str) == Some(destination_fact_id.as_str())
+            });
+            let existing_audit = audit_records
+                .iter()
+                .find(|r| r.get("id").and_then(Value::as_str) == Some(promotion_id.as_str()));
 
-        let mut audit_lines: Vec<String> = audit_records.iter().map(canonical_json_value).collect();
+            let completed_at = existing_audit
+                .and_then(|a| {
+                    a.get("completed_at")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| facts::format_timestamp(now));
+            let (destination_value, audit) = build(&completed_at);
+
+            if let Some(existing) = existing_fact {
+                ensure!(
+                    existing == &destination_value,
+                    "existing promoted fact does not match its source"
+                );
+            }
+            if let Some(existing) = existing_audit {
+                ensure!(
+                    existing == &audit,
+                    "existing promotion audit does not match its source"
+                );
+            }
+
+            first_promotion = existing_fact.is_none() && existing_audit.is_none();
+            if first_promotion {
+                let mut lines: Vec<String> =
+                    shared_records.iter().map(canonical_json_value).collect();
+                lines.push(canonical_json_value(&destination_value));
+                *current = Some((lines.join("\n") + "\n").into_bytes());
+                committed_audit = Some(audit);
+            }
+        }
+        Ok(next)
+    })?;
+
+    let promoted = result.action_id.is_some();
+    if promoted {
+        let audit = committed_audit.expect("a committed promotion built its audit entry");
+        let mut audit_lines: Vec<String> =
+            read_lines(&audit_path, MAX_AUDIT_BYTES, "promotion audit")?
+                .iter()
+                .map(canonical_json_value)
+                .collect();
         audit_lines.push(canonical_json_value(&audit));
         let total = |l: &[String]| l.iter().map(|l| l.len() + 1).sum::<usize>();
         while total(&audit_lines) > MAX_AUDIT_BYTES as usize && audit_lines.len() > 1 {
@@ -198,12 +229,20 @@ pub fn promote(
             (audit_lines.join("\n") + "\n").as_bytes(),
             "promotion audit",
         )?;
+        super::audit::record(
+            &shared_route,
+            &super::audit::Event::Commit {
+                action_id: result.action_id.expect("checked Some above"),
+                changed: vec![super::FACTS_FILE_NAME.to_string()],
+                facts_added: 1,
+            },
+        );
     }
 
     Ok(PromotionResult {
         promotion_id,
         destination_fact_id,
-        promoted: first_promotion,
+        promoted,
     })
 }
 
