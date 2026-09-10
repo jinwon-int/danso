@@ -9,6 +9,7 @@ pub struct Http {
     header: reqwest::header::HeaderName,
     key: reqwest::header::HeaderValue,
     retries: u32,
+    zai_diagnostics: bool,
 }
 impl Http {
     /// Bearer-authenticated transport (OpenAI, GLM).
@@ -89,11 +90,16 @@ impl Http {
             header,
             key,
             retries: 0,
+            zai_diagnostics: false,
         })
     }
 
     /// Bounded wire-level retry budget (issue #67 B): 0 disables; the
     /// default construction leaves retries off until configured.
+    pub fn enable_zai_diagnostics(&mut self) {
+        self.zai_diagnostics = true;
+    }
+
     pub fn set_retries(&mut self, retries: u32) {
         self.retries = retries;
     }
@@ -174,7 +180,12 @@ impl Http {
                     tokio::time::sleep(retry_delay(attempt, retry_after)).await;
                     continue;
                 }
-                return Err(crate::failure::http_status_error(status));
+                let error = crate::failure::http_status_error(status);
+                return Err(if self.zai_diagnostics {
+                    error.context(super::http_diagnostic::capture(response).await)
+                } else {
+                    error
+                });
             }
             break response;
         };

@@ -98,8 +98,10 @@ impl Glm {
         thinking: bool,
         timeout_seconds: u64,
     ) -> Result<Self> {
+        let mut http = Http::new(base, "chat/completions", &key, timeout_seconds)?;
+        http.enable_zai_diagnostics();
         Ok(Self {
-            http: Http::new(base, "chat/completions", &key, timeout_seconds)?,
+            http,
             model,
             effort,
             max_output_tokens,

@@ -55,6 +55,7 @@ class Fixture(unittest.TestCase):
         self.responses = []
         self.headers = []
         self.paths = []
+        self.retry_after = None
         owner = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -69,6 +70,8 @@ class Fixture(unittest.TestCase):
                 self.send_response(status)
                 if status == 302:
                     self.send_header('Location', f'http://127.0.0.1:{owner.server.server_port}/redirected')
+                if owner.retry_after is not None:
+                    self.send_header('Retry-After', owner.retry_after)
                 self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
                 try:
@@ -322,6 +325,30 @@ class Providers(Fixture):
         p = self.run_cli('glm', '--max-output-tokens', '128')
         self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn('configuration', p.stderr)
+
+    def test_zai_error_metadata_is_optional_bounded_and_body_free(self):
+        self.retry_after = '120'
+        for provider, body, expected in (
+            ('glm', {'error': {'code': '1305', 'message': 'SENSITIVE_BODY'}}, 1305),
+            ('glm', {'error': {'code': 1302, 'message': 'SENSITIVE_BODY'}}, 1302),
+            ('glm', b'{"error":{"code":1302,"code":1305}}', None),
+            ('glm', b'SENSITIVE_BODY' * 2000, None),
+            ('openai', {'error': {'code': '1305'}}, None),
+        ):
+            with self.subTest(provider=provider, expected=expected):
+                self.responses.append((429, body))
+                p = self.run_cli(provider, '--provider-retries', '0')
+                self.assertEqual(p.returncode, 3, p.stderr)
+                self.assertNotIn('SENSITIVE_BODY', p.stderr)
+                records = [line for line in p.stderr.splitlines() if line.startswith('DANSO_HTTP=')]
+                if provider == 'openai':
+                    self.assertEqual(records, [])
+                else:
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(json.loads(records[0].split('=', 1)[1]), {
+                        'version': 1, 'provider': 'zai', 'http_status': 429,
+                        'provider_code': expected, 'retry_after_seconds': 120})
+                self.assertIn('"http_status":429', p.stderr)
 
     def test_glm_thinking_toggle_length_diagnosis_and_endpoint_conflicts(self):
         # Default body keeps thinking enabled (issue #70 A).
