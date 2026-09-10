@@ -381,8 +381,12 @@ pub fn validate_output(
                 "fact subject is invalid"
             );
         }
-        let rank = match (source, quote) {
-            (Some(_), Some(quote)) if quote.chars().count() >= 8 => 2,
+        // §4.1: rank follows the source (3 user-stated / 2 measured / 1
+        // inferred). The write gates demote a rank-2/3 draft to 1 unless it
+        // cites a verbatim ≥8-char quote from the transcript (needs-human).
+        let rank = match source {
+            Some("user-stated") => 3,
+            Some("measured") => 2,
             _ => 1,
         };
         drafts.push(FactDraft {

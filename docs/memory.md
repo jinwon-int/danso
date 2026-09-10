@@ -10,12 +10,12 @@ with no Python, Node, Shell, or SQLite runtime dependency. Design source:
 
 | Stage | Scope | Status |
 | --- | --- | --- |
-| M1 | Storage + search core: `paths`, `scan`, `facts`, `recall`, `memory init/add/search/close/show/eval` | This PR |
-| M2 | Snapshot assembly + run integration (`snapshot.rs`, `--memory read`, dynamic budgets) | **This PR** |
+| M1 | Storage + search core: `paths`, `scan`, `facts`, `recall`, `memory init/add/search/close/show/eval` | Done |
+| M2 | Snapshot assembly + run integration (`snapshot.rs`, `--memory read`, dynamic budgets) | Done |
 | M3 | Working-state + checkpoints (harness-written `working-state.md`) | Done (M1–M3) |
-| M2½ | `--memory-refresh per-request` (runtime context hook) | **This PR** |
-| M4 | Distill extraction + journal + transactions (`--memory read-write`, `distill/drain/rollback`) | **This PR** |
-| M5 | Scope diagnostics (`check`, audit ledger, legacy read) | **This PR** (promotion deferred per §7) |
+| M2½ | `--memory-refresh per-request` (runtime context hook) | Done |
+| M4 | Distill extraction + journal + transactions (`--memory read-write`, `distill/drain/rollback`) | Done; #65 PR-1 fixed the read-write blocking defects, PR-2 unified manual add/close onto the rollback transaction, wired the audit ledger, and added the wiki-candidate queue |
+| M5 | Scope diagnostics (`check`, audit ledger, legacy read) | Done except legacy read: `--memory-legacy-read` and the `memory_requests` usage counter are not implemented (deferred); promotion deferred per §7 |
 
 ## On-disk layout (§3)
 
@@ -188,6 +188,14 @@ danso memory init                              # create the scope tree + templat
 danso memory add --kind K --text T [--because B] [--subject S] [--valid-from F] [--valid-until U]
 danso memory search <query> [--as-of ISO] [--limit N] [--json]
 danso memory close --fact <id>                 # valid_until = now (reversible, idempotent)
+```
+
+Manual `add`/`close` writes go through the same crash-recoverable rollback
+transaction as distill commits (#65 §1.5): the memory-rollback lock
+serializes them, the write leaves an undoable head, and both record
+body-free `MemoryCommit` ledger events. Read mode (`--memory read`) injects
+only — it never writes working state, checkpoints, session archives, or the
+journal (§8).
 danso memory show                              # M1 snapshot preview (fixed caps)
 danso memory eval --golden | --scenario        # built-in fixture suites, pinned clock
 ```

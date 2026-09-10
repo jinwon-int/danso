@@ -657,3 +657,360 @@ async fn drain_classifies_provider_http_failures() {
         std::fs::remove_file(journal::journal_dir(&route).join(format!("{job_id}.json"))).ok();
     }
 }
+
+// ---------------------------------------------------------------------------
+// #65 PR-2: design deviations (§1.5–1.7, §2)
+// ---------------------------------------------------------------------------
+
+const FIXTURE_SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+/// The extraction JSON the fixture provider answers with: provenance echoed
+/// from the extraction input, one fact, one wiki candidate, one resume row.
+fn fixture_extraction(thread_hash: &str, wiki_candidate: Value) -> Value {
+    json!({
+        "schema_version": 1,
+        "provenance": {"provider": "danso", "source_thread_hash": thread_hash,
+                        "trigger": "explicit", "distilled_at": "2026-09-08T12:00:00Z"},
+        "honcho": [{"kind": "preference", "text": "에디터는 Helix", "subject": "user"}],
+        "wiki_candidates": [wiki_candidate],
+        "resume": {"last_activity": "정리 완료"}
+    })
+}
+
+fn wiki_candidate_fixture() -> Value {
+    json!({"title": "런북 갱신", "suggested_path": "pages/nodes/x/RUNBOOK.md",
+            "summary": "요약", "evidence_excerpt": "근거"})
+}
+
+/// A provider that answers every request with the same bounded JSON text and
+/// records the joined system prompts it was asked with.
+struct ScriptedExtraction {
+    texts: std::collections::VecDeque<String>,
+    systems: std::cell::RefCell<Vec<String>>,
+}
+
+impl Provider for ScriptedExtraction {
+    fn validate_history(&self, _: &[Value]) -> Result<()> {
+        Ok(())
+    }
+    async fn complete(&mut self, request: ModelRequest<'_>, _: &mut Usage) -> Result<Value> {
+        self.systems.borrow_mut().push(request.system.joined());
+        let text = self.texts.pop_front().expect("scripted provider drained");
+        Ok(json!({"content": [{"type": "text", "text": text}]}))
+    }
+}
+
+fn enqueue_one(route: &Route, session_path: &Path) -> String {
+    match journal::enqueue(route, session_path, "explicit", now()).unwrap() {
+        journal::EnqueueOutcome::Enqueued { job_id } => job_id,
+        other => panic!("expected enqueue, got {other:?}"),
+    }
+}
+
+/// §4.6: the single allowed retry re-asks with an explicit STRICT directive
+/// instead of resending the identical prompt (#65 §2).
+#[test]
+fn strict_retry_reasks_with_strict_directive() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.jsonl");
+    write_private(
+        &session_path,
+        session_lines(FIXTURE_SESSION_ID, 4, 16).as_bytes(),
+    );
+    let (input, _, _) = journal_super_build(&session_path, 32768).unwrap();
+    let thread_hash = facts::hex_encode(&sha2::Sha256::digest(FIXTURE_SESSION_ID.as_bytes()));
+    let good = serde_json::to_string(&fixture_extraction(&thread_hash, json!([]))).unwrap();
+    let mut provider = ScriptedExtraction {
+        texts: std::collections::VecDeque::from(["not json at all".into(), good]),
+        systems: std::cell::RefCell::new(Vec::new()),
+    };
+    let mut usage = Usage::default();
+    let outcome =
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(memory::distill::extract::extract(
+                &mut provider,
+                &mut usage,
+                &input,
+                &thread_hash,
+                "explicit",
+                true,
+            ));
+    assert!(
+        outcome.is_ok(),
+        "second attempt must succeed: {}",
+        outcome
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default()
+    );
+    let systems = provider.systems.borrow();
+    assert_eq!(systems.len(), 2, "exactly one retry");
+    assert!(
+        !systems[0].contains("STRICT:"),
+        "first ask is the plain prompt"
+    );
+    assert!(
+        systems[1].contains("STRICT:"),
+        "retry must carry the STRICT directive"
+    );
+    assert!(
+        systems[1].starts_with(&systems[0]),
+        "retry extends the base prompt"
+    );
+}
+
+fn drain_fixture_session(
+    route: &Route,
+    dir: &Path,
+    wiki_candidate: Value,
+) -> (String, Result<usize>) {
+    let session_path = dir.join("session.jsonl");
+    if !session_path.exists() {
+        write_private(
+            &session_path,
+            session_lines(FIXTURE_SESSION_ID, 4, 16).as_bytes(),
+        );
+    }
+    let job_id = enqueue_one(route, &session_path);
+    let thread_hash = facts::hex_encode(&sha2::Sha256::digest(FIXTURE_SESSION_ID.as_bytes()));
+    let response = fixture_extraction(&thread_hash, wiki_candidate);
+    let mut provider = ScriptedExtraction {
+        texts: std::collections::VecDeque::from([serde_json::to_string(&response).unwrap()]),
+        systems: std::cell::RefCell::new(Vec::new()),
+    };
+    let mut usage = Usage::default();
+    let report = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(danso::memory::distill::extract::drain(
+            route,
+            &mut provider,
+            &mut usage,
+            1,
+            1000,
+            now(),
+        ))
+        .map(|report| report.extracted);
+    (job_id, report)
+}
+
+fn audit_events(route: &Route) -> Vec<Value> {
+    let payload = std::fs::read_to_string(route.state_dir().join("audit.jsonl")).unwrap();
+    payload
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// §1.7: wiki candidates land only in the immutable local queue
+/// `state/wiki-candidates/<job_id>.json`; §1.6: the commit and the job append
+/// body-free ledger events; §4.1: the resume header carries the real
+/// provenance instead of `thread_hash=0 trigger=run`.
+#[test]
+fn drain_success_writes_wiki_queue_audit_and_resume_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let (job_id, extracted) = drain_fixture_session(&route, dir.path(), wiki_candidate_fixture());
+    assert_eq!(extracted.unwrap(), 1);
+
+    // Wiki queue: exactly one immutable file, named by the job id.
+    let queue_dir = route.state_dir().join("wiki-candidates");
+    let entries: Vec<_> = std::fs::read_dir(&queue_dir)
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1, "one queue entry");
+    let path = queue_dir.join(format!("{job_id}.json"));
+    assert!(path.is_file(), "queue entry named by the job id");
+    let queued: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(queued["job_id"], json!(job_id));
+    assert_eq!(queued["wiki_candidates"][0]["title"], json!("런북 갱신"));
+
+    // Resume header provenance (§4.1): real thread hash, trigger, time.
+    let resume = std::fs::read_to_string(route.state_dir().join("resume.md")).unwrap();
+    let header = resume.lines().next().unwrap();
+    let thread_hash = facts::hex_encode(&sha2::Sha256::digest(FIXTURE_SESSION_ID.as_bytes()));
+    assert!(
+        header.contains(&format!("thread_hash={thread_hash}")),
+        "resume header carries the real thread hash: {header}"
+    );
+    assert!(header.contains("trigger=explicit"), "{header}");
+    assert!(
+        header.contains("distilled_at=2026-09-08T12:00:00Z"),
+        "resume header stamps the drain time, not Utc::now(): {header}"
+    );
+    assert!(!header.contains("thread_hash=0"), "{header}");
+
+    // Audit ledger (§6.4): body-free commit and job events.
+    let events = audit_events(&route);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == json!("MemoryCommit")
+                && event["facts_added"] == json!(1)
+                && event["changed"]
+                    .as_array()
+                    .is_some_and(|changed| !changed.is_empty())
+        }),
+        "MemoryCommit recorded: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == json!("DistillJob")
+                && event["job_id"] == json!(job_id)
+                && event["status"] == json!("committed")
+        }),
+        "DistillJob committed recorded: {events:?}"
+    );
+}
+
+/// §1.7: the queue entry is immutable — replaying the same extraction is
+/// idempotent, different bytes for the same job fail the job instead of
+/// quietly overwriting the queue.
+#[test]
+fn drain_replays_identical_wiki_queue_and_refuses_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let (job_id, extracted) = drain_fixture_session(&route, dir.path(), wiki_candidate_fixture());
+    assert_eq!(extracted.unwrap(), 1);
+    let path = route
+        .state_dir()
+        .join("wiki-candidates")
+        .join(format!("{job_id}.json"));
+    let committed = std::fs::read(&path).unwrap();
+
+    // Replay: re-enqueue the same transcript and drain again — the same
+    // extraction produces the same bytes and succeeds.
+    let (replay_id, extracted) =
+        drain_fixture_session(&route, dir.path(), wiki_candidate_fixture());
+    assert_eq!(replay_id, job_id, "job id is content-addressed");
+    assert_eq!(extracted.unwrap(), 1, "identical replay succeeds");
+    assert_eq!(std::fs::read(&path).unwrap(), committed, "bytes unchanged");
+
+    // Conflict: different bytes under the same job id stop the drain with a
+    // conflict error instead of quietly overwriting the queue.
+    std::fs::remove_file(&path).unwrap();
+    write_private(&path, b"{\"job_id\":\"tampered\"}\n");
+    let (_, outcome) = drain_fixture_session(&route, dir.path(), wiki_candidate_fixture());
+    let error = outcome.expect_err("conflicting queue entry refuses the commit");
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with the committed extraction"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"{\"job_id\":\"tampered\"}\n".as_slice(),
+        "tampered queue entry is never overwritten"
+    );
+}
+
+/// §4.1: draft rank follows the source — 3 user-stated, 2 measured, 1
+/// inferred — instead of pinning user-stated at 2. The write gates still
+/// demote rank-2/3 drafts that lack a verbatim ≥8-char quote.
+#[test]
+fn extraction_rank_follows_source() {
+    let thread_hash = "b".repeat(64);
+    let build = |source: Value, quote: Value| {
+        let mut fact = json!({"kind": "preference", "text": "에디터는 Helix", "subject": "user"});
+        if !source.is_null() {
+            fact["source"] = source;
+        }
+        if !quote.is_null() {
+            fact["quote"] = quote;
+        }
+        memory::distill::validate_output(
+            &serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "provenance": {"provider": "danso", "source_thread_hash": thread_hash, "trigger": "explicit", "distilled_at": "2026-09-08T12:00:00Z"},
+                "honcho": [fact],
+                "wiki_candidates": [],
+                "resume": {}
+            }))
+            .unwrap(),
+            &thread_hash,
+            "explicit",
+            true,
+        )
+        .unwrap()
+    };
+    let quote = json!("에디터는 Helix 을 쓴다");
+    assert_eq!(
+        build(json!("user-stated"), quote.clone()).facts[0].source_rank,
+        3
+    );
+    assert_eq!(
+        build(json!("measured"), quote.clone()).facts[0].source_rank,
+        2
+    );
+    assert_eq!(build(json!("inferred"), quote).facts[0].source_rank, 1);
+    assert_eq!(
+        build(json!("user-stated"), json!(null)).facts[0].source_rank,
+        3,
+        "draft rank follows the source; the gates demote quoteless drafts"
+    );
+}
+
+/// §4.5: a manifest entry that claims a file is absent must carry the
+/// constant absent hash — anything else stops recovery/rollback (#65 §2).
+#[test]
+fn rollback_manifest_rejects_bogus_absent_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    write_private(&route.facts_file(), b"changed\n");
+    let action_id = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+    let action_dir = route
+        .state_dir()
+        .join("memory-rollback/actions")
+        .join(action_id);
+    danso::memory::paths::require_private_dir(&action_dir).unwrap();
+    let absent = transaction::absent_hash();
+    let manifest = json!({
+        "schema": "ccc.local-memory-rollback.v1",
+        "action_id": action_id,
+        "state": "committed",
+        "parent": Value::Null,
+        "provider": "danso",
+        "actor": "distill",
+        "tool": "local-memory-sink",
+        "diff": "mode-both",
+        "session": "aabbccdd00112233",
+        "created_at": "2026-09-08T12:00:00Z",
+        "targets": {
+            "memory-facts.jsonl": {
+                "before_exists": false,
+                "after_exists": true,
+                "before_hash": facts::hex_encode(&sha2::Sha256::digest(b"not the absent constant")),
+                "after_hash": facts::hex_encode(&sha2::Sha256::digest(b"changed\n"))
+            },
+            "resume.md": {
+                "before_exists": false,
+                "after_exists": false,
+                "before_hash": absent,
+                "after_hash": absent
+            }
+        }
+    });
+    write_private(
+        &action_dir.join("manifest.json"),
+        format!("{}\n", manifest).as_bytes(),
+    );
+    // The rollback head points at the action, so rollback must verify it.
+    let head = route.state_dir().join("memory-rollback/HEAD");
+    write_private(&head, format!("{action_id}\n").as_bytes());
+
+    let transaction = Transaction::new(&route.state_dir());
+    let error = transaction
+        .rollback(1000, action_id)
+        .expect_err("bogus absent hash must stop the rollback");
+    assert!(
+        error.to_string().contains("absent-file hash is invalid"),
+        "unexpected error: {error}"
+    );
+    // The targets were never touched.
+    assert_eq!(
+        std::fs::read(route.facts_file()).unwrap(),
+        b"changed\n".as_slice(),
+        "rollback refused before mutating targets"
+    );
+}

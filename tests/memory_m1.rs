@@ -5,7 +5,7 @@
 use danso::memory::{
     Route,
     facts::{self, Candidate, Line},
-    paths, recall,
+    paths, recall, transaction,
 };
 use serde_json::{Value, json};
 use std::path::Path;
@@ -484,4 +484,80 @@ fn cli_end_to_end() {
     assert_eq!(code, 0, "{out}");
     let value: Value = serde_json::from_str(out.trim()).unwrap();
     assert_eq!(value["closed"], json!(true));
+}
+
+/// #65 §1.5: manual closes go through the rollback transaction — the write
+/// leaves an undoable head (serialized with distill commits) and a
+/// body-free MemoryCommit ledger event.
+#[test]
+fn close_goes_through_the_rollback_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = route_in(dir.path(), "global");
+    setup_tree(&route);
+
+    let existing = facts::load(&route).unwrap();
+    let now = pinned_now();
+    let out = facts::gate_and_render(
+        &existing,
+        vec![manual_candidate("보고서는 한국어로 쓴다")],
+        "private",
+        now,
+        facts::MAX_FACTS_DEFAULT,
+    )
+    .unwrap();
+    let payload: String = out.lines.concat();
+    write_private(&route.facts_file(), &payload);
+    let id = facts::load(&route)
+        .unwrap()
+        .records()
+        .next()
+        .unwrap()
+        .id
+        .clone();
+
+    let transaction = transaction::Transaction::new(&route.state_dir());
+    assert_eq!(
+        transaction.status().unwrap(),
+        (None, 0),
+        "fresh scope has no rollback head"
+    );
+
+    assert_eq!(
+        facts::close(&route, &id, now, 1000).unwrap(),
+        facts::CloseOutcome::Closed
+    );
+    // One undoable head now exists.
+    let (head, actions) = transaction.status().unwrap();
+    assert_eq!(head.as_deref(), Some(head_action_id(&route).as_str()));
+    assert_eq!(actions, 1, "the close left exactly one action");
+
+    // Body-free MemoryCommit ledger event recorded.
+    let audit = std::fs::read_to_string(route.state_dir().join("audit.jsonl")).unwrap();
+    assert!(
+        audit.contains("\"event\":\"MemoryCommit\"") && audit.contains("\"facts_added\":0"),
+        "close records a MemoryCommit event: {audit}"
+    );
+
+    // The head actually rolls the close back.
+    let action_id = head.unwrap();
+    assert_eq!(
+        transaction.rollback(1000, &action_id).unwrap(),
+        transaction::RollbackOutcome::RolledBack
+    );
+    let record = facts::load(&route)
+        .unwrap()
+        .records()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        record.valid_until, None,
+        "rollback undoes the close (valid_until cleared)"
+    );
+}
+
+fn head_action_id(route: &Route) -> String {
+    String::from_utf8_lossy(&std::fs::read(route.state_dir().join("memory-rollback/HEAD")).unwrap())
+        .trim()
+        .to_string()
 }

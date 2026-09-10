@@ -463,9 +463,15 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         .as_deref()
         .map(|root| memory::Route::new(root, &args.memory.scope))
         .transpose()?;
-    let mut recorder = memory_route
-        .as_ref()
-        .map(|route| memory::working_state::Recorder::new(route.clone(), &args.prompt));
+    // §8: read mode injects only — the harness records nothing (no
+    // working-state, checkpoints, or session-archive writes).
+    let mut recorder = match (args.memory.mode, memory_route.as_ref()) {
+        (memory::MemoryMode::ReadWrite, Some(route)) => Some(memory::working_state::Recorder::new(
+            route.clone(),
+            &args.prompt,
+        )),
+        _ => None,
+    };
     let distill_enqueue = args.memory.mode == memory::MemoryMode::ReadWrite
         && args.memory_distill != memory::DistillMode::Off;
     let mut recording = memory::working_state::RecordingSink::new(sink, recorder.as_mut());
