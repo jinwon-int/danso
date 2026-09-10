@@ -365,3 +365,16 @@ retry. These fields describe the observed failure, not its underlying cause;
 previous failures without this metadata cannot be diagnosed retroactively.
 Auth-store errors and other response-processing failures may still carry only
 the existing category.
+
+### Optional Z.AI HTTP diagnostics
+
+Final GLM HTTP failures retain the existing `DANSO_PROVIDER` record and add
+`DANSO_HTTP={"version":1,"provider":"zai","http_status":429,"provider_code":1305,"retry_after_seconds":120}`.
+Only documented numeric Z.AI codes are emitted. The body is read within 1 second
+and 16 KiB; malformed, oversized, duplicate-code or incomplete bodies omit the
+code while preserving HTTP failure. Retry-After accepts integer seconds 0..86400;
+HTTP-date and invalid values are omitted. This reports the final response hint,
+not the retry scheduler's capped delay. No prose, URL or credential is emitted.
+Retry counts, scheduling, journal transitions and replay policy are unchanged.
+Old consumers may ignore this optional record; update CCC before the native binary
+to display it. See https://docs.z.ai/api-reference/api-code for code meanings.

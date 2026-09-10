@@ -2,6 +2,7 @@
 pub mod anthropic;
 mod chatgpt;
 mod chatgpt_auth;
+pub mod http_diagnostic;
 pub use chatgpt_auth::adopt as adopt_chatgpt_auth;
 pub mod glm;
 mod http;
