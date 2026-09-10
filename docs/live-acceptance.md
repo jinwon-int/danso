@@ -100,3 +100,14 @@ or credentials. Programmatic callers still receive the original exception when
 failure-report persistence succeeds. If storage itself fails, a report may not
 be available. Preflight/setup errors before the run reporting block may likewise
 produce no `result.json`; the CLI continues to print a generic failure message.
+
+## Recorded runs (operator-executed, body-free)
+
+| Date (KST) | Provider / model | Base URL | Effort | Result | Requests (run-1/run-2) | Tokens in/out/total | Note |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-10 | `glm` / `glm-5.3-flash` | `https://api.z.ai/api/coding/paas/v4` (coding preset) | `low` | PASS — coding task, four tools, sandbox test, usage, session resume | 5 / 1 | 3,499 / 181 / 6,624 (cache reads 2,944) | danso #70 완료 조건 F; compactions 0; cost not priced by the runner |
+
+Token counts are usage aggregates from the harness result; request/response
+bodies, credentials, and session identifiers are not recorded here. The run
+used the `ZAI_API_KEY` environment mechanism with the default endpoint
+overridden by an explicit trusted `--base-url`.
