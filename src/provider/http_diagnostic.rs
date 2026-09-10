@@ -4,6 +4,8 @@ use std::time::Duration;
 
 #[derive(Debug, serde::Serialize)]
 pub struct HttpDiagnostic {
+    #[serde(skip)]
+    source: Option<anyhow::Error>,
     pub version: u8,
     pub provider: &'static str,
     pub http_status: u16,
@@ -15,7 +17,17 @@ impl std::fmt::Display for HttpDiagnostic {
         write!(f, "Z.AI HTTP diagnostic")
     }
 }
-impl std::error::Error for HttpDiagnostic {}
+impl std::error::Error for HttpDiagnostic {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|e| e.as_ref())
+    }
+}
+impl HttpDiagnostic {
+    pub fn with_source(mut self, error: anyhow::Error) -> anyhow::Error {
+        self.source = Some(error);
+        anyhow::Error::new(self)
+    }
+}
 
 #[derive(Deserialize)]
 struct Envelope {
@@ -69,6 +81,7 @@ pub async fn capture(mut response: reqwest::Response) -> HttpDiagnostic {
     .ok()
     .flatten();
     HttpDiagnostic {
+        source: None,
         version: 1,
         provider: "zai",
         http_status: status,

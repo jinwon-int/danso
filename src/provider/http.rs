@@ -182,7 +182,9 @@ impl Http {
                 }
                 let error = crate::failure::http_status_error(status);
                 return Err(if self.zai_diagnostics {
-                    error.context(super::http_diagnostic::capture(response).await)
+                    super::http_diagnostic::capture(response)
+                        .await
+                        .with_source(error)
                 } else {
                     error
                 });

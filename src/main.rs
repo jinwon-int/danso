@@ -196,11 +196,8 @@ fn main() {
                         if let Some(diagnostic) = failure::provider(&e) {
                             failure::report_provider(diagnostic);
                         }
-                        for cause in e.chain() {
-                            if let Some(diagnostic) = cause.downcast_ref::<danso::provider::http_diagnostic::HttpDiagnostic>() {
-                                eprintln!("DANSO_HTTP={}", serde_json::to_string(diagnostic).expect("fixed diagnostic"));
-                                break;
-                            }
+                        if let Some(diagnostic) = e.chain().find_map(|cause| cause.downcast_ref::<danso::provider::http_diagnostic::HttpDiagnostic>()) {
+                            eprintln!("DANSO_HTTP={}", serde_json::to_string(diagnostic).expect("fixed diagnostic"));
                         }
                         code
                     },
