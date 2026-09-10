@@ -208,13 +208,15 @@ fn prune_checkpoints(dir: &std::path::Path, keep: usize) -> Result<()> {
 
 fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    // The 0600 mode rides the open(2) call: create-then-chmod leaves a
+    // window where the umask decides the file's permissions (§6.1).
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(path)?;
     file.write_all(contents)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 

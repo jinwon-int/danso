@@ -1014,3 +1014,41 @@ fn rollback_manifest_rejects_bogus_absent_hash() {
         "rollback refused before mutating targets"
     );
 }
+
+/// #65 §2: the journal stores the resolved absolute session path — a
+/// relative `--session` must not dead-letter as session-missing when the
+/// drain runs from a different working directory.
+#[test]
+fn enqueue_canonicalizes_relative_session_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let session_path = dir.path().join("session.jsonl");
+    write_private(
+        &session_path,
+        session_lines(FIXTURE_SESSION_ID, 4, 16).as_bytes(),
+    );
+
+    // Resolve the relative form against the temp dir, then enqueue with it.
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(dir.path()).unwrap();
+    let outcome = journal::enqueue(
+        &route,
+        std::path::Path::new("session.jsonl"),
+        "explicit",
+        now(),
+    );
+    std::env::set_current_dir(prev_cwd).unwrap();
+    let job_id = match outcome.unwrap() {
+        journal::EnqueueOutcome::Enqueued { job_id } => job_id,
+        other => panic!("expected enqueue, got {other:?}"),
+    };
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(journal::journal_dir(&route).join(format!("{job_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    let stored = std::path::PathBuf::from(record["session_path"].as_str().unwrap());
+    assert!(
+        stored.is_absolute() && stored == session_path,
+        "journal must store the canonical absolute session path, got {stored:?}"
+    );
+}
