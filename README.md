@@ -93,6 +93,14 @@ v0 implements these portable contracts within the documented subset:
 
 See [issues](https://github.com/jinwon-int/danso/issues) for the v0 slice.
 
+## Roadmap beyond v0
+
+[Issue #33](https://github.com/jinwon-int/danso/issues/33) tracks folding the
+ccc-node operating features (Telegram, scheduling, diagnostics, service mode)
+into this repository as Rust modules. The module boundaries, feature mapping,
+migration and stage plan are in [the unified design](docs/unified-design.md).
+The v0 non-goals above still describe the current release, not that roadmap.
+
 ## Development checks
 
 For frozen Danso/Pi comparison plans and honest paired result accounting, see
