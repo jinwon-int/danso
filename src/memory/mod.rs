@@ -91,6 +91,9 @@ pub struct MemoryConfig {
     pub max_bytes: usize,
     pub as_of: Option<String>,
     pub refresh: RefreshMode,
+    /// Read-only legacy ccc tree (§9, `--memory-legacy-read`). `None` keeps
+    /// the pre-#86 behaviour byte for byte.
+    pub legacy_read: Option<std::path::PathBuf>,
 }
 
 impl MemoryConfig {
@@ -120,6 +123,19 @@ impl MemoryConfig {
         );
         if let Some(root) = &self.root {
             ensure!(root.is_absolute(), "memory dir must be an absolute path");
+        }
+        if let Some(dir) = &self.legacy_read {
+            ensure!(
+                dir.is_absolute(),
+                "memory legacy read dir must be an absolute path"
+            );
+            // §7/§8 read matrix: a shared run never opens a personal or legacy
+            // tree. Refuse the combination up front rather than silently
+            // ignoring the flag.
+            ensure!(
+                self.scope != "shared",
+                "--memory-legacy-read is not allowed with --memory-scope shared"
+            );
         }
         Ok(())
     }

@@ -110,6 +110,13 @@ impl Doc {
             "memory" => 3.0,
             "structured" => 2.5,
             "state" => 0.5,
+            // Legacy lanes rank below their live counterparts: the ccc tree is
+            // a migration source, so when both carry a near-match the current
+            // tree should win. Falling through to the 1.0 default instead
+            // would rank a stale MEMORY.md *above* the live state files.
+            "legacy-memory" => 2.0,
+            "legacy-structured" => 1.5,
+            "legacy-state" => 0.25,
             _ => 1.0,
         }
     }
@@ -174,9 +181,15 @@ impl TemporalStatus {
 }
 
 /// Read one owner-only markdown/state document into a memory/state doc.
-fn document(route_dir: &std::path::Path, file: &str, source: &'static str) -> Option<Doc> {
+fn document(
+    route_dir: &std::path::Path,
+    file: &str,
+    source: &'static str,
+    policy: paths::ModePolicy,
+) -> Option<Doc> {
     let path = route_dir.join(file);
-    let payload = paths::read_bounded(&path, DOC_FILE_MAX_BYTES, "memory document").ok()??;
+    let payload =
+        paths::read_bounded_with(&path, DOC_FILE_MAX_BYTES, "memory document", policy).ok()??;
     let raw = String::from_utf8_lossy(&payload).into_owned();
     if raw.trim().is_empty() {
         return None;
@@ -206,6 +219,11 @@ fn document(route_dir: &std::path::Path, file: &str, source: &'static str) -> Op
 fn structured_docs(route: &Route, now: DateTime<Utc>) -> Result<Vec<Doc>> {
     let facts_file = route.facts_file();
     let file = facts::load(route)?;
+    let source = if route.is_legacy() {
+        "legacy-structured"
+    } else {
+        "structured"
+    };
     let mut docs = Vec::new();
     for record in file.records() {
         if record.review == "rejected" || record.review == "superseded" {
@@ -231,7 +249,7 @@ fn structured_docs(route: &Route, now: DateTime<Utc>) -> Result<Vec<Doc>> {
         }
         docs.push(Doc {
             path: format!("{}#L{}:{}", facts_file.display(), record.line_no, record.id),
-            source: "structured",
+            source,
             snippet: scan::truncate_utf8(&scanned.text, SNIPPET_CHARS).to_string(),
             content,
             observed: record
@@ -253,46 +271,50 @@ fn structured_docs(route: &Route, now: DateTime<Utc>) -> Result<Vec<Doc>> {
 /// tree. Every source is independently fail-open (§5.1).
 pub fn build_index(route: &Route, now: DateTime<Utc>) -> Result<Vec<Doc>> {
     let mut docs = Vec::new();
-    let mut roots = vec![route.scope_dir()];
-    if let Some(shared) = route.shared_route() {
-        roots.push(shared.scope_dir());
-    }
-    for (index, scope_dir) in roots.iter().enumerate() {
-        let memories = scope_dir.join("memories");
-        let state = scope_dir.join("state");
+    // Iterate routes, not bare directories. The previous shape downgraded the
+    // lanes to paths and rebuilt the facts route from `index == 0`, which
+    // silently mislabels any third lane.
+    for lane in route.read_routes() {
+        let memories = lane.memories_dir();
+        let state = lane.state_dir();
+        let (doc_source, state_source) = if lane.is_legacy() {
+            ("legacy-memory", "legacy-state")
+        } else {
+            ("memory", "state")
+        };
         for file in ["MEMORY.md", "USER.md"] {
-            if let Some(doc) = document(&memories, file, "memory") {
+            if let Some(doc) = document(&memories, file, doc_source, lane.mode_policy()) {
                 docs.push(doc);
             }
         }
         for file in [paths::RESUME_FILE, paths::WORKING_STATE_FILE] {
-            if let Some(doc) = document(&state, file, "state") {
+            if let Some(doc) = document(&state, file, state_source, lane.mode_policy()) {
                 docs.push(doc);
             }
         }
-        // Structured docs stay scoped to the route's own tree; the shared
-        // tree contributes its own facts file when present. Source failures
-        // are fail-open (§5.1): the block is skipped, the rest still injects.
-        let facts_route = if index == 0 {
-            route.clone()
-        } else {
-            match shared_route_for(scope_dir) {
-                Ok(shared) => shared,
-                Err(_) => continue,
-            }
-        };
-        if let Ok(structured) = structured_docs(&facts_route, now) {
+        // Source failures are fail-open (§5.1): the lane is skipped, the rest
+        // still injects.
+        if let Ok(structured) = structured_docs(&lane, now) {
             docs.extend(structured);
         }
     }
+    // §7 dedup: the legacy tree is where the current tree's contents came
+    // from, so the same fact is very likely present twice. Later lanes lose.
+    dedup_by_normalized_text(&mut docs);
     Ok(docs)
 }
 
-fn shared_route_for(scope_dir: &std::path::Path) -> Result<Route> {
-    let root = scope_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("scope directory has no parent"))?;
-    Route::new(root, "shared")
+/// Drop documents whose normalized text was already contributed by an earlier
+/// lane (§7 merge order `private → shared → legacy`). Normalization is the
+/// same one the write gates dedup on, so a reformatted copy still matches.
+fn dedup_by_normalized_text(docs: &mut Vec<Doc>) {
+    let mut seen = std::collections::HashSet::new();
+    docs.retain(|doc| {
+        let key = facts::normalize(&doc.content);
+        // An empty normalization carries no comparable text; keep it rather
+        // than collapsing unrelated documents onto one empty key.
+        key.is_empty() || seen.insert(key)
+    });
 }
 
 // ---------------------------------------------------------------------------
