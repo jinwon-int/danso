@@ -758,6 +758,91 @@ fn strict_retry_reasks_with_strict_directive() {
         systems[1].starts_with(&systems[0]),
         "retry extends the base prompt"
     );
+    // §4.6 (#86): the STRICT re-ask is a separate request and counts again.
+    assert_eq!(
+        usage.memory_requests(),
+        2,
+        "first ask and STRICT re-ask each count one extraction request"
+    );
+}
+
+/// §4.6 (#86): `memory_requests` breaks down `requests`, it does not add to
+/// them, and it never leaks into DANSO_USAGE / PIRI_USAGE, whose field set is
+/// fixed by the Piri schema (docs/v0.md).
+#[test]
+fn memory_requests_are_a_subset_of_requests_and_stay_out_of_the_usage_record() {
+    struct BillingExtraction {
+        text: String,
+    }
+    impl Provider for BillingExtraction {
+        fn validate_history(&self, _: &[Value]) -> Result<()> {
+            Ok(())
+        }
+        async fn complete(&mut self, _: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
+            usage.add(
+                "test",
+                "extractor",
+                danso::usage::TokenUsage {
+                    input: 7,
+                    output: 3,
+                    ..Default::default()
+                },
+            )?;
+            Ok(json!({"content": [{"type": "text", "text": self.text.clone()}]}))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.jsonl");
+    write_private(
+        &session_path,
+        session_lines(FIXTURE_SESSION_ID, 4, 16).as_bytes(),
+    );
+    let (input, _, _) = journal_super_build(&session_path, 32768).unwrap();
+    let thread_hash = facts::hex_encode(&sha2::Sha256::digest(FIXTURE_SESSION_ID.as_bytes()));
+    let good = serde_json::to_string(&fixture_extraction(&thread_hash, json!([]))).unwrap();
+    let mut provider = BillingExtraction { text: good };
+    let mut usage = Usage::default();
+
+    let before = usage.summary();
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(memory::distill::extract::extract(
+            &mut provider,
+            &mut usage,
+            &input,
+            &thread_hash,
+            "explicit",
+            true,
+        ))
+        .expect("scripted extraction succeeds on the first ask");
+
+    assert_eq!(usage.memory_requests(), 1, "one extraction request");
+    assert_eq!(
+        usage.snapshot().requests,
+        1,
+        "the extraction request is aggregated into the normal request total"
+    );
+    assert_eq!(
+        usage.summary()["requests"],
+        json!(1),
+        "extraction tokens still land in DANSO_USAGE (§4.6)"
+    );
+    assert!(
+        usage.summary().get("memoryRequests").is_none()
+            && usage.summary().get("memory_requests").is_none(),
+        "the counter must not widen the Piri-fixed DANSO_USAGE field set"
+    );
+    assert_eq!(
+        usage
+            .summary()
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        before.as_object().unwrap().keys().collect::<Vec<_>>(),
+        "DANSO_USAGE keys are unchanged by extraction accounting"
+    );
 }
 
 fn drain_fixture_session(
@@ -792,6 +877,98 @@ fn drain_fixture_session(
         ))
         .map(|report| report.extracted);
     (job_id, report)
+}
+
+/// §4.6 (#86): `danso memory drain` builds a throwaway `Usage`, so the request
+/// cost has to ride out on the serialized DrainReport or it is invisible.
+#[test]
+fn drain_report_carries_the_extraction_request_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let session_path = dir.path().join("session.jsonl");
+    write_private(
+        &session_path,
+        session_lines(FIXTURE_SESSION_ID, 4, 16).as_bytes(),
+    );
+    enqueue_one(&route, &session_path);
+    let thread_hash = facts::hex_encode(&sha2::Sha256::digest(FIXTURE_SESSION_ID.as_bytes()));
+    // A malformed first reply forces the STRICT re-ask, so the count is 2 and
+    // cannot be confused with the number of jobs drained (1).
+    let good = serde_json::to_string(&fixture_extraction(&thread_hash, json!([]))).unwrap();
+    let mut provider = ScriptedExtraction {
+        texts: std::collections::VecDeque::from(["not json at all".into(), good]),
+        systems: std::cell::RefCell::new(Vec::new()),
+    };
+    let mut usage = Usage::default();
+    let report = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(danso::memory::distill::extract::drain(
+            &route,
+            &mut provider,
+            &mut usage,
+            1,
+            1000,
+            now(),
+        ))
+        .expect("drain succeeds");
+
+    assert_eq!(report.extracted, 1, "one job drained");
+    assert_eq!(
+        report.memory_requests, 2,
+        "one ask plus the STRICT re-ask, counted independently of job count"
+    );
+    let serialized = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        serialized["memory_requests"],
+        json!(2),
+        "the CLI drain output surfaces the counter"
+    );
+}
+
+/// §4.6 (#86): an inline drain shares the run's `Usage`, so the report must
+/// carry this drain's delta rather than the run-to-date total.
+#[test]
+fn drain_report_counts_this_drain_only_on_a_shared_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let session_path = dir.path().join("session.jsonl");
+    write_private(
+        &session_path,
+        session_lines(FIXTURE_SESSION_ID, 4, 16).as_bytes(),
+    );
+    enqueue_one(&route, &session_path);
+    let thread_hash = facts::hex_encode(&sha2::Sha256::digest(FIXTURE_SESSION_ID.as_bytes()));
+    let good = serde_json::to_string(&fixture_extraction(&thread_hash, json!([]))).unwrap();
+    let mut provider = ScriptedExtraction {
+        texts: std::collections::VecDeque::from([good]),
+        systems: std::cell::RefCell::new(Vec::new()),
+    };
+    let mut usage = Usage::default();
+    // Pretend an earlier drain in the same run already spent three requests.
+    for _ in 0..3 {
+        usage.record_memory_request();
+    }
+    let report = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(danso::memory::distill::extract::drain(
+            &route,
+            &mut provider,
+            &mut usage,
+            1,
+            1000,
+            now(),
+        ))
+        .expect("drain succeeds");
+
+    assert_eq!(
+        report.memory_requests, 1,
+        "report is this drain's delta, not the run total"
+    );
+    assert_eq!(
+        usage.memory_requests(),
+        4,
+        "the run-to-date counter keeps accumulating"
+    );
 }
 
 fn audit_events(route: &Route) -> Vec<Value> {

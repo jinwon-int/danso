@@ -32,6 +32,10 @@ pub struct DrainReport {
     pub extracted: usize,
     pub failed: usize,
     pub dead: usize,
+    /// Extraction requests this drain spent (#52 §4.6, issue #86), including
+    /// STRICT re-asks. `danso memory drain` builds its own `Usage` and drops
+    /// it, so without this field a CLI drain reports no request cost at all.
+    pub memory_requests: u32,
 }
 
 /// Run the extraction round trip: one tool-free request with the prompt and
@@ -58,6 +62,11 @@ pub async fn extract(
                 "{base_system}\n\nSTRICT: your previous reply violated the extraction contract. Return only the JSON object matching the schema exactly — no prose, no markdown fences, no trailing commentary."
             )
         };
+        // §4.6: count the extraction request before dispatching it, so a
+        // request that fails mid-flight is still counted. The provider itself
+        // aggregates tokens into the same `usage`, making `memory_requests` a
+        // breakdown of `requests`, not an addition to it.
+        usage.record_memory_request();
         let response = provider
             .complete(
                 crate::provider::ModelRequest {
@@ -365,6 +374,9 @@ pub async fn drain(
     now: DateTime<Utc>,
 ) -> Result<DrainReport> {
     let mut report = DrainReport::default();
+    // Delta, not absolute: an inline drain shares the run's `Usage`, which may
+    // already carry extraction requests from an earlier drain in the same run.
+    let requests_before = usage.memory_requests();
     for _ in 0..max_jobs {
         let Some(job) = journal::claim(route, now, timeout_ms)? else {
             break;
@@ -407,6 +419,7 @@ pub async fn drain(
             }
         }
     }
+    report.memory_requests = usage.memory_requests().saturating_sub(requests_before);
     Ok(report)
 }
 

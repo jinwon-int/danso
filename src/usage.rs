@@ -15,6 +15,13 @@ pub struct Usage {
     /// Compaction summary requests counted by the runtime (issue #69 F);
     /// reported only via DANSO_BUDGET, never in DANSO_USAGE.
     summary_requests: u32,
+    /// Memory-distill extraction requests (#52 §4.6, issue #86). Their tokens
+    /// are aggregated into DANSO_USAGE like any other request; this counter
+    /// only breaks out how many of those requests came from extraction. Like
+    /// `summary_requests` it is reported via DANSO_BUDGET and never via
+    /// DANSO_USAGE, because that record doubles as PIRI_USAGE and its field
+    /// set is fixed by the Piri schema (docs/v0.md).
+    memory_requests: u32,
     /// Terminal output-cap stops seen by the runtime (issue #69 F).
     length_stops: u32,
     /// Length stops continued with a follow-up request (issue #69 B/F).
@@ -81,6 +88,17 @@ impl Usage {
     /// Run budget facts for the body-free DANSO_BUDGET record (issue #69 F).
     pub fn record_summary_request(&mut self) {
         self.summary_requests = self.summary_requests.saturating_add(1);
+    }
+
+    /// Count one memory-distill extraction request (#52 §4.6). The STRICT
+    /// re-ask after a contract violation is a separate request and counts
+    /// again, matching how `summary_requests` counts repair requests.
+    pub fn record_memory_request(&mut self) {
+        self.memory_requests = self.memory_requests.saturating_add(1);
+    }
+
+    pub fn memory_requests(&self) -> u32 {
+        self.memory_requests
     }
 
     pub fn record_length_stop(&mut self) {
