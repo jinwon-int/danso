@@ -21,10 +21,13 @@ jobs:
           sudo apt-get install -y bubblewrap
       - name: Format, lint and test
         run: |
-          cargo +1.98.1 fmt --check
-          cargo +1.98.1 clippy --locked --all-targets -- -D warnings
-          cargo +1.98.1 test --locked
+          cargo +1.98.1 fmt --all --check
+          cargo +1.98.1 clippy --workspace --locked --all-targets -- -D warnings
+          cargo +1.98.1 test --workspace --locked
           cargo +1.98.1 build --locked
+          # A CLI-only install must stay buildable without the optional
+          # module features (docs/unified-design.md §3.1).
+          cargo +1.98.1 build --workspace --locked --no-default-features
           cargo +1.98.1 build --release --locked
           python3 scripts/test_e2e.py
           # The documented install builds --release; run the CLI contract

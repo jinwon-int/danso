@@ -419,6 +419,90 @@ async fn progress_follows_durable_markers_and_cannot_authorize_effects() {
     }
 }
 
+/// A policy wrapper is an executor extension: it never touches the loop.
+struct PolicyExecutor<E> {
+    inner: E,
+    verdict: danso::contracts::Verdict,
+}
+impl<E: ToolExecutor> ToolExecutor for PolicyExecutor<E> {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.inner.definitions()
+    }
+    async fn preflight(&self) -> Result<()> {
+        self.inner.preflight().await
+    }
+    fn admit(&self, _: &ToolCall) -> danso::contracts::Verdict {
+        self.verdict.clone()
+    }
+    async fn execute(&self, call: &ToolCall) -> Result<ToolOutcome> {
+        self.inner.execute(call).await
+    }
+}
+
+/// A refused call is a failed tool result: journaled with both operation
+/// markers, visible to the model, and never dispatched. `Ask` without an
+/// approval route is the same refusal (fail-closed).
+#[tokio::test]
+async fn policy_refusal_is_a_journaled_tool_failure_without_execution() {
+    use danso::contracts::Verdict;
+    for verdict in [
+        Verdict::Deny {
+            reason: "bash is disabled for this audience".into(),
+        },
+        Verdict::Ask,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+        let calls = Rc::new(RefCell::new(vec![]));
+        let mut registry = Registry::default();
+        registry.register(ProbeTool(calls.clone())).unwrap();
+        let executor = PolicyExecutor {
+            inner: TestExecutor {
+                registry,
+                session_path: path.clone(),
+                preflight_fails: false,
+            },
+            verdict: verdict.clone(),
+        };
+        let mut provider = provider(vec![
+            tool_message("p1"),
+            json!({"role":"assistant","content":[{"type":"text","text":"gave up"}],"stopReason":"stop"}),
+        ]);
+        runtime::run(
+            input(),
+            &mut provider,
+            &executor,
+            &mut session,
+            &mut RecordingSink::default(),
+            &mut Usage::default(),
+        )
+        .await
+        .unwrap();
+        assert!(calls.borrow().is_empty(), "refused call must not execute");
+        let result = &provider.requests[1]["messages"][2];
+        assert_eq!(result["role"], "toolResult");
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("tool call refused by policy: "), "{text}");
+        if let Verdict::Deny { reason } = &verdict {
+            assert!(text.ends_with(reason));
+        } else {
+            assert!(text.contains("approval required"));
+        }
+        // Both markers are durable, so recovery sees a settled operation.
+        session.check_recovery().unwrap();
+        assert_eq!(session.tool_call_ids().unwrap().len(), 1);
+        let states: Vec<&str> = session
+            .entries
+            .iter()
+            .filter(|entry| entry["type"] == "custom")
+            .filter_map(|entry| entry["data"]["state"].as_str())
+            .collect();
+        assert_eq!(states, ["started", "settled"]);
+    }
+}
+
 #[tokio::test]
 async fn no_tools_skips_executor_but_rejects_unsolicited_calls_before_persistence() {
     for malicious in [false, true] {

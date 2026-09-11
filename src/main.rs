@@ -61,6 +61,40 @@ fn main() {
         }
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("config") {
+        #[derive(clap::Parser)]
+        #[command(
+            name = "danso config",
+            about = "Validate $DANSO_HOME/config.toml without echoing values. No provider or network access."
+        )]
+        struct ConfigArgs {
+            #[command(subcommand)]
+            command: ConfigCommand,
+        }
+        #[derive(clap::Subcommand)]
+        enum ConfigCommand {
+            /// Parse and validate; print a body-free key report.
+            Check {
+                #[arg(long)]
+                file: Option<std::path::PathBuf>,
+            },
+        }
+        let args = ConfigArgs::parse_from(std::env::args_os().skip(1));
+        let ConfigCommand::Check { file } = args.command;
+        match danso::config::check(file.as_deref()) {
+            Ok(report) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).expect("serializable")
+                );
+            }
+            Err(error) => {
+                eprintln!("config check failed: {error:#}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("auth-adopt") {
         #[derive(clap::Parser)]
         #[command(

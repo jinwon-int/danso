@@ -38,7 +38,7 @@
 | 청중(audience) 스코프 라우팅 | `bridge/core/memory_audience.py`, `memory_policy.py` | 선택 모듈 `telegram` | HMAC 키 → `private-<32hex>`; danso 메모리 스코프 형식과 이미 일치 |
 | `AgentRuntime`/`AgentSession` 이벤트 계약 | `bridge/core/agent_runtime.py` | 코어 (`danso-runtime` 크레이트에 Rust 타입으로) | §4.1 |
 | Telegram 송수신·접근 제어·세션 연결·진행·취소·명령 | `bridge/core/bot*.py`, `streaming.py`, `ui.py`, `utils/tg_*` | 선택 모듈 `telegram` (#33 3행) | §5 |
-| 승인(approval) 흐름 | `bot_approvals.py`, `approval_contract.py`, `approval_audit.py` | 선택 모듈 `telegram` + 코어 `ToolPolicy` 훅 | danso 런타임에 `ask` 정책이 없으므로 코어 변경 필요(§4.3) |
+| 승인(approval) 흐름 | `bot_approvals.py`, `approval_contract.py`, `approval_audit.py` | 선택 모듈 `telegram` + 코어 `ToolExecutor::admit` 훅 | 훅은 A단계에 추가됨; `Ask` 경로는 B4(§4.3) |
 | 하트비트·상태 메시지·정체 감지 | `heartbeat.py`, `turn_watchdog.py`, `turn_stall.py` | 선택 모듈 `telegram` | 감지만, 개입 없음 원칙 유지 |
 | 후속 메시지 큐, `/stop` 우선 | `bot_followup_queue.py`, `task_queue.py` | 선택 모듈 `telegram` | 내구 큐 + 상한 |
 | 세션 저장소(`sessions.json`) | `session/store.py`, `manager.py` | 선택 모듈 `telegram` | atomic + `.bak` + CAS 패턴 그대로 |
@@ -78,7 +78,7 @@ flowchart TD
     Bin[danso bin: run / memory / bridge / cron / doctor / audit / update / service]
     Bin --> Core[danso-core: contracts, runtime, session, tools, provider, compaction, context]
     Bin --> Mem[danso-memory: facts, recall, snapshot, distill, transaction]
-    Bin --> Rt[danso-runtime: AgentEvent contract, TurnRunner, ToolPolicy]
+    Bin --> Rt[danso-runtime: AgentEvent contract, TurnRunner, ApprovalHandler]
     Bin -. feature telegram .-> Tg[danso-telegram: Bot API client, updates, rendering, commands, approvals, store]
     Bin -. feature ops .-> Ops[danso-ops: config, cron, doctor, audit, update, service, health, usage meter]
     Rt --> Core
@@ -98,7 +98,7 @@ flowchart TD
 | `danso-fs` | `memory/paths.rs`의 owner-only 검증·`open_secure`·atomic write·flock·bounded read를 승격, `redaction`(자격증명 패턴), `scan`(주입 스캐너) | 없음 (`libc`, `sha2` 기존) |
 | `danso-core` | 현재 `src/` 중 memory 제외 전부 | 없음 |
 | `danso-memory` | 현재 `src/memory/*` | 없음 |
-| `danso-runtime` | `AgentEvent`, `AgentSession`, `TurnRunner`(인프로세스/서브프로세스), `ToolPolicy` | 없음 |
+| `danso-runtime` | `AgentEvent`, `AgentSession`, `TurnRunner`(인프로세스/서브프로세스), `ApprovalHandler` | 없음 |
 | `danso-telegram` | Bot API 클라이언트, 업데이트 루프, 렌더러, 명령, 승인, 대화 저장소, 하트비트, 스풀 | `reqwest` `multipart` feature (파일 전송) |
 | `danso-ops` | 설정, cron 스케줄러, doctor, audit, update, service, health, 사용량 미터 | `toml`, `ed25519-dalek`(업데이트 서명), `hmac` |
 | `danso` (bin) | 서브커맨드 조합. `default-features = ["ops"]`, `telegram`은 opt-in | — |
@@ -144,7 +144,7 @@ pub enum AgentEvent {
 }
 ```
 
-- 기본은 **본문 없음**: `arguments`/`result`는 `ToolPolicy`가 표시를 허용한 경우에만
+- 기본은 **본문 없음**: `arguments`/`result`는 실행기 정책이 표시를 허용한 경우에만
   `Some`이다. Telegram 렌더러는 도구 이름과 성공 여부만 쓰고, 인수·결과·경로는
   쓰지 않는다(ccc의 danso 레인과 동일).
 - 기존 `contracts::Event`(Session/Message/Compaction/FinalAnswer/Task/Request/
@@ -196,29 +196,33 @@ pub trait AgentSession {
 큐가 보장한다. 같은 저널 UUID에 대한 교차 프로세스 잠금은 기존 `session.rs`의
 flock이 그대로 담당한다.
 
-### 4.3 `ToolPolicy`와 승인
+### 4.3 도구 admission(`ToolExecutor::admit`)과 승인
 
 v0 계약은 "네 도구, 승인 UI 없음"이다. Telegram 그룹·비소유자 경로에서는
 ccc-node의 `strict-project`/`owner-operator`/`disabled` 프로필과 bash 정책
 (`disabled`/`approve-each`/`auto-approve`)이 필요하다. 코어에는 **정책 훅만**
-추가하고 정책 판단은 밖에 둔다.
+추가하고 정책 판단은 밖에 둔다. 훅은 별도 트레이트가 아니라 기존
+`ToolExecutor`의 기본 메서드다(A단계 구현): 루프는 분기하지 않고, 임베더는
+실행기를 감싸 정책을 얹는다.
 
 ```rust
-pub enum Verdict { Allow, Deny { reason: &'static str }, Ask }
-pub trait ToolPolicy: Send + Sync {
-    fn preflight(&self, call: &ToolCall) -> Verdict;
+pub enum Verdict { Allow, Deny { reason: String }, Ask }
+pub trait ToolExecutor {
+    fn admit(&self, call: &ToolCall) -> Verdict { Verdict::Allow }   // 기본 = 허용
+    // definitions / preflight / execute …
 }
+// danso-runtime
 pub trait ApprovalHandler: Send + Sync {
-    async fn decide(&self, req: &ApprovalRequest) -> ApprovalDecision; // 기본 구현 = Deny
+    fn decide(&self, req: &ApprovalRequest) -> BoxFuture<'_, ApprovalDecision>; // DenyAll 기본
 }
 ```
 
-- 정책은 `ToolExecutor` 앞단(`execute` 직전, `started` 저널 기록 **전**)에서
-  평가한다. `Deny`/`Ask→Deny`는 `toolResult.isError=true`로 모델에 돌아가고
-  저널에는 정상 `started/settled`로 남는다. 즉 승인 거부는 도구 실패다.
-- `Ask`는 `ApprovalRequest` 이벤트를 내고 `ApprovalHandler`를 기다린다.
-  핸들러 부재·타임아웃(기본 60초)·예외는 모두 Deny다.
-- CLI 기본 정책은 `AllowAll`(현재 동작 불변). 브리지 기본은
+- 루프는 `started` 저널 기록 **전**에 `admit`을 묻는다. `Deny`/`Ask→Deny`는
+  `toolResult.isError=true`로 모델에 돌아가고 저널에는 정상 `started/settled`로
+  남으며 실행기는 호출되지 않는다. 즉 승인 거부는 도구 실패다.
+- `Ask`는 B4에서 `ApprovalRequest` 이벤트를 내고 `ApprovalHandler`를 기다린다.
+  그 전까지, 그리고 핸들러 부재·타임아웃(기본 60초)·예외는 모두 Deny다.
+- CLI 기본 정책은 허용(현재 동작 불변). 브리지 기본은
   `owner-operator`(소유자 1인 DM은 Allow, 그 외 `bash`는 Ask, `write/edit`는
   워크스페이스 밖이면 Ask).
 - 승인 토큰은 요청 지문(HMAC)과 **렌더링된 텍스트 지문(SHA-256)** 둘 다에
@@ -433,7 +437,7 @@ import` 가능). 저장 위치 `$DANSO_HOME/cron/tasks.json`, 잠금 `cron/locks
 - 잠금: `O_EXCL` 0600 JSON(`acquiredAt, pid, bootId, runId`). 스테일 판정은
   `boot_id` 변경 또는 opt-in `lockTimeoutSec` 두 가지뿐. 상태 커밋 실패 잡은
   `persist-failed` 격리로 남고 `danso cron lock <id> --release --run-id`로만 해제.
-- 페이로드 종류: `prompt`(danso 런, `allowedTools`·`permissionMode`→`ToolPolicy`,
+- 페이로드 종류: `prompt`(danso 런, `allowedTools`·`permissionMode`→`admit` 정책,
   `no-tools` 옵션), `command`(argv, cwd, timeout, 출력 상한), **`memory-drain`**
   (내장, #87(a)의 외부 트리거를 대체), `doctor`, `update-check`.
 - 알림: `notify` ∈ `none|telegram-owner|telegram-owner-on-failure|telegram-chat…`
@@ -513,11 +517,12 @@ $DANSO_HOME (0700)
 
 | 단계 | 내용 | 완료 판단 |
 | --- | --- | --- |
-| A. 준비 | workspace 분리, `danso-fs` 승격, `AgentEvent`/`TurnRunner`/`ToolPolicy(AllowAll)` 정의, `InProcessRunner` + 취소 안전성, `config.toml` 로더 | 동작 변경 없음. 기존 전 테스트 통과, 적합성 스위트 초기판, feature off 빌드 |
+| A. 준비 | workspace 분리, `AgentEvent`/`TurnRunner`/`ToolExecutor::admit`(기본 Allow) 정의, `InProcessRunner` + 취소 안전성, `config.toml` 로더 + `danso config check` | 동작 변경 없음. 기존 전 테스트 통과, 적합성 스위트 초기판, feature off 빌드 |
+| A 이월 | `danso-fs` 크레이트 분리(`memory/paths.rs` 승격), `danso-core`/`danso-memory` 분리, 자격증명 값 주입(§4.2 2항), `config.toml` → `RunTemplate` 매핑 | B1 첫 PR에서 브리지가 실제로 필요로 할 때 진행. 그 전까지 인프로세스 러너는 CLI와 같이 프로세스 env에서 자격증명을 읽는다 |
 | B1. Telegram 최소 | Bot API 클라이언트, 토큰 잠금, 접근 제어, 대화 저장소, 단일 턴(최종 답변만), `/start /new /stop /model /effort /usage` | 가짜 Bot API로 기준 시나리오. ccc 없이 실행 |
 | B2. 진행·내구성 | 하트비트, 도구 진행 한 줄, 후속 큐, 재시작 후 고아 상태 메시지 정리, health.json, 로그 redaction | 재연결·중복 업데이트·429·메시지 길이·재시작 복구 테스트 |
 | B3. 장기과제·메모리 | `/task_pause /task_resume /distill /memory_promote /resume /history`, 청중 스코프, 메모리 read-write 잡 enqueue | 스코프 격리 테스트(다른 DM 트리 미개방), 저널 이동 전환 절차 문서 |
-| B4. 정책·승인 | `ToolPolicy` 훅, 승인 이벤트·버튼·감사 원장, 실행 프로필 | 승인 없음=거부, 지문 불일치 거부, 타임아웃 거부, 저널에 실패 도구로 기록 |
+| B4. 정책·승인 | `admit`의 `Ask` 경로, 승인 이벤트·버튼·감사 원장, 실행 프로필 | 승인 없음=거부, 지문 불일치 거부, 타임아웃 거부, 저널에 실패 도구로 기록 |
 | B5. 파일·스풀 | 문서 송수신, 푸시 스풀 소비, `/restart` | 워크스페이스 밖 확인 흐름, 스풀 형식 호환 |
 | C. 운영 | `config check/import-ccc`, `doctor`, `audit`, `service`, `update`, `cron`(memory-drain 포함), `backup`, 사용량 미터 | 새 환경에서 문서만으로 설치→서비스→재시작→복구 재현. #87(a) 트리거를 `cron`으로 대체 |
 | D. 시험 노드 전환 | 공명 노드 1대 ccc→danso 전환·복귀 리허설 | 전환 절차와 관찰 결과 기록, 확대 여부 결정 |
@@ -536,7 +541,7 @@ PR 본문에 기록한다.
    (`text_streaming: degraded`)이므로 3행 완료 조건에서는 제외하고 E단계로 둔다.
 3. **음성.** Whisper HTTP + ffmpeg 외부 의존. 필요하면 `voice` feature로,
    아니면 폐기.
-4. **승인 훅의 v0 표면 변경.** `ToolPolicy`는 코어 계약 변경이다. CLI 기본은
+4. **승인 훅의 v0 표면 변경.** `ToolExecutor::admit`은 코어 계약 변경이다(A단계에서 기본 허용으로 추가됨). CLI 기본은
    불변이지만 v0 문서의 "승인 UI 없음" 문구를 수정해야 한다.
 5. **cron 시간대.** IANA tzdata 파싱을 1차에서 뺀다(UTC·고정 오프셋만). 기존
    ccc 잡이 `Asia/Seoul`을 쓰므로 import 시 `+09:00`으로 변환하되 DST 없는

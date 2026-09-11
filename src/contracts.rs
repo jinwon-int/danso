@@ -63,11 +63,31 @@ pub trait SessionStore {
     }
 }
 
+/// Admission verdict for one tool call, decided before the call is journaled
+/// or dispatched. A denied call is recorded as a failed tool result so the
+/// model sees the refusal; the executor is never invoked for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Allow,
+    Deny {
+        reason: String,
+    },
+    /// Requires an explicit approval. Until an approval route exists the
+    /// runtime treats this exactly like `Deny` (fail-closed).
+    Ask,
+}
+
 /// The executor owns isolation and limits; the loop never invokes tools inline.
 #[allow(async_fn_in_trait)]
 pub trait ToolExecutor {
     fn definitions(&self) -> Vec<ToolDefinition>;
     async fn preflight(&self) -> Result<()>;
+    /// Policy admission for one call. The default admits everything, which
+    /// keeps the CLI behavior unchanged; embedders wrap an executor to apply
+    /// a stricter policy. Called by the loop before the `started` marker.
+    fn admit(&self, _call: &ToolCall) -> Verdict {
+        Verdict::Allow
+    }
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutcome>;
 }
 

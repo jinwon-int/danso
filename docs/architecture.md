@@ -42,6 +42,14 @@ flowchart TD
 | `context.rs` | Trust-aware discovery, trusted backend/limit execution context and context budgets | Model requests or tool execution |
 | `failure.rs` | Typed failure categories and body-free CLI error records | Inferring causes from provider text or authorizing retries |
 | `usage.rs`, `output.rs` | Normalized usage, event rendering, usage prefixes | Authorization or execution policy |
+| `config.rs` | `$DANSO_HOME/config.toml` parsing, shape/range validation, body-free `config check` | Applying values to a run (the CLI stays flag-driven until the bridge stage) |
+| `crates/danso-runtime` | Provider-neutral `AgentEvent` vocabulary, `AgentSession`/`TurnRunner` traits, `ChannelSink`, in-process runner with cancel/pause | Telegram, scheduling, HTTP servers, or any change to the core loop |
+
+The workspace split and the module plan are in [the unified design](unified-design.md).
+`ToolExecutor::admit` is the only policy seam: the loop asks it before the
+durable `started` marker, records a refusal as a failed tool result with both
+markers, and never dispatches the call. The default admits everything, so
+the CLI is unchanged; embedders wrap an executor to deny or (later) ask.
 
 The existing Pi message envelope remains the shared message representation
 (`serde_json::Value`) so unknown interchange fields survive persistence. New
@@ -102,8 +110,17 @@ registry without enabling extra production tools.
 
 The loop checks recovery and executor preflight before calling a provider.
 For each returned batch it validates all call IDs before any side effect.
-For each tool it persists `started`, executes, persists the result, then
-persists `settled`. A failed journal write prevents execution. Completed
+For each tool it asks `admit`, persists `started`, executes (or records the
+refusal), persists the result, then persists `settled`. A failed journal
+write prevents execution. An `Ask` verdict without an approval route is a
+refusal, never an implicit allow.
+
+Embedders drive the same loop through `danso-runtime`: the in-process runner
+executes `app::run` on a dedicated thread and cancels by dropping the run
+future, which is the CLI's SIGTERM path. Descendant cleanup on that path is
+covered by `scripts/test_host_execution.py`; the event ordering, body-free
+error mapping and cancel/recovery contract are covered by
+`crates/danso-runtime/tests/conformance.rs` over a loopback fake provider. Completed
 history is context, never a replay queue. Cancellation can leave an unresolved
 operation and must not be turned into an implicit success or manual ACK.
 

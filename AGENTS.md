@@ -16,8 +16,15 @@ module boundary; `app.rs` is the composition root and `runtime.rs` is agent poli
   changes that scope. Avoid speculative plugin runtimes or unused abstractions.
 - For a new extension, test it through the common runtime and relevant failure
   gates. Keep the Pi fixture and real-sandbox E2E tests passing.
-- Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`,
-  `cargo test --locked`, `cargo build --locked`, `python3 scripts/test_e2e.py`,
+- The repository is a Cargo workspace: the root package `danso` is the core
+  harness and CLI; `crates/danso-runtime` is the provider-neutral session and
+  event contract for embedders (see `docs/unified-design.md`). Keep the core
+  loop free of channel or scheduler concerns; put embedder behavior behind
+  `danso-runtime` traits. Tool admission policy lives on `ToolExecutor::admit`
+  (default allow) and never in `runtime.rs` branches.
+- Run `cargo fmt --all --check`, `cargo clippy --workspace --locked --all-targets -- -D warnings`,
+  `cargo test --workspace --locked`, `cargo build --locked`,
+  `cargo build --workspace --locked --no-default-features`, `python3 scripts/test_e2e.py`,
   `python3 scripts/test_compaction.py`, `python3 scripts/test_providers.py`, and `python3 scripts/test_live_acceptance.py`
   before a PR. Also run `python3 scripts/test_dev_check.py` and `python3 scripts/test_dev_check_host.py` and `python3 scripts/test_ccc_node.py`.
   Include `python3 scripts/test_progress.py` for real CLI progress timing/privacy.
