@@ -152,6 +152,7 @@ fn input<'a>(prompt: &'a str, task: LongTaskRun) -> RunInput<'a> {
         stream_requests: false,
         report_progress: false,
         pause_requested: None,
+        cancellation_reason: None,
     }
 }
 
@@ -421,7 +422,7 @@ async fn reported_token_budget_applies_to_compaction_without_action_dispatch() {
 }
 
 #[tokio::test]
-async fn pending_provider_and_budget_exhaustion_never_replay() {
+async fn cancelled_provider_requires_explicit_resume_and_preserves_unknown_usage() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pending.jsonl");
     let limits = limits();
@@ -467,7 +468,7 @@ async fn pending_provider_and_budget_exhaustion_never_replay() {
         calls: 0,
         delay: None,
     };
-    let error = runtime::run(
+    runtime::run(
         input(
             "",
             LongTaskRun {
@@ -484,9 +485,13 @@ async fn pending_provider_and_budget_exhaustion_never_replay() {
         &mut Usage::default(),
     )
     .await
-    .unwrap_err();
-    assert_eq!(failure::category(&error), Some(Kind::Session));
-    assert_eq!(retry.calls, 0);
+    .unwrap();
+    assert_eq!(retry.calls, 1);
+    drop(resumed);
+    let status = Session::read_status(&path).unwrap();
+    assert_eq!(status["usage"]["requests"], 2);
+    assert_eq!(status["usage"]["unknown_usage_requests"], 1);
+    assert_eq!(status["state"], "completed");
 }
 
 #[tokio::test]
@@ -672,6 +677,7 @@ async fn short_mode_repeat_guard_guides_once_then_terminates() {
         stream_requests: false,
         report_progress: false,
         pause_requested: None,
+        cancellation_reason: None,
     };
     let error = runtime::run(
         input,
@@ -757,4 +763,150 @@ fn recovery_advice_distinguishes_checkpoints_uncertainty_and_budgets() {
         }
     }
     assert!(failure::task_recovery(&anyhow::anyhow!("DANSO_RECOVERY=PRIVATE")).is_none());
+}
+
+#[tokio::test]
+async fn repeated_provider_cancellation_consumes_durable_budget_without_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cancelled.jsonl");
+    let effects = Rc::new(RefCell::new(Vec::new()));
+    let executor = FakeExecutor {
+        calls: effects.clone(),
+        outputs: RefCell::new(VecDeque::new()),
+    };
+    for attempt in 0..3 {
+        let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+        let mut provider = FakeProvider {
+            replies: VecDeque::new(),
+            calls: 0,
+            delay: Some(Duration::from_secs(1)),
+        };
+        let mut sink = Sink::default();
+        let mut usage = Usage::default();
+        let run = runtime::run(
+            input(
+                if attempt == 0 {
+                    "original objective"
+                } else {
+                    ""
+                },
+                LongTaskRun {
+                    limits: limits(),
+                    explicit_limits: 31,
+                    resume: attempt > 0,
+                    pause_after_stage: None,
+                },
+            ),
+            &mut provider,
+            &executor,
+            &mut session,
+            &mut sink,
+            &mut usage,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), run)
+                .await
+                .is_err()
+        );
+        drop(session);
+        let status = Session::read_status(&path).unwrap();
+        assert_eq!(status["usage"]["requests"], attempt + 1);
+        assert_eq!(status["usage"]["unknown_usage_requests"], attempt + 1);
+        assert_eq!(status["resume_allowed"], attempt < 2);
+        assert!(status["elapsed_ms"].as_u64().unwrap() >= (attempt + 1) * 10);
+    }
+    let before = std::fs::read(&path).unwrap();
+    let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+    let mut provider = FakeProvider {
+        replies: VecDeque::new(),
+        calls: 0,
+        delay: None,
+    };
+    assert!(
+        runtime::run(
+            input(
+                "",
+                LongTaskRun {
+                    limits: limits(),
+                    explicit_limits: 31,
+                    resume: true,
+                    pause_after_stage: None
+                }
+            ),
+            &mut provider,
+            &executor,
+            &mut session,
+            &mut Sink::default(),
+            &mut Usage::default()
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(provider.calls, 0);
+    assert!(effects.borrow().is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn output_failure_after_assistant_append_cannot_be_reclassified_as_provider_wait() {
+    struct BrokenSink;
+    impl EventSink for BrokenSink {
+        fn emit(&mut self, event: Event<'_>) -> Result<()> {
+            if let Event::Message(entry) = event {
+                if entry["message"]["role"] == "assistant" {
+                    anyhow::bail!("synthetic sink failure");
+                }
+            }
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("output.jsonl");
+    let effects = Rc::new(RefCell::new(Vec::new()));
+    let executor = FakeExecutor {
+        calls: effects.clone(),
+        outputs: RefCell::new(VecDeque::new()),
+    };
+    let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+    let mut provider = FakeProvider {
+        replies: VecDeque::from([final_reply("durable")]),
+        calls: 0,
+        delay: None,
+    };
+    assert!(
+        runtime::run(
+            input(
+                "goal",
+                LongTaskRun {
+                    limits: limits(),
+                    explicit_limits: 31,
+                    resume: false,
+                    pause_after_stage: None
+                }
+            ),
+            &mut provider,
+            &executor,
+            &mut session,
+            &mut BrokenSink,
+            &mut Usage::default()
+        )
+        .await
+        .is_err()
+    );
+    drop(session);
+    let status = Session::read_status(&path).unwrap();
+    assert_eq!(status["state"], "pending_provider");
+    assert_eq!(status["resume_allowed"], false);
+    assert_eq!(status["usage"]["unknown_usage_requests"], 0);
+    let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+    // Even a syntactically valid interruption record must not cross the
+    // assistant append, whether or not that assistant contains tool calls.
+    session
+        .record_long_task(json!({"version":1,"event":"provider_interrupted",
+        "sequence":1,"stage":0,"elapsed_ms":1,"reason":"unknown","request_kind":"action"}))
+        .unwrap();
+    assert!(session.check_recovery().is_err());
+    drop(session);
+    assert!(Session::read_status(&path).is_err());
+    assert!(effects.borrow().is_empty());
 }

@@ -264,6 +264,7 @@ async fn per_request_refresh_re_resolves_after_compaction() {
             stream_requests: false,
             report_progress: false,
             pause_requested: None,
+            cancellation_reason: None,
         },
         &mut provider,
         &BigTool,

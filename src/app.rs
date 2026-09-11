@@ -13,7 +13,10 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::{
     path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
@@ -77,6 +80,7 @@ pub struct RunConfig {
     /// Process-local graceful-pause request, installed by the CLI signal
     /// handler. Library callers may leave this unset.
     pub pause_requested: Option<Arc<AtomicBool>>,
+    pub cancellation_reason: Option<Arc<AtomicU8>>,
 }
 
 /// Build a production provider from explicit parts (shared by `danso run`
@@ -507,6 +511,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
                 stream_requests: args.stream_requests,
                 report_progress: args.report_progress,
                 pause_requested: args.pause_requested.as_deref(),
+                cancellation_reason: args.cancellation_reason.as_deref(),
             },
             &mut provider,
             &runner,
@@ -520,11 +525,14 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
                     || anyhow::anyhow!("long-task wall budget exhausted"),
                 )))
             } else {
-                match tokio::time::timeout(Duration::from_millis(remaining), run_future).await {
-                    Ok(result) => result,
-                    Err(_) => Err(at(Kind::RunTimeout)(anyhow::anyhow!(
-                        "long-task wall budget exhausted"
-                    ))),
+                tokio::select! {
+                    result = run_future => result,
+                    _ = async {
+                        tokio::time::sleep(Duration::from_millis(remaining)).await;
+                        if let Some(reason) = &args.cancellation_reason {
+                            reason.store(3, Ordering::Release);
+                        }
+                    } => Err(at(Kind::RunTimeout)(anyhow::anyhow!("long-task wall budget exhausted"))),
                 }
             }
         } else {

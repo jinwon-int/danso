@@ -134,11 +134,13 @@ class _TaskStatus:
     requests: int
     reported_tokens: int
     resume_allowed: bool
+    unknown_usage_requests: int = 0
+    interruption_reason: str | None = None
 
 
 def _task_status(data):  # noqa: C901 -- strict nested protocol validation
     """Parse the provider-free native status projection without relaying data."""
-    if (type(data) is not dict or set(data) != TASK_STATUS_KEYS
+    if (type(data) is not dict or set(data) not in (TASK_STATUS_KEYS, TASK_STATUS_KEYS | {'recovery'})
             or type(data.get('version')) is not int or data['version'] != 1
             or data.get('kind') != 'long_task_status'
             or type(data.get('session_id')) is not str
@@ -158,7 +160,7 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
     limits = data['limits']
     usage = data['usage']
     if (type(limits) is not dict or set(limits) != TASK_STATUS_LIMIT_KEYS
-            or type(usage) is not dict or set(usage) != TASK_STATUS_USAGE_KEYS):
+            or type(usage) is not dict or set(usage) != (TASK_STATUS_USAGE_KEYS | ({'unknown_usage_requests'} if 'recovery' in data else set()))):
         raise ValueError('invalid task status')
     values = {}
     for key, maximum in (
@@ -178,6 +180,28 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
         if type(value) is not int or not 0 <= value <= maximum:
             raise ValueError('invalid task status usage')
         usage_values[key] = value
+    unknown = 0
+    reason = None
+    if 'recovery' in data:
+        recovery = data['recovery']
+        unknown = usage['unknown_usage_requests']
+        if (type(recovery) is not dict
+                or set(recovery) != {'interruption_reason', 'interrupted_requests',
+                                     'max_interrupted_requests', 'automatic_resume_allowed'}
+                or type(unknown) is not int or not 0 <= unknown <= 3
+                or unknown > usage_values['requests']
+                or type(recovery['interrupted_requests']) is not int
+                or recovery['interrupted_requests'] != unknown
+                or type(recovery['max_interrupted_requests']) is not int
+                or recovery['max_interrupted_requests'] != 3
+                or recovery['automatic_resume_allowed'] is not False):
+            raise ValueError('invalid task recovery assessment')
+        reason = recovery['interruption_reason']
+        if (reason is not None and (type(reason) is not str or reason not in
+                {'user_stop', 'signal_termination', 'run_deadline', 'unknown'})):
+            raise ValueError('invalid task interruption reason')
+        if (unknown == 0) != (reason is None) or (unknown == 3 and data['resume_allowed']):
+            raise ValueError('inconsistent task recovery assessment')
     pending = data['pending']
     if pending is not None:
         if type(pending) is not dict:
@@ -194,7 +218,8 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
             raise ValueError('invalid task status pending')
     return _TaskStatus(
         state=data['state'], stage=data['stage'], elapsed_ms=data['elapsed_ms'],
-        resume_allowed=data['resume_allowed'], **values, **usage_values,
+        resume_allowed=data['resume_allowed'], unknown_usage_requests=unknown,
+        interruption_reason=reason, **values, **usage_values,
     )
 
 

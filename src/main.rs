@@ -13,17 +13,20 @@ use std::{
     io::Read,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
 
-async fn interrupted() -> i32 {
+async fn interrupted(reason: &AtomicU8) -> i32 {
     use tokio::signal::unix::{SignalKind, signal};
     let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
     let mut hup = signal(SignalKind::hangup()).expect("SIGHUP handler");
-    tokio::select! { _ = int.recv() => 130, _ = term.recv() => 143, _ = hup.recv() => 129 }
+    let code =
+        tokio::select! { _ = int.recv() => 130, _ = term.recv() => 143, _ = hup.recv() => 129 };
+    reason.store(if code == 130 { 1 } else { 2 }, Ordering::Release);
+    code
 }
 
 // The tool worker must not initialize Tokio: RLIMIT_AS intentionally leaves
@@ -156,7 +159,9 @@ fn main() {
         .expect("runtime");
     let mut usage = Usage::default();
     let pause_requested = Arc::new(AtomicBool::new(false));
+    let cancellation_reason = Arc::new(AtomicU8::new(0));
     let mut config = args.config();
+    config.cancellation_reason = Some(Arc::clone(&cancellation_reason));
     if config.long_task.is_some() {
         config.pause_requested = Some(Arc::clone(&pause_requested));
     }
@@ -177,8 +182,16 @@ fn main() {
             None
         };
         let code = tokio::select! {
-            code = interrupted() => { eprintln!("run interrupted"); failure::report(Kind::Interrupted, code); code },
-            result = tokio::time::timeout(Duration::from_secs(config.timeout_seconds), app::run(&config, &mut sink, &mut usage)) => {
+            code = interrupted(&cancellation_reason) => { eprintln!("run interrupted"); failure::report(Kind::Interrupted, code); code },
+            result = async {
+                tokio::select! {
+                    result = app::run(&config, &mut sink, &mut usage) => Ok(result),
+                    _ = async {
+                        tokio::time::sleep(Duration::from_secs(config.timeout_seconds)).await;
+                        cancellation_reason.store(3, Ordering::Release);
+                    } => Err(()),
+                }
+            } => {
                 match result {
                     Ok(Ok(())) => 0,
                     Ok(Err(e)) => {

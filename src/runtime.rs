@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
     time::Instant,
 };
 
@@ -51,6 +51,8 @@ pub struct RunInput<'a> {
     /// this flag at settled boundaries; it never interrupts a provider or
     /// tool operation.
     pub pause_requested: Option<&'a AtomicBool>,
+    /// Supervisor classification; absence means unknown, never inferred.
+    pub cancellation_reason: Option<&'a AtomicU8>,
 }
 
 impl<'a> RunInput<'a> {
@@ -77,6 +79,7 @@ impl<'a> RunInput<'a> {
             stream_requests: false,
             report_progress: false,
             pause_requested: None,
+            cancellation_reason: None,
         }
     }
 }
@@ -115,6 +118,7 @@ struct LongTaskProvider<'a, P, S> {
     mode: GateMode,
     started: Instant,
     base_elapsed_ms: u64,
+    cancellation_reason: Option<&'a AtomicU8>,
 }
 
 impl<'a, P, S> LongTaskProvider<'a, P, S> {
@@ -125,6 +129,7 @@ impl<'a, P, S> LongTaskProvider<'a, P, S> {
         mode: GateMode,
         started: Instant,
         base_elapsed_ms: u64,
+        cancellation_reason: Option<&'a AtomicU8>,
     ) -> Self {
         Self {
             provider,
@@ -133,12 +138,56 @@ impl<'a, P, S> LongTaskProvider<'a, P, S> {
             mode,
             started,
             base_elapsed_ms,
+            cancellation_reason,
         }
     }
 
     fn elapsed_ms(&self) -> u64 {
         self.base_elapsed_ms
             .saturating_add(self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+    }
+}
+
+/// Exists only across Provider::complete. Dropping it cannot replay tools.
+struct ProviderWait<'a, S: SessionStore> {
+    session: &'a mut S,
+    ledger: &'a mut crate::long_task::Ledger,
+    started: Instant,
+    base_elapsed_ms: u64,
+    mode: GateMode,
+    reason: Option<&'a AtomicU8>,
+    armed: bool,
+}
+
+impl<S: SessionStore> Drop for ProviderWait<'_, S> {
+    fn drop(&mut self) {
+        if !self.armed || std::thread::panicking() {
+            return;
+        }
+        let Some(limits) = self.ledger.limits else {
+            return;
+        };
+        let elapsed = self
+            .base_elapsed_ms
+            .saturating_add(self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+            .min(limits.wall_seconds.saturating_mul(1000));
+        let reason = match self.reason.map(|r| r.load(Ordering::Acquire)).unwrap_or(0) {
+            1 => "user_stop",
+            2 => "signal_termination",
+            3 => "run_deadline",
+            _ => "unknown",
+        };
+        // A failed durable append must leave recovery fail-closed. Drop has no
+        // error channel; the next assessment will see pending/torn data.
+        let _ = self.ledger.interrupt_request(
+            self.session,
+            elapsed,
+            reason,
+            match self.mode {
+                GateMode::Action => "action",
+                GateMode::Summary => "summary",
+            },
+        );
     }
 }
 
@@ -162,7 +211,20 @@ impl<P: Provider, S: SessionStore> Provider for LongTaskProvider<'_, P, S> {
         }
         let _sequence = self.ledger.begin_request(self.session, self.elapsed_ms())?;
         let before = usage.snapshot();
-        let response = self.provider.complete(request, usage).await;
+        let response = {
+            let mut guard = ProviderWait {
+                session: self.session,
+                ledger: self.ledger,
+                started: self.started,
+                base_elapsed_ms: self.base_elapsed_ms,
+                mode: self.mode,
+                reason: self.cancellation_reason,
+                armed: true,
+            };
+            let response = self.provider.complete(request, usage).await;
+            guard.armed = false;
+            response
+        };
         let delta = token_delta(before, usage.snapshot())?;
         match response {
             Ok(response) => match self.mode {
@@ -571,6 +633,7 @@ pub async fn run(
                             GateMode::Summary,
                             task_started,
                             task_base_elapsed_ms,
+                            input.cancellation_reason,
                         );
                         crate::compaction::summarize(
                             &mut gated,
@@ -675,6 +738,7 @@ pub async fn run(
                 GateMode::Action,
                 task_started,
                 task_base_elapsed_ms,
+                input.cancellation_reason,
             );
             gated
                 .complete(
