@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import time
+import threading
 import unittest
 
 def system_text(body):
@@ -293,6 +294,70 @@ class LongTask(providers.Fixture):
             capture_output=True, text=True, timeout=5,
         )
 
+    def assert_recovery(self, result, state, reason, allowed):
+        records = [json.loads(line.split('=', 1)[1])
+                   for line in result.stderr.splitlines()
+                   if line.startswith('DANSO_RECOVERY=')]
+        self.assertEqual(records, [{
+            'version': 1, 'state': state, 'reason': reason,
+            'resume_allowed': allowed,
+            'action': 'resume_task' if allowed else 'new_session',
+        }], result.stderr)
+        errors = [json.loads(line.split('=', 1)[1])
+                  for line in result.stderr.splitlines()
+                  if line.startswith('DANSO_ERROR=')]
+        self.assertEqual(len(errors), 1, result.stderr)
+        self.assertEqual(set(errors[0]), {'version', 'category', 'exit_code'})
+        self.assertEqual(errors[0]['exit_code'], result.returncode)
+        if not allowed:
+            self.assertNotIn('requires explicit --resume-task', result.stderr)
+            self.assertIn('different --session path', result.stderr)
+
+    def test_interrupted_provider_reports_recovery_without_replay_or_journal_change(self):
+        received, release = threading.Event(), threading.Event()
+
+        def delayed(_request):
+            received.set()
+            release.wait(10)
+            return providers.response('glm', text='unobserved result')
+
+        self.responses.append((200, delayed))
+        process = subprocess.Popen(
+            self.command('--timeout-seconds', '60', prompt='Synthetic interrupted request'),
+            env=self.env('glm'), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertTrue(received.wait(5))
+            process.send_signal(signal.SIGTERM)
+            _, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 143, stderr)
+        finally:
+            release.set()
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        before = self.session.read_bytes()
+        status = self.status()
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)['state'], 'pending_provider')
+        self.assertFalse(json.loads(status.stdout)['resume_allowed'])
+        for args, prompt in [((), 'A new message'), (('--resume-task', '-p'), None)]:
+            with self.subTest(args=args):
+                refused = self.run_long(*args, prompt=prompt)
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assert_recovery(refused, 'pending_provider', 'uncertain_work', False)
+                self.assertEqual(len(self.requests), 1)
+                self.assertEqual(self.session.read_bytes(), before)
+        # Omitting --long-task must not bypass either the gate or its advice.
+        command = self.command(prompt='Short mode must not bypass the gate')
+        command.remove('--long-task')
+        refused = subprocess.run(command, env=self.env('glm'), capture_output=True,
+                                 text=True, timeout=5)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assert_recovery(refused, 'pending_provider', 'uncertain_work', False)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.session.read_bytes(), before)
+
     def test_cli_resume_inherits_limits_and_does_not_replay_tools(self):
         self.responses.append((200, self.tool_response('echo once >> effects')))
         first = self.run_long(
@@ -318,6 +383,8 @@ class LongTask(providers.Fixture):
         refused = self.run_long('--timeout-seconds', '60',
                                 prompt='Start over without permission')
         self.assertNotEqual(refused.returncode, 0)
+        self.assert_recovery(refused, 'paused', 'explicit_resume_required', True)
+        self.assertEqual(self.session.read_bytes(), before)
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(len(self.users()), 1)
 
@@ -331,6 +398,7 @@ class LongTask(providers.Fixture):
 
         completed = self.run_long('--resume-task', '-p')
         self.assertNotEqual(completed.returncode, 0)
+        self.assert_recovery(completed, 'completed', 'terminal_task', False)
         self.assertEqual(len(self.requests), 2)
 
     def test_sigusr1_pauses_after_settled_tool_and_resume_is_explicit(self):
@@ -395,9 +463,14 @@ class LongTask(providers.Fixture):
         status = self.status()
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertFalse(json.loads(status.stdout)['resume_allowed'])
-        resumed = self.run_long('--resume-task', '-p')
-        self.assertNotEqual(resumed.returncode, 0)
-        self.assertEqual(len(self.requests), 1)
+        before = self.session.read_bytes()
+        for args, prompt in [((), 'New message'), (('--resume-task', '-p'), None)]:
+            refused = self.run_long(*args, prompt=prompt)
+            self.assertEqual(refused.returncode, 2, refused.stderr)
+            self.assert_recovery(refused, 'pending_tools', 'uncertain_work', False)
+            self.assertEqual(len(self.requests), 1)
+            self.assertEqual(self.session.read_bytes(), before)
+            self.assertFalse((self.repo / 'effects').exists())
 
     def test_resume_uses_saved_active_deadline(self):
         self.responses.append((200, self.tool_response(
