@@ -254,7 +254,26 @@ impl Session {
     }
 
     pub fn check_recovery(&self) -> Result<()> {
-        self.scan()?.1.complete()
+        // Validate the entire journal before attaching advice. A malformed
+        // ledger must never be mistaken for a recoverable checkpoint.
+        let recovery = self.scan()?.1;
+        if let Err(error) = recovery.complete() {
+            let ledger = crate::long_task::Ledger::from_records(
+                &self.long_task_records()?,
+                self.entries[0]["id"].as_str(),
+            )?;
+            return Err(
+                if matches!(
+                    ledger.state,
+                    crate::long_task::State::PendingTools | crate::long_task::State::FinalPending
+                ) {
+                    ledger.recovery_error()
+                } else {
+                    error
+                },
+            );
+        }
+        Ok(())
     }
 
     fn scan(&self) -> Result<(Vec<Value>, Recovery)> {

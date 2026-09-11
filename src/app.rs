@@ -345,6 +345,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     // An explicitly supplied value remains an assertion, so a caller cannot
     // silently change cumulative budgets by restarting with different flags.
     let mut long_task = args.long_task;
+    let mut exhausted_recovery = None;
     let long_remaining = if let Some(mut task) = long_task {
         let records = session.long_task_records().map_err(at(Kind::Session))?;
         let ledger =
@@ -385,7 +386,14 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
             )
         {
             let cap = task.limits.wall_seconds.saturating_mul(1000);
-            Some(cap.saturating_sub(ledger.elapsed_ms))
+            let remaining = cap.saturating_sub(ledger.elapsed_ms);
+            if remaining == 0 {
+                // The deadline can reject before runtime::run validates the
+                // full journal. Never attach advice from unvalidated bindings.
+                session.check_recovery().map_err(at(Kind::Session))?;
+                exhausted_recovery = Some(ledger.recovery_error());
+            }
+            Some(remaining)
         } else {
             Some(task.limits.wall_seconds.saturating_mul(1000))
         }
@@ -499,8 +507,8 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         );
         if let Some(remaining) = long_remaining {
             if remaining == 0 {
-                Err(at(Kind::RunTimeout)(anyhow::anyhow!(
-                    "long-task wall budget exhausted"
+                Err(at(Kind::RunTimeout)(exhausted_recovery.unwrap_or_else(
+                    || anyhow::anyhow!("long-task wall budget exhausted"),
                 )))
             } else {
                 match tokio::time::timeout(Duration::from_millis(remaining), run_future).await {

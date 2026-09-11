@@ -190,6 +190,9 @@ fn main() {
                         };
                         eprintln!("{e:#}");
                         failure::report(failure::category(&e).unwrap_or(Kind::Configuration), code);
+                        if let Some(diagnostic) = failure::task_recovery(&e) {
+                            failure::report_task_recovery(diagnostic);
+                        }
                         if let Some(diagnostic) = failure::transport(&e) {
                             failure::report_transport(diagnostic);
                         }

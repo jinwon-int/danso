@@ -104,6 +104,21 @@ failed jobs, and completed jobs are rejected before another provider request.
 `--task-status` remains a provider-free native CLI operation and does not
 create or mutate a journal.
 
+### Interrupted-session recovery diagnostics
+
+Native Danso now emits optional `DANSO_RECOVERY` metadata for blocked long-task
+invocations; see [the state/action contract and recovery procedure](v0.md#recovering-after-interruption).
+The existing `DANSO_ERROR` fields and no-replay boundary are unchanged.
+
+The bundled Python adapter and deployed CCC bridge do **not** yet consume this
+record. Their user-facing message can remain a generic runtime/session failure
+until [CCC #1667](https://github.com/jinwon-int/ccc-node/issues/1667) is merged and deployed. That
+consumer must validate bounded enums, exact keys/types and state/action
+consistency, preserve fail-closed behavior for malformed/duplicate records, and
+show a new-chat (`/new`) option for uncertain work without auto-resuming,
+resetting, or acknowledging the old journal. This native change alone does not
+claim to fix the deployed Telegram message.
+
 ## Optional compaction
 
 Set `compact_at_bytes=16384` on `DansoRuntime` to opt in to native checkpoint

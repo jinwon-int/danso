@@ -704,3 +704,55 @@ async fn short_mode_repeat_guard_guides_once_then_terminates() {
     );
     // The final answer path never ran: no terminal stop reply was consumed.
 }
+
+#[test]
+fn recovery_advice_distinguishes_checkpoints_uncertainty_and_budgets() {
+    use danso::long_task::{Ledger, State};
+    for (state, reason, allowed) in [
+        (State::Ready, "explicit_resume_required", true),
+        (State::Paused, "explicit_resume_required", true),
+        (State::PendingProvider, "uncertain_work", false),
+        (State::PendingTools, "uncertain_work", false),
+        (State::FinalPending, "uncertain_work", false),
+        (State::Completed, "terminal_task", false),
+        (State::Failed, "terminal_task", false),
+    ] {
+        let mut ledger = Ledger {
+            limits: Some(limits()),
+            state,
+            ..Default::default()
+        };
+        let error = failure::at(Kind::Session)(ledger.recovery_error()).context("PRIVATE context");
+        let diagnostic = failure::task_recovery(&error).unwrap();
+        assert_eq!(
+            serde_json::to_value(diagnostic).unwrap(),
+            json!({
+                "version": 1, "state": state.as_str(), "reason": reason,
+                "resume_allowed": allowed,
+                "action": if allowed { "resume_task" } else { "new_session" },
+            })
+        );
+        assert_eq!(ledger.ensure_safe_resume().is_ok(), allowed);
+        if allowed {
+            for budget in 0..4 {
+                ledger = Ledger {
+                    limits: Some(limits()),
+                    state,
+                    ..Default::default()
+                };
+                match budget {
+                    0 => ledger.elapsed_ms = limits().wall_seconds * 1000,
+                    1 => ledger.requests = limits().max_requests,
+                    2 => ledger.reported_tokens = limits().max_tokens,
+                    _ => ledger.repeat_count = limits().repeat_limit,
+                }
+                let error = ledger.ensure_safe_resume().unwrap_err();
+                let record = serde_json::to_value(failure::task_recovery(&error).unwrap()).unwrap();
+                assert_eq!(record["reason"], "budget_exhausted");
+                assert_eq!(record["resume_allowed"], false);
+                assert_eq!(record["action"], "new_session");
+            }
+        }
+    }
+    assert!(failure::task_recovery(&anyhow::anyhow!("DANSO_RECOVERY=PRIVATE")).is_none());
+}

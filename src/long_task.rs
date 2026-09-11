@@ -519,21 +519,32 @@ impl Ledger {
             })
     }
 
-    pub fn ensure_safe_resume(&self) -> Result<()> {
-        match self.state {
-            State::None => Ok(()),
-            State::Ready | State::Paused => {
-                ensure!(
-                    self.resume_allowed(),
-                    "long-task cumulative budget exhausted"
-                );
-                Ok(())
-            }
+    /// Recovery advice is derived only from a validated ledger; it grants no
+    /// authority to replay, acknowledge, or mutate uncertain work.
+    pub fn recovery_error(&self) -> anyhow::Error {
+        use crate::failure::{TaskRecoveryDiagnostic, TaskRecoveryReason};
+        let reason = match self.state {
             State::PendingProvider | State::PendingTools | State::FinalPending => {
-                bail!("long-task has uncertain work; manual recovery required")
+                TaskRecoveryReason::UncertainWork
             }
-            State::Completed => bail!("long-task is complete; start a new session"),
-            State::Failed => bail!("long-task failed; start a new session"),
+            State::Ready | State::Paused if !self.resume_allowed() => {
+                TaskRecoveryReason::BudgetExhausted
+            }
+            State::Completed | State::Failed => TaskRecoveryReason::TerminalTask,
+            _ => TaskRecoveryReason::ExplicitResumeRequired,
+        };
+        anyhow::Error::new(TaskRecoveryDiagnostic::new(
+            self.state.as_str(),
+            reason,
+            self.resume_allowed(),
+        ))
+    }
+
+    pub fn ensure_safe_resume(&self) -> Result<()> {
+        if self.state == State::None || self.resume_allowed() {
+            Ok(())
+        } else {
+            Err(self.recovery_error())
         }
     }
 

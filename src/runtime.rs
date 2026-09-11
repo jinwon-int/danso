@@ -6,7 +6,7 @@ use crate::{
     session::millis,
     usage::{Usage, UsageSnapshot},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
     sync::atomic::{AtomicBool, Ordering},
@@ -341,13 +341,12 @@ pub async fn run(
                     "resume-task takes no prompt"
                 );
             } else {
-                ensure!(
-                    matches!(
-                        long_ledger.state,
-                        crate::long_task::State::Completed | crate::long_task::State::Failed
-                    ),
-                    "unfinished long-task requires explicit --resume-task"
-                );
+                if !matches!(
+                    long_ledger.state,
+                    crate::long_task::State::Completed | crate::long_task::State::Failed
+                ) {
+                    return Err(long_ledger.recovery_error());
+                }
                 ensure!(
                     !input.prompt.trim().is_empty(),
                     "new long-task requires a prompt"
@@ -365,7 +364,7 @@ pub async fn run(
             crate::long_task::State::Completed | crate::long_task::State::Failed
         )
     {
-        bail!("unfinished long-task requires explicit --resume-task");
+        return Err(long_ledger.recovery_error());
     }
     let task_started = Instant::now();
     let task_base_elapsed_ms = long_ledger.elapsed_ms;

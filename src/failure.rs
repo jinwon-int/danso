@@ -248,6 +248,85 @@ pub fn report_provider(diagnostic: &ProviderDiagnostic) {
     );
 }
 
+/// Bounded recovery metadata, emitted separately from the strict DANSO_ERROR
+/// contract. No journal IDs, paths, prompts, or underlying error text.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRecoveryReason {
+    ExplicitResumeRequired,
+    UncertainWork,
+    BudgetExhausted,
+    TerminalTask,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskRecoveryDiagnostic {
+    version: u8,
+    reason: TaskRecoveryReason,
+    state: &'static str,
+    resume_allowed: bool,
+    action: &'static str,
+}
+
+impl TaskRecoveryDiagnostic {
+    pub(crate) fn new(
+        state: &'static str,
+        reason: TaskRecoveryReason,
+        resume_allowed: bool,
+    ) -> Self {
+        Self {
+            version: 1,
+            reason,
+            state,
+            resume_allowed,
+            action: if resume_allowed {
+                "resume_task"
+            } else {
+                "new_session"
+            },
+        }
+    }
+}
+
+impl fmt::Display for TaskRecoveryDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "long-task state={}: ", self.state)?;
+        match self.reason {
+            TaskRecoveryReason::ExplicitResumeRequired => write!(
+                f,
+                "unfinished long-task requires explicit --resume-task with no new prompt"
+            ),
+            TaskRecoveryReason::UncertainWork => write!(
+                f,
+                "long-task has uncertain work; resume is not allowed. Preserve the journal, inspect prior effects, and start a new session with a different --session path. No automatic replay"
+            ),
+            TaskRecoveryReason::BudgetExhausted => write!(
+                f,
+                "long-task cumulative budget exhausted; preserve the journal and start a new session with a different --session path"
+            ),
+            TaskRecoveryReason::TerminalTask => write!(
+                f,
+                "long-task is terminal; preserve the journal and start a new session with a different --session path"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TaskRecoveryDiagnostic {}
+
+pub fn task_recovery(error: &Error) -> Option<&TaskRecoveryDiagnostic> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TaskRecoveryDiagnostic>())
+}
+
+pub fn report_task_recovery(diagnostic: &TaskRecoveryDiagnostic) {
+    eprintln!(
+        "DANSO_RECOVERY={}",
+        serde_json::to_string(diagnostic).expect("fixed recovery diagnostic")
+    );
+}
+
 pub fn at(kind: Kind) -> impl FnOnce(Error) -> Error {
     move |error| {
         if category(&error).is_some() {
