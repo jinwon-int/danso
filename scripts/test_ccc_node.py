@@ -683,5 +683,48 @@ class ProviderDiagnostics(unittest.TestCase):
         self.assertNotIn('reason=', self.failure('').message)
 
 
+class InterruptedTaskStatus(unittest.TestCase):
+    def status(self):
+        return dict(version=1, kind='long_task_status', state='paused',
+                    session_id='12345678-1234-1234-1234-123456789abc', stage=0, elapsed_ms=12,
+                    limits=dict(wall_seconds=60, stage_requests=16, max_requests=10,
+                                max_tokens=1000, repeat_limit=3),
+                    usage=dict(requests=1, reported_tokens=0, unknown_usage_requests=1),
+                    pending=None, resume_allowed=True,
+                    recovery=dict(interruption_reason='unknown', interrupted_requests=1,
+                                  max_interrupted_requests=3, automatic_resume_allowed=False))
+
+    def test_legacy_and_interruption_status(self):
+        from integrations.ccc_node import _task_status
+        data = self.status()
+        self.assertEqual(_task_status(data).unknown_usage_requests, 1)
+        del data['recovery']
+        del data['usage']['unknown_usage_requests']
+        self.assertEqual(_task_status(data).unknown_usage_requests, 0)
+
+    def test_inconsistent_resume_and_unknown_usage_are_rejected(self):
+        from integrations.ccc_node import _task_status
+        for patch in ({'state': 'pending_provider'}, {'elapsed_ms': 60000}):
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                _task_status(self.status() | patch)
+        data = self.status()
+        data['recovery']['automatic_resume_allowed'] = True
+        with self.assertRaises(ValueError):
+            _task_status(data)
+        data = self.status()
+        data['usage']['unknown_usage_requests'] = True
+        with self.assertRaises(ValueError):
+            _task_status(data)
+
+    def test_token_overshoot_is_valid_status_but_cannot_authorize_resume(self):
+        from integrations.ccc_node import _task_status
+        data = self.status()
+        data['usage']['reported_tokens'] = 1001
+        with self.assertRaises(ValueError):
+            _task_status(data)
+        data.update(state='failed', resume_allowed=False)
+        self.assertEqual(_task_status(data).reported_tokens, 1001)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

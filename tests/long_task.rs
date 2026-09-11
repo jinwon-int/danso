@@ -852,10 +852,10 @@ async fn output_failure_after_assistant_append_cannot_be_reclassified_as_provide
     struct BrokenSink;
     impl EventSink for BrokenSink {
         fn emit(&mut self, event: Event<'_>) -> Result<()> {
-            if let Event::Message(entry) = event {
-                if entry["message"]["role"] == "assistant" {
-                    anyhow::bail!("synthetic sink failure");
-                }
+            if let Event::Message(entry) = event
+                && entry["message"]["role"] == "assistant"
+            {
+                anyhow::bail!("synthetic sink failure");
             }
             Ok(())
         }

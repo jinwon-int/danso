@@ -177,6 +177,13 @@ impl<S: SessionStore> Drop for ProviderWait<'_, S> {
             3 => "run_deadline",
             _ => "unknown",
         };
+        // A supervisor deadline may include configuration/preflight time
+        // outside the runtime clock. It exhausts the immutable whole-run cap.
+        let elapsed = if reason == "run_deadline" {
+            limits.wall_seconds.saturating_mul(1000)
+        } else {
+            elapsed
+        };
         // A failed durable append must leave recovery fail-closed. Drop has no
         // error channel; the next assessment will see pending/torn data.
         let _ = self.ledger.interrupt_request(

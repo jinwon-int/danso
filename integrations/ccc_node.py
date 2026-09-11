@@ -171,11 +171,9 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
         if type(value) is not int or not 1 <= value <= maximum:
             raise ValueError('invalid task status limits')
         values[key] = value
-    if values['stage_requests'] > values['max_requests']:
-        raise ValueError('invalid task status limits')
     usage_values = {}
     for key, maximum in (('requests', values['max_requests']),
-                         ('reported_tokens', values['max_tokens'])):
+                         ('reported_tokens', 2**64 - 1)):
         value = usage[key]
         if type(value) is not int or not 0 <= value <= maximum:
             raise ValueError('invalid task status usage')
@@ -216,6 +214,12 @@ def _task_status(data):  # noqa: C901 -- strict nested protocol validation
                 raise ValueError('invalid task status pending')
         else:
             raise ValueError('invalid task status pending')
+    if data['resume_allowed'] and (
+            data['state'] not in {'ready', 'paused'} or pending is not None
+            or data['elapsed_ms'] >= values['wall_seconds'] * 1000
+            or usage_values['requests'] >= values['max_requests']
+            or usage_values['reported_tokens'] >= values['max_tokens']):
+        raise ValueError('inconsistent task resume assessment')
     return _TaskStatus(
         state=data['state'], stage=data['stage'], elapsed_ms=data['elapsed_ms'],
         resume_allowed=data['resume_allowed'], unknown_usage_requests=unknown,
