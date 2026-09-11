@@ -379,7 +379,12 @@ pub async fn drain(
     // already carry extraction requests from an earlier drain in the same run.
     let requests_before = usage.memory_requests();
     for _ in 0..max_jobs {
-        let Some(job) = journal::claim(route, now, timeout_ms)? else {
+        let outcome = journal::claim_counted(route, now, timeout_ms)?;
+        // Dead-letters retired on the way to this job still belong in the
+        // report: before #87 the field existed but was never incremented, so
+        // a drain that retired jobs always printed `dead: 0`.
+        report.dead += outcome.dead_lettered;
+        let Some(job) = outcome.job else {
             break;
         };
         report.claimed += 1;

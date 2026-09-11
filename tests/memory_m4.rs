@@ -1229,3 +1229,264 @@ fn enqueue_canonicalizes_relative_session_paths() {
         "journal must store the canonical absolute session path, got {stored:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cancellation / abnormal-exit matrix (#33 표 2행, issue #87 (d))
+// ---------------------------------------------------------------------------
+
+fn journal_record(route: &Route, job_id: &str) -> Value {
+    let path = route
+        .state_dir()
+        .join("distill-journal")
+        .join(format!("{job_id}.json"));
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+/// A drain killed mid-claim (SIGINT, SIGKILL, panic, power loss) releases the
+/// flock through the kernel closing the fd, and leaves the journal record
+/// exactly as enqueued — `claim` never writes to it.
+///
+/// The consequence is worth pinning explicitly: `fail_count` does **not**
+/// advance on a crash, so the five-failure cap cannot end a crash loop. The
+/// 48-hour age limit is the only terminator. That is the current contract,
+/// not an accident of this test.
+#[test]
+fn a_crash_mid_claim_leaves_the_job_reclaimable_and_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let session_path = dir.path().join("session.jsonl");
+    write_private(
+        &session_path,
+        session_lines(FIXTURE_SESSION_ID, 4, 16).as_bytes(),
+    );
+    let job_id = enqueue_one(&route, &session_path);
+    let before = journal_record(&route, &job_id);
+
+    // Claim, then drop the claim without completing or recording a failure.
+    // Dropping is what a killed process does: the kernel closes the fd.
+    {
+        let claimed = journal::claim(&route, now(), 1000).unwrap();
+        assert!(claimed.is_some(), "the job is claimable");
+        let lock_path = route
+            .state_dir()
+            .join("distill-journal")
+            .join(format!("{job_id}.json.lock"));
+        assert!(lock_path.exists(), "the claim takes a lock file");
+    }
+
+    let after = journal_record(&route, &job_id);
+    assert_eq!(before, after, "claim never mutates the record");
+    assert_eq!(
+        after["fail_count"].as_u64().unwrap_or(0),
+        0,
+        "a crash does not advance fail_count — the age limit is the only \
+         terminator for a crash loop"
+    );
+
+    // The stale lock file is left behind, and is harmless: the next claim
+    // reuses it rather than being blocked by it.
+    let again = journal::claim(&route, now(), 1000).unwrap();
+    assert!(
+        again.is_some(),
+        "a leftover lock file must not block the next drain"
+    );
+}
+
+/// §4.7 (a): the external trigger design (cron/systemd running `danso memory
+/// drain` periodically) is only safe if two drains cannot claim one job. The
+/// claim lock is what makes that true.
+#[test]
+fn two_concurrent_drains_cannot_claim_the_same_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let session_path = dir.path().join("session.jsonl");
+    write_private(
+        &session_path,
+        session_lines(FIXTURE_SESSION_ID, 4, 16).as_bytes(),
+    );
+    enqueue_one(&route, &session_path);
+
+    let first = journal::claim(&route, now(), 50).unwrap();
+    assert!(first.is_some(), "the first drain claims the only job");
+    // The second drain runs while the first still holds its claim.
+    let second = journal::claim(&route, now(), 50).unwrap();
+    assert!(
+        second.is_none(),
+        "a concurrent drain must not claim a job that is already claimed"
+    );
+
+    // Once the first drain finishes, the job is claimable again.
+    drop(first);
+    assert!(
+        journal::claim(&route, now(), 1000).unwrap().is_some(),
+        "releasing the claim re-exposes the job"
+    );
+}
+
+/// §4.7: the 48-hour age limit retires a job, and the drain reports it.
+/// Before #87 `DrainReport.dead` was declared but never incremented, so a
+/// drain that retired jobs still printed `dead: 0`.
+#[test]
+fn age_exceeded_jobs_are_dead_lettered_and_counted_in_the_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let session_path = dir.path().join("session.jsonl");
+    write_private(
+        &session_path,
+        session_lines(FIXTURE_SESSION_ID, 4, 16).as_bytes(),
+    );
+    let job_id = enqueue_one(&route, &session_path);
+
+    // 49 hours later the job is past the 48-hour limit.
+    let later = now() + chrono::Duration::hours(49);
+    let mut provider = ScriptedExtraction {
+        texts: std::collections::VecDeque::new(),
+        systems: std::cell::RefCell::new(Vec::new()),
+    };
+    let mut usage = Usage::default();
+    let report = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(danso::memory::distill::extract::drain(
+            &route,
+            &mut provider,
+            &mut usage,
+            1,
+            1000,
+            later,
+        ))
+        .expect("drain succeeds without a claimable job");
+
+    assert_eq!(report.claimed, 0, "nothing was claimed");
+    assert_eq!(report.dead, 1, "the retired job is reported");
+    assert_eq!(
+        report.memory_requests, 0,
+        "retiring a job costs no provider request"
+    );
+    let dead = route.state_dir().join("distill-journal/dead");
+    assert!(
+        std::fs::read_to_string(dead.join(format!("{job_id}.json")))
+            .unwrap()
+            .contains("age-exceeded")
+    );
+}
+
+/// §4.7: the five-failure cap retires a job the same way, and is likewise
+/// reported. This is the path a *reported* failure takes — contrast with the
+/// crash test above, where `fail_count` never advances.
+#[test]
+fn max_attempts_dead_letter_is_counted_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let session_path = dir.path().join("session.jsonl");
+    write_private(
+        &session_path,
+        session_lines(FIXTURE_SESSION_ID, 4, 16).as_bytes(),
+    );
+    let job_id = enqueue_one(&route, &session_path);
+
+    // Rewrite the record with the failure cap already reached.
+    let path = route
+        .state_dir()
+        .join("distill-journal")
+        .join(format!("{job_id}.json"));
+    let mut record = journal_record(&route, &job_id);
+    record["fail_count"] = json!(5);
+    std::fs::remove_file(&path).unwrap();
+    write_private(&path, format!("{record}\n").as_bytes());
+
+    let outcome = journal::claim_counted(&route, now(), 1000).unwrap();
+    assert!(outcome.job.is_none(), "a capped job is not claimable");
+    assert_eq!(outcome.dead_lettered, 1);
+    let dead = route.state_dir().join("distill-journal/dead");
+    assert!(
+        std::fs::read_to_string(dead.join(format!("{job_id}.json")))
+            .unwrap()
+            .contains("max-attempts")
+    );
+}
+
+/// §4.5: a crash *after* the transaction commits but *before* the journal
+/// records completion re-runs the extraction. The commit is idempotent, so
+/// the fact count stays at one — but the replay does spend another provider
+/// request, which `memory_requests` (#86) now makes visible.
+#[test]
+fn a_crash_between_commit_and_complete_replays_without_duplicating_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let session_path = dir.path().join("session.jsonl");
+    write_private(
+        &session_path,
+        session_lines(FIXTURE_SESSION_ID, 4, 16).as_bytes(),
+    );
+    let job_id = enqueue_one(&route, &session_path);
+    let thread_hash = facts::hex_encode(&sha2::Sha256::digest(FIXTURE_SESSION_ID.as_bytes()));
+    let response = fixture_extraction(&thread_hash, json!([]));
+
+    // First pass: claim, extract, commit — then "die" before `complete`.
+    let mut usage = Usage::default();
+    {
+        let claimed = journal::claim(&route, now(), 1000).unwrap().unwrap();
+        let mut provider = ScriptedExtraction {
+            texts: std::collections::VecDeque::from([serde_json::to_string(&response).unwrap()]),
+            systems: std::cell::RefCell::new(Vec::new()),
+        };
+        let extraction = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(memory::distill::extract::extract(
+                &mut provider,
+                &mut usage,
+                &journal_super_build(&session_path, 32768).unwrap().0,
+                &thread_hash,
+                &claimed.trigger,
+                true,
+            ))
+            .unwrap();
+        let transcript = std::fs::read_to_string(&session_path).unwrap();
+        memory::distill::extract::commit_extraction(
+            &route,
+            &memory::distill::extract::CommitContext {
+                job_id: &claimed.job_id,
+                transcript: &transcript,
+                thread_hash: &thread_hash,
+                trigger: &claimed.trigger,
+            },
+            &extraction,
+            now(),
+            1000,
+        )
+        .unwrap();
+        // journal::complete is deliberately NOT called: this is the crash.
+    }
+    let after_first = facts::load(&route).unwrap().records().count();
+    assert!(after_first >= 1, "the first pass committed");
+    assert_eq!(usage.memory_requests(), 1);
+
+    // Second pass: the job is still pending, so a drain re-runs it.
+    let mut provider = ScriptedExtraction {
+        texts: std::collections::VecDeque::from([serde_json::to_string(&response).unwrap()]),
+        systems: std::cell::RefCell::new(Vec::new()),
+    };
+    let report = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(danso::memory::distill::extract::drain(
+            &route,
+            &mut provider,
+            &mut usage,
+            1,
+            1000,
+            now(),
+        ))
+        .unwrap();
+
+    assert_eq!(report.claimed, 1, "the job survived the crash");
+    assert_eq!(
+        report.memory_requests, 1,
+        "the replay costs one more extraction request"
+    );
+    assert_eq!(
+        facts::load(&route).unwrap().records().count(),
+        after_first,
+        "the replayed commit is idempotent: no duplicate facts"
+    );
+    let _ = job_id;
+}
