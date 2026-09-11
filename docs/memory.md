@@ -160,6 +160,89 @@ the provider failure kind and HTTP status only (auth 6h, quota until
 4 h, dead-letter after five failures, 48 h age limit, transcript-change
 dead-letter) with a scope-wide cooldown for hard classes.
 
+### Running the queue (§4.7 (a), #87)
+
+A run only ever enqueues; `--memory-distill inline` drains a single job right
+after the run. Nothing else consumes the queue on its own — Danso has no
+built-in scheduler at this stage (that is #33's service mode). The supported
+way to keep the queue moving is an **external trigger** that runs
+`danso memory drain` periodically.
+
+cron:
+
+```cron
+*/30 * * * * /usr/local/bin/danso memory drain --max-jobs 3 >>~/.danso/drain.log 2>&1
+```
+
+systemd timer (`danso-drain.timer` + `danso-drain.service`):
+
+```ini
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+```
+
+Every 30 minutes is a reasonable default: a job is only created at the end of
+a run, at most one per run, and the three-exchange gate drops trivial
+sessions, so the queue grows slowly. Shorten it if runs are frequent and
+recall staleness matters; lengthen it freely, because nothing expires before
+the 48-hour age limit.
+
+**Overlapping drains are safe**, which is what makes a fixed schedule usable
+without a wrapper lock:
+
+- each job is claimed under an exclusive `flock` on `<job_id>.json.lock`, so a
+  second drain skips a claimed job rather than duplicating it;
+- hard failure classes write a scope-wide cooldown, so a fleet of drains backs
+  off together instead of each discovering the same 401 or quota exhaustion;
+- a job retired by one drain is moved to `dead/`, and a concurrent retirement
+  of the same job is a no-op rather than a double write.
+
+Tests pin the first point directly (`two_concurrent_drains_cannot_claim_the_same_job`).
+
+### Usage limits (§4.7 (b), #87)
+
+Danso enforces **no local extraction quota**, by decision. The real ceiling is
+the provider subscription, and consumption is already bounded by construction:
+at most one job per run, the three-exchange gate, five failures or 48 hours to
+retirement, and the §4.7 backoff table with scope-wide cooldowns for auth and
+quota classes. Exhausting the subscription surfaces as 401/429, which the
+existing backoff already absorbs and retries.
+
+A local daily cap would only buy one thing — stopping background extraction
+from consuming quota a foreground run wanted — and the per-run job bound
+already caps the worst case. If a scheduled drain is ever observed competing
+with interactive work for quota, a lightweight cap becomes worth revisiting.
+
+### Cancellation and abnormal exit (§4.7 (d), #87)
+
+`claim` never writes to the journal record. A drain that dies mid-extraction
+— SIGINT, SIGKILL, a panic, power loss — therefore leaves:
+
+- **the lock released**, because the kernel closes the fd; `Drop` running is
+  not required. The `.lock` file itself stays on disk and is harmless: the
+  next claim reopens it rather than being blocked by it;
+- **the record byte-identical to when it was enqueued**. In particular
+  `fail_count` does not advance.
+
+That second point has a consequence worth stating plainly: **the five-failure
+cap cannot end a crash loop.** It counts reported failures, and a crash
+reports nothing. An input that reliably kills the process will be retried by
+every drain until the 48-hour age limit retires it. The age limit is the only
+terminator for that case. There is no lease, no claim timestamp and no stale
+claim reclamation — the flock is the entire mechanism, which is sound on one
+host but assumes a filesystem where `flock` means something (not NFS).
+
+A crash *between* the commit and `journal::complete` replays the job. The
+commit is idempotent, so the replay adds no duplicate facts — but it does
+spend another extraction request, which `DANSO_BUDGET.memory_requests` makes
+visible. A crash during the transaction's prepared stage is recovered by the
+`ccc.local-memory-rollback.v1` forward/rollback path.
+
+`DrainReport.dead` counts jobs retired during the drain. Before #87 the field
+existed but was never incremented, so a drain that retired jobs still
+reported `dead: 0`.
+
 ### Extraction request accounting (§4.6)
 
 Extraction requests are ordinary provider requests: their tokens and their

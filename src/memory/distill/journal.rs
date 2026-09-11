@@ -201,12 +201,29 @@ pub struct ClaimedJob {
     lock: paths::ExclusiveLock,
 }
 
+/// One claim attempt's outcome: the job, plus how many jobs the attempt
+/// dead-lettered on the way to it. The count is the only way a caller can
+/// report dead-letters, because `claim` retires them itself and moves on.
+pub struct ClaimOutcome {
+    pub job: Option<ClaimedJob>,
+    pub dead_lettered: usize,
+}
+
 /// Claim the oldest runnable job (claim lock held, cooldown respected,
 /// 48h age dead-letter, transcript-change dead-letter, 5-failure cap).
 pub fn claim(route: &Route, now: DateTime<Utc>, timeout_ms: u64) -> Result<Option<ClaimedJob>> {
+    Ok(claim_counted(route, now, timeout_ms)?.job)
+}
+
+/// `claim` plus the dead-letter count (§4.7; issue #87 (d)).
+pub fn claim_counted(route: &Route, now: DateTime<Utc>, timeout_ms: u64) -> Result<ClaimOutcome> {
+    let mut dead_lettered = 0usize;
     let dir = journal_dir(route);
     if !dir.is_dir() {
-        return Ok(None);
+        return Ok(ClaimOutcome {
+            job: None,
+            dead_lettered,
+        });
     }
     // Scope-wide hard cooldown.
     if let Ok(payload) = std::fs::read(cooldown_path(route))
@@ -216,7 +233,10 @@ pub fn claim(route: &Route, now: DateTime<Utc>, timeout_ms: u64) -> Result<Optio
             .and_then(|v| facts::parse_timestamp(v).ok())
         && until > now
     {
-        return Ok(None);
+        return Ok(ClaimOutcome {
+            job: None,
+            dead_lettered,
+        });
     }
     let mut jobs: Vec<(String, Value)> = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
@@ -242,10 +262,12 @@ pub fn claim(route: &Route, now: DateTime<Utc>, timeout_ms: u64) -> Result<Optio
         let age_hours = (now - created_at).num_hours();
         if age_hours > MAX_AGE_HOURS {
             dead_letter(route, &job_id, &record, "age-exceeded")?;
+            dead_lettered += 1;
             continue;
         }
         if record["fail_count"].as_u64().unwrap_or(0) >= MAX_FAIL_COUNT as u64 {
             dead_letter(route, &job_id, &record, "max-attempts")?;
+            dead_lettered += 1;
             continue;
         }
         if let Some(retry_after) = record["retry_after"]
@@ -279,22 +301,30 @@ pub fn claim(route: &Route, now: DateTime<Utc>, timeout_ms: u64) -> Result<Optio
             let live_hash = facts::hex_encode(&Sha256::digest(&live));
             if live_hash != transcript_sha256 {
                 dead_letter(route, &job_id, &record, "transcript-changed")?;
+                dead_lettered += 1;
                 continue;
             }
         } else {
             dead_letter(route, &job_id, &record, "session-missing")?;
+            dead_lettered += 1;
             continue;
         }
-        return Ok(Some(ClaimedJob {
-            job_id,
-            record,
-            session_path,
-            transcript_sha256,
-            trigger,
-            lock: _lock,
-        }));
+        return Ok(ClaimOutcome {
+            job: Some(ClaimedJob {
+                job_id,
+                record,
+                session_path,
+                transcript_sha256,
+                trigger,
+                lock: _lock,
+            }),
+            dead_lettered,
+        });
     }
-    Ok(None)
+    Ok(ClaimOutcome {
+        job: None,
+        dead_lettered,
+    })
 }
 
 /// Dead-letter is a move, never a deletion (§4.7).
