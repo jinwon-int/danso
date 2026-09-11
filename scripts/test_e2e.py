@@ -388,9 +388,12 @@ class Acceptance(unittest.TestCase):
         # Issue #69 F: one body-free budget receipt with the closed shape.
         budgets = [l for l in p.stderr.splitlines() if l.startswith('DANSO_BUDGET=')]
         self.assertEqual(len(budgets), 1, p.stderr)
+        # memory_requests (#52 §4.6, #86) counts distill extraction requests;
+        # a run without --memory read-write never makes one, so it reads 0.
         self.assertEqual(json.loads(budgets[0].split('=', 1)[1]), {
             'version': 1, 'requests_used': 1, 'requests_total': 48,
-            'summary_requests': 0, 'output_tokens_max': 16384,
+            'summary_requests': 0, 'memory_requests': 0,
+            'output_tokens_max': 16384,
             'length_stops': 0, 'continuations': 0})
 
     def test_cached_stable_block_is_byte_identical_across_requests(self):

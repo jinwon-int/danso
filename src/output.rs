@@ -138,15 +138,24 @@ pub fn report_budget(config: &crate::app::RunConfig, usage: &Usage) {
         Some(task) => u32::try_from(task.limits.max_requests).unwrap_or(u32::MAX),
         None => config.max_turns,
     };
-    let (summary_requests, length_stops, continuations) = usage.budget_counts();
     let cap = crate::provider::resolve_max_output_tokens(config.max_output_tokens).unwrap_or(0);
-    eprintln!(
-        "DANSO_BUDGET={{\"version\":1,\"requests_used\":{},\"requests_total\":{},\"summary_requests\":{},\"output_tokens_max\":{},\"length_stops\":{},\"continuations\":{}}}",
+    eprintln!("DANSO_BUDGET={}", budget_record(usage, requests_total, cap));
+}
+
+/// The DANSO_BUDGET payload as a string, split out from the side-effecting
+/// printer and from `RunConfig` so the field set can be pinned by a test.
+/// Hand-written rather than `json!` so the key order stays stable for
+/// existing adapters.
+pub fn budget_record(usage: &Usage, requests_total: u32, cap: u32) -> String {
+    let (summary_requests, length_stops, continuations) = usage.budget_counts();
+    format!(
+        "{{\"version\":1,\"requests_used\":{},\"requests_total\":{},\"summary_requests\":{},\"memory_requests\":{},\"output_tokens_max\":{},\"length_stops\":{},\"continuations\":{}}}",
         usage.snapshot().requests,
         requests_total,
         summary_requests,
+        usage.memory_requests(),
         cap,
         length_stops,
         continuations
-    );
+    )
 }

@@ -114,6 +114,31 @@ fn zero_token_successful_call_still_counts_as_a_request() {
     assert_eq!(summary["models"], json!(["noop/silent", "noop/loud"]));
 }
 
+/// #52 §4.6 (#86): `memory_requests` is a DANSO_BUDGET field. Pin the whole
+/// record so a future counter cannot silently land in the Piri-fixed
+/// DANSO_USAGE record instead, and so the hand-written format literal cannot
+/// drift out of argument order.
+#[test]
+fn budget_record_is_exactly_the_budget_contract() {
+    let mut usage = Usage::default();
+    usage.record_summary_request();
+    usage.record_memory_request();
+    usage.record_memory_request();
+    usage.record_length_stop();
+    usage.add("noop", "silent", TokenUsage::default()).unwrap();
+
+    let record = danso::output::budget_record(&usage, 12, 4096);
+    assert_eq!(
+        record,
+        "{\"version\":1,\"requests_used\":1,\"requests_total\":12,\"summary_requests\":1,\"memory_requests\":2,\"output_tokens_max\":4096,\"length_stops\":1,\"continuations\":0}"
+    );
+    // It must parse as JSON: the literal is hand-escaped.
+    let parsed: Value = serde_json::from_str(&record).unwrap();
+    assert_eq!(parsed["memory_requests"], json!(2));
+    // The counter never widens DANSO_USAGE / PIRI_USAGE.
+    assert!(usage.summary().get("memoryRequests").is_none());
+}
+
 fn tok(input: u64, output: u64, cache_read: u64, cache_write: u64) -> TokenUsage {
     TokenUsage {
         input,

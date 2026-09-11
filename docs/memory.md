@@ -15,7 +15,7 @@ with no Python, Node, Shell, or SQLite runtime dependency. Design source:
 | M3 | Working-state + checkpoints (harness-written `working-state.md`) | Done (M1–M3) |
 | M2½ | `--memory-refresh per-request` (runtime context hook) | Done |
 | M4 | Distill extraction + journal + transactions (`--memory read-write`, `distill/drain/rollback`) | Done; #65 PR-1 fixed the read-write blocking defects, PR-2 unified manual add/close onto the rollback transaction, wired the audit ledger, and added the wiki-candidate queue |
-| M5 | Scope diagnostics (`check`, audit ledger, legacy read) | Done except legacy read: `--memory-legacy-read` and the `memory_requests` usage counter are not implemented (deferred); promotion deferred per §7 |
+| M5 | Scope diagnostics (`check`, audit ledger, legacy read) | Done except legacy read: `--memory-legacy-read` is not implemented (#86). The `memory_requests` counter landed with #86; promotion landed earlier as `danso memory promote` (see Promotion below) |
 
 ## On-disk layout (§3)
 
@@ -154,6 +154,28 @@ the provider failure kind and HTTP status only (auth 6h, quota until
 01:00 UTC, rate-limit 30 min, model 6h, exponential otherwise, capped at
 4 h, dead-letter after five failures, 48 h age limit, transcript-change
 dead-letter) with a scope-wide cooldown for hard classes.
+
+### Extraction request accounting (§4.6)
+
+Extraction requests are ordinary provider requests: their tokens and their
+request count are aggregated into `DANSO_USAGE` like any other request. On top
+of that they are counted separately, so the share of a run's spend that went to
+background extraction is visible.
+
+- `DANSO_BUDGET.memory_requests` — extraction requests made during the run,
+  including the STRICT re-ask, which is a second request and counts again. A
+  request is counted before dispatch, so one that fails mid-flight still counts.
+- `danso memory drain` reports `memory_requests` in its JSON summary. The CLI
+  drain has no run to attach usage to, so this is the only place its request
+  cost is visible. The value is that drain's delta, not a run-to-date total.
+
+The counter deliberately does **not** appear in `DANSO_USAGE`. That record is
+emitted verbatim as `PIRI_USAGE`, whose field set is fixed by the Piri schema
+(`docs/v0.md`); widening it would break the portable contract. This matches
+`summary_requests`, which is reported the same way for the same reason.
+
+Because `memory_requests` counts a subset of `requests`, the two must never be
+added together to estimate spend.
 
 ## Diagnostics (§6.4, M5)
 
