@@ -408,3 +408,27 @@ run-local and must be supplied on every invocation. It does not suppress context
 discovery: isolated callers should use an empty HOME/workspace and omit
 `--trust-project`. Private extraction inputs can use `--system-context-file`
 without putting their contents in command arguments.
+
+## User-facing interim progress
+
+`--progress-jsonl` also enables run-local Rust guidance for tool-enabled action
+requests. It asks for concise updates in the user's language alongside the next
+tool calls at the start, meaningful findings, verified checks and substantial
+next steps. It distinguishes observations from completion and discourages raw
+tool output, secrets, private reasoning and repetitive narration. The guidance
+survives context refresh/compaction; it is not journaled as a user request and
+adds no provider calls or tool effects. `--no-tools` extraction and final-only
+`-p` retain their existing prompt behavior.
+
+JSONL already flushes durable assistant messages before their tool execution.
+Short and long-task real-pipe tests now pin that timing for intermediate text as
+well as body-free tool events, while checking unchanged request counts. A
+consumer must forward the assistant text from a `toolUse` message as an interim
+message rather than buffering the entire run; user/tool/reasoning bodies are
+not user-facing progress. The CCC adapter tracks this integration in
+jinwon-int/ccc-node#1673; its draft-streaming switch is separate from completed
+interim bubbles. Old consumers can continue to buffer final-only output.
+
+This is milestone reporting, not token streaming or a timer-driven model call.
+A provider or tool blocked inside a request cannot produce a new model-authored
+update; the caller's existing elapsed-time/status heartbeat covers that gap.

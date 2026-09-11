@@ -17,8 +17,15 @@ class Progress(unittest.TestCase):
     tool = e2e.Acceptance.tool
 
     def test_native_start_arrives_before_tool_finishes(self):
+        self._assert_interim_before_finish()
+
+    def test_long_task_interim_arrives_before_tool_finishes(self):
+        self._assert_interim_before_finish('--long-task', '--task-progress')
+
+    def _assert_interim_before_finish(self, *flags):
         self.tool('bash', {'command': 'sleep 2; echo PRIVATE_TOOL_OUTPUT'})
-        process = subprocess.Popen(self.command('--progress-jsonl'), env=self.env,
+        self.responses[0][1]['content'].insert(0, {'type': 'text', 'text': '설정을 확인했고 검증을 실행합니다.'})
+        process = subprocess.Popen(self.command('--progress-jsonl', *flags), env=self.env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         records = []
         buffer = b''
@@ -37,8 +44,15 @@ class Progress(unittest.TestCase):
                     if record.get('type') == 'danso_progress' and record['phase'] == 'started':
                         found = True
             self.assertIsNone(process.poll(), 'progress was buffered until exit')
+            interim = [r['message'] for r in records if r.get('type') == 'message'
+                       and r['message'].get('role') == 'assistant']
+            self.assertEqual(len(interim), 1)
+            self.assertEqual(interim[0]['content'][0]['text'], '설정을 확인했고 검증을 실행합니다.')
+            self.assertEqual(interim[0]['stopReason'], 'toolUse')
+            self.assertIn('User-facing progress:', e2e.system_text(self.requests[0]))
             out, err = process.communicate(timeout=10)
             self.assertEqual(process.returncode, 0, err)
+            self.assertEqual(len(self.requests), 2, 'reporting added a model request')
             records.extend(map(json.loads, (buffer + out).splitlines()))
             progress = [r for r in records if r.get('type') == 'danso_progress']
             self.assertEqual([r['phase'] for r in progress], ['started', 'settled'])
@@ -52,6 +66,20 @@ class Progress(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
             process.communicate()
+
+    def test_progress_guidance_does_not_change_tool_free_extraction(self):
+        self.final()
+        p = self.run_cli('--progress-jsonl', '--no-tools')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('User-facing progress:', e2e.system_text(self.requests[0]))
+        self.assertEqual(len(self.requests), 1)
+
+    def test_plain_output_does_not_request_interim_reports(self):
+        self.final()
+        p = self.run_cli('-p')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), 'done')
+        self.assertNotIn('User-facing progress:', e2e.system_text(self.requests[0]))
 
     def test_progress_reports_tool_failure_without_claiming_task_failure(self):
         self.tool('bash', {'command': 'exit 7'})

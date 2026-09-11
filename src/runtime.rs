@@ -45,6 +45,8 @@ pub struct RunInput<'a> {
     pub continuation_limit: u32,
     /// Opt-in per-request progress notification (issue #69 F).
     pub stream_requests: bool,
+    /// Ask for concise user-facing updates alongside tool calls.
+    pub report_progress: bool,
     /// Set by the CLI's graceful SIGUSR1 handler. The runtime only observes
     /// this flag at settled boundaries; it never interrupts a provider or
     /// tool operation.
@@ -73,9 +75,27 @@ impl<'a> RunInput<'a> {
             repeat_limit: 0,
             continuation_limit: 0,
             stream_requests: false,
+            report_progress: false,
             pause_requested: None,
         }
     }
+}
+
+/// Stable run-local guidance; never a request or a journal entry of its own.
+fn action_system(
+    names: &str,
+    context: &str,
+    execution_context: &str,
+    report_progress: bool,
+) -> String {
+    let progress = if report_progress {
+        " User-facing progress: include a brief update in the user's language alongside your next tool calls when starting work, after meaningful findings or completed checks, and before a substantial next step. State observed results and the next action; distinguish attempted work from verified completion. Keep updates concise and avoid repetitive narration, secrets, raw tool output, or private reasoning. Continue with the needed tool calls in the same response; do not end the task or add a model request solely to report progress."
+    } else {
+        ""
+    };
+    format!(
+        "You are a headless coding worker. Use only {names}. Skills are loaded using read. Prefer targeted line-range reads and searches over whole-file dumps. After compaction, continue from recorded progress; re-read only missing or changed information.{progress}{context}{execution_context}"
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -384,9 +404,11 @@ pub async fn run(
         .map(|d| d.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let mut base_system = format!(
-        "You are a headless coding worker. Use only {names}. Skills are loaded using read. Prefer targeted line-range reads and searches over whole-file dumps. After compaction, continue from recorded progress; re-read only missing or changed information.{}{}",
-        input.context, input.execution_context
+    let mut base_system = action_system(
+        &names,
+        input.context,
+        input.execution_context,
+        input.report_progress && !input.no_tools,
     );
     sink.emit(Event::Session(session.header()))
         .map_err(at(Kind::Output))?;
@@ -527,9 +549,9 @@ pub async fn run(
                     let bare = provider
                         .request_bytes(&ModelRequest {
                             system: crate::provider::SystemParts {
-                            stable: &base_system,
-                            volatile: &guidance,
-                        },
+                                stable: &base_system,
+                                volatile: &guidance,
+                            },
                             messages: std::slice::from_ref(&latest),
                             tools: &definitions,
                         })
@@ -576,9 +598,11 @@ pub async fn run(
                     // exact instructions that the next action request will use.
                     if let Some(refresh) = input.refresh_context {
                         let refreshed = refresh().map_err(at(Kind::Configuration))?;
-                        base_system = format!(
-                            "You are a headless coding worker. Use only {names}. Skills are loaded using read. Prefer targeted line-range reads and searches over whole-file dumps. After compaction, continue from recorded progress; re-read only missing or changed information.{}{}",
-                            refreshed, input.execution_context
+                        base_system = action_system(
+                            &names,
+                            &refreshed,
+                            input.execution_context,
+                            input.report_progress && !input.no_tools,
                         );
                     }
                     let final_phase = budget_final_phase(
@@ -587,12 +611,8 @@ pub async fn run(
                         remaining,
                         budget_total,
                     );
-                    guidance = budget_guidance(
-                        budget_total,
-                        remaining,
-                        summary_requests,
-                        final_phase,
-                    );
+                    guidance =
+                        budget_guidance(budget_total, remaining, summary_requests, final_phase);
                     if let Some(notice) = &repeat_guidance {
                         guidance.push('\n');
                         guidance.push_str(notice);
@@ -601,9 +621,9 @@ pub async fn run(
                     let after = provider
                         .request_bytes(&ModelRequest {
                             system: crate::provider::SystemParts {
-                            stable: &base_system,
-                            volatile: &guidance,
-                        },
+                                stable: &base_system,
+                                volatile: &guidance,
+                            },
                             messages: &compacted,
                             tools: &definitions,
                         })

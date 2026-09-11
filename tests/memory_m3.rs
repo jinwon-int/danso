@@ -247,6 +247,7 @@ async fn run_inner(route: &Route, session_path: &Path) -> anyhow::Result<()> {
             repeat_limit: 0,
             continuation_limit: 0,
             stream_requests: false,
+            report_progress: false,
             pause_requested: None,
         },
         &mut provider,

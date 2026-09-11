@@ -61,6 +61,8 @@ pub struct RunConfig {
     pub continuation_limit: u32,
     /// Opt-in per-request progress frames (issue #69 F).
     pub stream_requests: bool,
+    /// Ask for concise user-facing updates alongside tool calls.
+    pub report_progress: bool,
     /// Short-mode identical-batch guard (issue #70 D); 0 disables.
     pub repeat_limit: u32,
     pub compact_at_bytes: Option<usize>,
@@ -497,6 +499,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
                 repeat_limit: args.repeat_limit,
                 continuation_limit: args.continuation_limit,
                 stream_requests: args.stream_requests,
+                report_progress: args.report_progress,
                 pause_requested: args.pause_requested.as_deref(),
             },
             &mut provider,
