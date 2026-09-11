@@ -469,7 +469,13 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     };
     let memory_route = memory_root
         .as_deref()
-        .map(|root| memory::Route::new(root, &args.memory.scope))
+        .map(|root| {
+            let route = memory::Route::new(root, &args.memory.scope)?;
+            match &args.memory.legacy_read {
+                Some(dir) => route.with_legacy(dir),
+                None => Ok(route),
+            }
+        })
         .transpose()?;
     // §8: read mode injects only — the harness records nothing (no
     // working-state, checkpoints, or session-archive writes).

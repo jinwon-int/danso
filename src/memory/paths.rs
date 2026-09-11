@@ -56,6 +56,13 @@ pub fn require_scope(name: &str) -> Result<&str> {
 pub struct Route {
     root: PathBuf,
     scope: String,
+    /// Read-only ccc tree attached for reads (§7/§9, `--memory-legacy-read`).
+    /// `None` keeps the pre-#86 behaviour byte for byte.
+    legacy: Option<PathBuf>,
+    /// True when this route *is* the legacy lane: `scope_dir` is the legacy
+    /// directory itself, and every write path must refuse it (§9 single-writer
+    /// rule — the ccc hooks still own that tree).
+    is_legacy: bool,
 }
 
 impl Route {
@@ -64,6 +71,65 @@ impl Route {
         Ok(Self {
             root: root.to_path_buf(),
             scope: require_scope(scope)?.to_string(),
+            legacy: None,
+            is_legacy: false,
+        })
+    }
+
+    /// Attach a read-only legacy tree (§9). `shared` scopes are rejected: the
+    /// M5 read matrix forbids a shared run from opening a personal or legacy
+    /// tree, and §8 scopes the flag to `private-*` and `global`.
+    pub fn with_legacy(mut self, dir: &Path) -> Result<Self> {
+        ensure!(
+            dir.is_absolute(),
+            "memory legacy read dir must be an absolute path"
+        );
+        ensure!(
+            self.scope != "shared",
+            "--memory-legacy-read is not allowed for the shared scope (§7 read matrix)"
+        );
+        self.legacy = Some(dir.to_path_buf());
+        Ok(self)
+    }
+
+    /// True for the legacy lane itself; write paths refuse such a route.
+    pub fn is_legacy(&self) -> bool {
+        self.is_legacy
+    }
+
+    /// Refuse a legacy lane on a write path (§9 single-writer rule). Danso
+    /// never writes a ccc tree: the ccc hooks still own it and are still
+    /// writing to it.
+    pub fn require_writable(&self) -> Result<()> {
+        ensure!(
+            !self.is_legacy,
+            "the legacy memory tree is read-only and must never be written"
+        );
+        Ok(())
+    }
+
+    /// The permission policy for reading this route's files.
+    pub fn mode_policy(&self) -> ModePolicy {
+        if self.is_legacy {
+            ModePolicy::ForeignReadOnly
+        } else {
+            ModePolicy::Owned
+        }
+    }
+
+    /// The read-only legacy lane, if one is attached (§7 merge order
+    /// `private → shared → legacy`).
+    pub fn legacy_route(&self) -> Option<Route> {
+        // Belt and braces: `with_legacy` already refuses `shared`, but the
+        // read matrix is the invariant that matters, so assert it here too.
+        if self.scope == "shared" {
+            return None;
+        }
+        self.legacy.as_ref().map(|dir| Route {
+            root: dir.clone(),
+            scope: self.scope.clone(),
+            legacy: None,
+            is_legacy: true,
         })
     }
 
@@ -75,9 +141,17 @@ impl Route {
         &self.root
     }
 
-    /// `<root>/<scope>` — the audience boundary directory.
+    /// `<root>/<scope>` — the audience boundary directory. For the legacy
+    /// lane the ccc tree root *is* that directory: a real ccc node keeps
+    /// `state/` and `memories/` directly below `~/.claude`, which is the same
+    /// shape as a Danso scope directory, so every derived path below follows
+    /// without a special case.
     pub fn scope_dir(&self) -> PathBuf {
-        self.root.join(&self.scope)
+        if self.is_legacy {
+            self.root.clone()
+        } else {
+            self.root.join(&self.scope)
+        }
     }
 
     pub fn memories_dir(&self) -> PathBuf {
@@ -108,14 +182,25 @@ impl Route {
     /// routes additionally read the shared tree; `shared` and `global` never
     /// open any other tree).
     pub fn shared_route(&self) -> Option<Route> {
-        if self.scope.starts_with("private-") {
+        if !self.is_legacy && self.scope.starts_with("private-") {
             Some(Route {
                 root: self.root.clone(),
                 scope: "shared".to_string(),
+                legacy: None,
+                is_legacy: false,
             })
         } else {
             None
         }
+    }
+
+    /// Every tree this route may read, in §7 merge order
+    /// `private → shared → legacy`. Writers must use the route itself.
+    pub fn read_routes(&self) -> Vec<Route> {
+        let mut routes = vec![self.clone()];
+        routes.extend(self.shared_route());
+        routes.extend(self.legacy_route());
+        routes
     }
 }
 
@@ -200,7 +285,42 @@ pub fn require_private_dir(path: &Path) -> Result<()> {
 
 /// Validate one already-open file descriptor: regular file, exactly one link,
 /// owned by the current user, mode exactly 0600.
-fn validate_open(file: &std::fs::File, what: &str) -> Result<()> {
+/// Which permission bits a file must carry to be accepted.
+///
+/// The 0600 rule exists to protect files Danso itself writes: it owns them,
+/// so it can promise they were never readable or writable by anyone else.
+/// A legacy tree (§9) is a foreign tree Danso only ever reads, and the ccc
+/// hooks that own it do not all write 0600 — a real ccc node keeps
+/// `working-state.md` at 0644. Demanding 0600 there would silently drop the
+/// most frequently updated file in the tree. What still matters for a file
+/// Danso reads and injects is integrity, not secrecy: nobody but the owner
+/// may be able to *modify* it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModePolicy {
+    /// Danso-owned state: exactly 0600.
+    Owned,
+    /// Read-only foreign file: owner-writable only, any read bits allowed.
+    ForeignReadOnly,
+}
+
+impl ModePolicy {
+    fn check(self, mode: u32, what: &str) -> Result<()> {
+        match self {
+            ModePolicy::Owned => {
+                ensure!(mode & 0o777 == 0o600, "{what} must have mode 0600");
+            }
+            ModePolicy::ForeignReadOnly => {
+                ensure!(
+                    mode & 0o022 == 0,
+                    "{what} must not be group- or world-writable"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_open(file: &std::fs::File, what: &str, policy: ModePolicy) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = file.metadata()?;
     ensure!(meta.is_file(), "{what} must be a regular file");
@@ -209,7 +329,7 @@ fn validate_open(file: &std::fs::File, what: &str) -> Result<()> {
         meta.uid() == euid(),
         "{what} must be owned by the current user"
     );
-    ensure!(meta.mode() & 0o777 == 0o600, "{what} must have mode 0600");
+    policy.check(meta.mode(), what)?;
     Ok(())
 }
 
@@ -217,6 +337,10 @@ fn validate_open(file: &std::fs::File, what: &str) -> Result<()> {
 /// validate the final descriptor. This closes the check-then-open symlink
 /// window that pathname-only validation leaves open.
 pub fn open_secure(path: &Path, what: &str) -> Result<std::fs::File> {
+    open_secure_with(path, what, ModePolicy::Owned)
+}
+
+pub fn open_secure_with(path: &Path, what: &str, policy: ModePolicy) -> Result<std::fs::File> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -242,13 +366,17 @@ pub fn open_secure(path: &Path, what: &str) -> Result<std::fs::File> {
         ensure!(fd >= 0, "{what} is unavailable: {}", path.display());
         dir = unsafe { std::fs::File::from_raw_fd(fd) };
     }
-    validate_open(&dir, what)?;
+    validate_open(&dir, what, policy)?;
     Ok(dir)
 }
 
 /// Validate a path's on-disk state without opening it: no symlink, regular
 /// file, one link, current-user owner, mode 0600. Absent paths pass.
 pub fn validate_regular(path: &Path, what: &str) -> Result<bool> {
+    validate_regular_with(path, what, ModePolicy::Owned)
+}
+
+pub fn validate_regular_with(path: &Path, what: &str, policy: ModePolicy) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -269,11 +397,9 @@ pub fn validate_regular(path: &Path, what: &str) -> Result<bool> {
                 "{what} has the wrong owner: {}",
                 path.display()
             );
-            ensure!(
-                meta.mode() & 0o777 == 0o600,
-                "{what} must have mode 0600: {}",
-                path.display()
-            );
+            policy
+                .check(meta.mode(), what)
+                .map_err(|e| anyhow::anyhow!("{e}: {}", path.display()))?;
             Ok(true)
         }
     }
@@ -282,11 +408,20 @@ pub fn validate_regular(path: &Path, what: &str) -> Result<bool> {
 /// Read an owner-only regular file through a pinned descriptor with a hard
 /// byte bound. `Ok(None)` means the file does not exist.
 pub fn read_bounded(path: &Path, max_bytes: u64, what: &str) -> Result<Option<Vec<u8>>> {
+    read_bounded_with(path, max_bytes, what, ModePolicy::Owned)
+}
+
+pub fn read_bounded_with(
+    path: &Path,
+    max_bytes: u64,
+    what: &str,
+    policy: ModePolicy,
+) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
-    if !validate_regular(path, what)? {
+    if !validate_regular_with(path, what, policy)? {
         return Ok(None);
     }
-    let file = open_secure(path, what)?;
+    let file = open_secure_with(path, what, policy)?;
     let mut data = Vec::new();
     file.take(max_bytes + 1).read_to_end(&mut data)?;
     ensure!(
@@ -334,7 +469,7 @@ pub fn atomic_write(path: &Path, payload: &[u8], what: &str) -> Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(&temp)?;
-        validate_open(&file, what)?;
+        validate_open(&file, what, ModePolicy::Owned)?;
         file.write_all(payload)?;
         file.sync_all()?;
     }
@@ -369,7 +504,7 @@ impl ExclusiveLock {
             .mode(0o600)
             .open(path)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        validate_open(&file, "memory lock")?;
+        validate_open(&file, "memory lock", ModePolicy::Owned)?;
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Self { file }),

@@ -27,6 +27,10 @@ pub struct MemoryArgs {
     /// Exclusive-lock deadline in milliseconds (fail closed on timeout).
     #[arg(long, global = true, default_value_t = paths::LOCK_TIMEOUT_DEFAULT_MS)]
     pub lock_timeout_ms: u64,
+    /// Read-only legacy ccc tree merged into reads (#52 §9). Absolute path,
+    /// never written, refused with `--scope shared`.
+    #[arg(long, global = true)]
+    pub memory_legacy_read: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -133,7 +137,11 @@ pub fn route(args: &MemoryArgs) -> anyhow::Result<Route> {
     // `--memory-dir` is explicit per-invocation configuration; it wins over
     // the DANSO_MEMORY_DIR environment and the ~/.danso default (§8).
     let root = args.memory_dir.clone().unwrap_or_else(default_root);
-    Route::new(&root, scope)
+    let route = Route::new(&root, scope)?;
+    match &args.memory_legacy_read {
+        Some(dir) => route.with_legacy(dir),
+        None => Ok(route),
+    }
 }
 
 /// Early configuration validation — failures exit 2 (configuration), while
