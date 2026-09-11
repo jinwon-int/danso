@@ -277,11 +277,20 @@ impl Session {
     }
 
     fn scan(&self) -> Result<(Vec<Value>, Recovery)> {
+        Self::scan_entries(&self.entries)
+    }
+
+    pub(crate) fn validate_status_history(entries: &[Value]) -> Result<()> {
+        Self::scan_entries(entries)?;
+        Ok(())
+    }
+
+    fn scan_entries(entries: &[Value]) -> Result<(Vec<Value>, Recovery)> {
         let mut prev = Value::Null;
         let mut messages = vec![];
         let mut latest_user: Option<(&Value, &Value)> = None;
         let mut recovery = Recovery::default();
-        for e in &self.entries[1..] {
+        for e in &entries[1..] {
             ensure!(
                 e["parentId"] == prev,
                 "branched Pi session is import-only in v0"
@@ -328,9 +337,13 @@ impl Session {
             }
             prev = e["id"].clone();
         }
-        let long_records = self.long_task_records()?;
-        crate::long_task::validate_bindings(&self.entries)?;
-        crate::long_task::Ledger::from_records(&long_records, self.entries[0]["id"].as_str())?;
+        let long_records: Vec<Value> = entries
+            .iter()
+            .filter(|e| e["type"] == "custom" && e["customType"] == crate::long_task::CUSTOM_TYPE)
+            .map(|e| e["data"].clone())
+            .collect();
+        crate::long_task::validate_bindings(entries)?;
+        crate::long_task::Ledger::from_records(&long_records, entries[0]["id"].as_str())?;
         Ok((messages, recovery))
     }
 }

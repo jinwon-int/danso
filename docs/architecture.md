@@ -109,8 +109,33 @@ operation and must not be turned into an implicit success or manual ACK.
 
 Long-task SIGUSR1 handling is owned by the CLI, but the runtime receives only a
 process-local pause flag and observes it after a settled provider/tool boundary.
-SIGINT/SIGTERM cancellation still drops the run and leaves uncertain work
-unresumable. `long_task.rs` persists the creation, request, tool-batch and
+SIGINT/SIGTERM cancellation drops the run. While awaiting only a provider
+response, a scoped cancellation guard appends `provider_interrupted` before the
+session lock is released. It never covers assistant append/output, tool execution,
+or response settlement. Only an interruption directly adjacent to its reservation
+can become a paused task; ordinary requests remain blocked until explicit
+`--resume-task`. SIGINT is recorded as `user_stop`, SIGTERM/SIGHUP as
+`signal_termination` (the sender/intent is unknown), deadlines as `run_deadline`,
+and unclassified embedding cancellation as `unknown`. No automatic resume exists.
+SIGKILL, panic, missing markers, and failed/torn journal writes stay fail-closed;
+old pending journals are not upgraded, acknowledged, or replayed.
+
+Interrupted provider requests consume a cumulative request slot and measured run
+time. Their token usage remains unknown, exposed as `unknown_usage_requests`
+separately from `reported_tokens`; the latter is not an upper bound on remote
+billing. A provider adapter can have made multiple bounded wire attempts within
+one logical request. At three interrupted logical requests the task cannot resume,
+even if other budgets remain. Explicit resumes preserve this count, request,
+wall, token and repetition counters. There is no automatic retry/backoff loop to
+reset across restarts. A wall-deadline interruption consumes the remaining wall
+budget and cannot extend the task. Remote processing may continue after local
+cancellation, so an explicitly authorized provider re-request may add cost.
+
+Status includes an additive `recovery` object and unknown-usage count. Both bundled
+Python consumers accept legacy status and validate the extension atomically;
+older strict consumers require an update. Status inspection and runtime share
+history/compaction/binding validation, with a read lock for inspection and the
+existing exclusive session lock for execution. `long_task.rs` persists the creation, request, tool-batch and
 stage records; status inspection validates the same ledger without creating or
 mutating a session.
 

@@ -130,6 +130,7 @@ fn input() -> RunInput<'static> {
         stream_requests: false,
         report_progress: false,
         pause_requested: None,
+        cancellation_reason: None,
     }
 }
 

@@ -10,6 +10,9 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+/// Cumulative cancellations; explicit resumes never reset this cap.
+pub const MAX_INTERRUPTED_REQUESTS: u64 = 3;
+
 pub const CUSTOM_TYPE: &str = "danso.long_task.v1";
 pub const MAX_WALL_SECONDS: u64 = 6 * 60 * 60;
 pub const DEFAULT_WALL_SECONDS: u64 = 300;
@@ -177,6 +180,8 @@ pub struct Ledger {
     pub last_fingerprint: Option<String>,
     pub repeat_count: u64,
     pub terminal_reason: Option<String>,
+    pub interrupted_requests: u64,
+    pub interruption_reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +207,8 @@ impl Default for Ledger {
             last_fingerprint: None,
             repeat_count: 0,
             terminal_reason: None,
+            interrupted_requests: 0,
+            interruption_reason: None,
         }
     }
 }
@@ -300,6 +307,44 @@ impl Ledger {
                     "summary" => State::Ready,
                     _ => unreachable!(),
                 };
+            }
+            "provider_interrupted" => {
+                exact_keys(
+                    data,
+                    &[
+                        "version",
+                        "event",
+                        "sequence",
+                        "stage",
+                        "elapsed_ms",
+                        "reason",
+                        "request_kind",
+                    ],
+                )?;
+                ensure!(data["version"] == 1);
+                let limits = self.limits.context("long-task record before creation")?;
+                ensure!(self.state == State::PendingProvider && self.pending_response.is_none());
+                ensure!(Some(integer(data, "sequence")?) == self.pending_sequence);
+                ensure!(integer(data, "stage")? == self.stage);
+                ensure!(matches!(
+                    string(data, "request_kind")?,
+                    "action" | "summary"
+                ));
+                let reason = string(data, "reason")?;
+                ensure!(matches!(
+                    reason,
+                    "user_stop" | "signal_termination" | "run_deadline" | "unknown"
+                ));
+                let elapsed = integer(data, "elapsed_ms")?;
+                self.ensure_elapsed(elapsed, limits)?;
+                // The remote request may have run. Count its slot, but never
+                // fabricate zero token usage as a known result.
+                ensure!(self.interrupted_requests < MAX_INTERRUPTED_REQUESTS);
+                self.add_request(elapsed, TokenDelta::default(), limits)?;
+                self.interrupted_requests += 1;
+                self.interruption_reason = Some(reason.to_owned());
+                self.pending_sequence = None;
+                self.state = State::Paused;
             }
             "request_failed" => {
                 exact_keys(
@@ -511,6 +556,7 @@ impl Ledger {
 
     pub fn resume_allowed(&self) -> bool {
         matches!(self.state, State::Ready | State::Paused)
+            && self.interrupted_requests < MAX_INTERRUPTED_REQUESTS
             && self.limits.is_some_and(|limits| {
                 self.elapsed_ms < limits.wall_seconds.saturating_mul(1000)
                     && self.repeat_count < limits.repeat_limit
@@ -582,6 +628,29 @@ impl Ledger {
         self.state = State::PendingProvider;
         self.elapsed_ms = elapsed_ms;
         Ok(sequence)
+    }
+
+    /// Called only while cancelling the provider future, before its response
+    /// can escape into history/output/tool execution. Append failure leaves
+    /// the original pending request blocked; no repair or ACK is attempted.
+    pub fn interrupt_request<S: SessionStore>(
+        &mut self,
+        session: &mut S,
+        elapsed_ms: u64,
+        reason: &str,
+        request_kind: &str,
+    ) -> Result<()> {
+        let data = json!({
+            "version":1,"event":"provider_interrupted",
+            "sequence":self.pending_sequence.context("no pending provider")?,
+            "stage":self.stage,"elapsed_ms":elapsed_ms,
+            "reason":reason,"request_kind":request_kind
+        });
+        let mut next = self.clone();
+        next.apply(&data, None)?;
+        session.record_long_task(data)?;
+        *self = next;
+        Ok(())
     }
 
     pub fn settle_request<S: SessionStore>(
@@ -784,7 +853,12 @@ impl Ledger {
                 "max_tokens":limits.max_tokens,
                 "repeat_limit":limits.repeat_limit
             },
-            "usage":{"requests":self.requests,"reported_tokens":self.reported_tokens},
+            "usage":{"requests":self.requests,"reported_tokens":self.reported_tokens,
+                "unknown_usage_requests":self.interrupted_requests},
+            "recovery":{"interruption_reason":self.interruption_reason,
+                "interrupted_requests":self.interrupted_requests,
+                "max_interrupted_requests":MAX_INTERRUPTED_REQUESTS,
+                "automatic_resume_allowed":false},
             "pending":self.pending_sequence.map(|sequence| json!({"kind":"provider","sequence":sequence})).or_else(||
                 (self.state == State::PendingTools).then(|| json!({"kind":"tools"}))
             ),
@@ -938,6 +1012,7 @@ pub fn inspect_entries(entries: &[Value]) -> Result<Value> {
         }
         previous = entry["id"].clone();
     }
+    crate::session::Session::validate_status_history(entries)?;
     validate_bindings(entries)?;
     let ledger = Ledger::from_records(&records, Some(id))?;
     let mut status = ledger.status(id);
@@ -957,6 +1032,19 @@ pub fn validate_bindings(entries: &[Value]) -> Result<()> {
     for (index, entry) in entries.iter().enumerate() {
         if entry["type"] != "custom" || entry["customType"] != CUSTOM_TYPE {
             continue;
+        }
+        if entry["data"]["event"] == "provider_interrupted" {
+            let previous = index
+                .checked_sub(1)
+                .and_then(|i| entries.get(i))
+                .context("provider interruption has no reservation")?;
+            ensure!(
+                previous["type"] == "custom"
+                    && previous["customType"] == CUSTOM_TYPE
+                    && previous["data"]["event"] == "request_started"
+                    && previous["data"]["sequence"] == entry["data"]["sequence"],
+                "provider interruption crosses a journal effect boundary"
+            );
         }
         if entry["data"]["event"] == "created" {
             let user_id = entry["data"]["user_entry_id"]

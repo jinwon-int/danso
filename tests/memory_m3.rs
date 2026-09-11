@@ -249,6 +249,7 @@ async fn run_inner(route: &Route, session_path: &Path) -> anyhow::Result<()> {
             stream_requests: false,
             report_progress: false,
             pause_requested: None,
+            cancellation_reason: None,
         },
         &mut provider,
         &Executor,

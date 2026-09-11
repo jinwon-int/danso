@@ -319,7 +319,13 @@ class LongTask(providers.Fixture):
             self.assertNotIn('requires explicit --resume-task', result.stderr)
             self.assertIn('different --session path', result.stderr)
 
-    def test_interrupted_provider_reports_recovery_without_replay_or_journal_change(self):
+    def test_cancelled_provider_requires_explicit_resume(self):
+        self._assert_cancelled_provider(signal.SIGTERM, 143, 'signal_termination')
+
+    def test_user_stop_requires_explicit_resume(self):
+        self._assert_cancelled_provider(signal.SIGINT, 130, 'user_stop')
+
+    def _assert_cancelled_provider(self, sig, code, reason):
         received, release = threading.Event(), threading.Event()
 
         def delayed(_request):
@@ -334,9 +340,78 @@ class LongTask(providers.Fixture):
         )
         try:
             self.assertTrue(received.wait(5))
-            process.send_signal(signal.SIGTERM)
+            process.send_signal(sig)
             _, stderr = process.communicate(timeout=5)
-            self.assertEqual(process.returncode, 143, stderr)
+            self.assertEqual(process.returncode, code, stderr)
+        finally:
+            release.set()
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        before = self.session.read_bytes()
+        status = json.loads(self.status().stdout)
+        self.assertEqual(status['state'], 'paused')
+        self.assertTrue(status['resume_allowed'])
+        self.assertEqual(status['usage']['unknown_usage_requests'], 1)
+        self.assertEqual(status['recovery']['interruption_reason'], reason)
+        refused = self.run_long(prompt='An unrelated new objective')
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.session.read_bytes(), before)
+        self.responses.append((200, providers.response('glm', text='RESUMED')))
+        resumed = self.run_long('--resume-task', '-p')
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout.strip(), 'RESUMED')
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(len(self.users()), 1)
+        status = json.loads(self.status().stdout)
+        self.assertEqual(status['usage']['requests'], 2)
+        self.assertEqual(status['usage']['unknown_usage_requests'], 1)
+
+    def test_provider_wait_deadline_consumes_wall_budget(self):
+        received, release = threading.Event(), threading.Event()
+
+        def delayed(_request):
+            received.set()
+            release.wait(5)
+            return providers.response('glm', text='too late')
+
+        self.responses.append((200, delayed))
+        try:
+            result = self.run_long('--timeout-seconds', '1', prompt='deadline fixture')
+            self.assertTrue(received.is_set())
+            self.assertEqual(result.returncode, 124, result.stderr)
+        finally:
+            release.set()
+        before = self.session.read_bytes()
+        status = json.loads(self.status().stdout)
+        self.assertEqual(status['state'], 'paused')
+        self.assertEqual(status['elapsed_ms'], 1000)
+        self.assertEqual(status['recovery']['interruption_reason'], 'run_deadline')
+        self.assertFalse(status['resume_allowed'])
+        resumed = self.run_long('--resume-task', '-p')
+        self.assertNotEqual(resumed.returncode, 0)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.session.read_bytes(), before)
+
+    def test_killed_provider_reports_recovery_without_replay_or_journal_change(self):
+        received, release = threading.Event(), threading.Event()
+
+        def delayed(_request):
+            received.set()
+            release.wait(10)
+            return providers.response('glm', text='unobserved result')
+
+        self.responses.append((200, delayed))
+        process = subprocess.Popen(
+            self.command('--timeout-seconds', '60', prompt='Synthetic interrupted request'),
+            env=self.env('glm'), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertTrue(received.wait(5))
+            process.send_signal(signal.SIGKILL)
+            _, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, -9, stderr)
         finally:
             release.set()
             if process.poll() is None:

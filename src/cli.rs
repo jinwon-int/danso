@@ -264,6 +264,7 @@ impl Args {
             }),
             task_progress: self.task_progress,
             pause_requested: None,
+            cancellation_reason: None,
         }
     }
     pub fn output_mode(&self) -> danso::output::Mode {
