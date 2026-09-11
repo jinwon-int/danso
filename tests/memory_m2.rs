@@ -268,6 +268,11 @@ async fn memory_block_survives_two_compactions() {
         systems: RefCell::new(Vec::new()),
         summarizer_calls: Rc::clone(&summarizer_calls),
     };
+    let refreshes = std::cell::Cell::new(0);
+    let refresh = || {
+        refreshes.set(refreshes.get() + 1);
+        Ok(block.clone())
+    };
     let error = runtime::run(
         RunInput {
             no_tools: false,
@@ -276,11 +281,12 @@ async fn memory_block_survives_two_compactions() {
             execution_context: "",
             max_turns: 12,
             compact_at_bytes: Some(8192),
-            refresh_context: None,
+            refresh_context: Some(&refresh),
             long_task: None,
             repeat_limit: 0,
             continuation_limit: 0,
             stream_requests: false,
+            report_progress: true,
             pause_requested: None,
         },
         &mut provider,
@@ -295,7 +301,9 @@ async fn memory_block_survives_two_compactions() {
         *summarizer_calls.borrow() >= 2,
         "at least two compactions ran"
     );
+    assert!(refreshes.get() >= 2);
     for system in provider.agent_systems().iter() {
+        assert!(system.contains("User-facing progress:"));
         assert!(
             system.contains(snapshot::MANAGED_BEGIN),
             "memory block present in every agent request"
@@ -337,6 +345,7 @@ async fn margin_check_sees_memory_bytes() {
             repeat_limit: 0,
             continuation_limit: 0,
             stream_requests: false,
+            report_progress: false,
             pause_requested: None,
         },
         &mut provider,

@@ -232,6 +232,7 @@ impl Args {
             provider_retries: self.provider_retries,
             continuation_limit: self.continue_on_length,
             stream_requests: self.stream_requests,
+            report_progress: self.progress_jsonl,
             compact_at_bytes: self.compact_at_bytes,
             timeout_seconds,
             provider_timeout_seconds: self.provider_timeout_seconds,

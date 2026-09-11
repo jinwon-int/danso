@@ -262,6 +262,7 @@ async fn per_request_refresh_re_resolves_after_compaction() {
             repeat_limit: 0,
             continuation_limit: 0,
             stream_requests: false,
+            report_progress: false,
             pause_requested: None,
         },
         &mut provider,
