@@ -520,12 +520,15 @@ pub fn read(payload: Option<Vec<u8>>) -> Result<FactsFile> {
     Ok(FactsFile { lines })
 }
 
-/// Load the facts file for a route through the owner-only read path.
+/// Load the facts file for a route through the owner-only read path. The
+/// legacy lane (§9) is a foreign tree Danso only reads, so it is judged on
+/// integrity rather than on the 0600 rule that governs Danso's own state.
 pub fn load(route: &paths::Route) -> Result<FactsFile> {
-    read(paths::read_bounded(
+    read(paths::read_bounded_with(
         &route.facts_file(),
         MAX_FACTS_FILE_BYTES,
         "memory facts",
+        route.mode_policy(),
     )?)
 }
 
@@ -923,6 +926,7 @@ pub fn close(
     now: DateTime<Utc>,
     lock_timeout_ms: u64,
 ) -> Result<CloseOutcome> {
+    route.require_writable()?;
     ensure!(paths::valid_scope(route.scope()), "invalid scope");
     ensure!(
         fact_id

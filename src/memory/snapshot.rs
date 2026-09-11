@@ -54,7 +54,15 @@ pub struct SnapshotOptions<'a> {
 /// hardlink, invalid UTF-8, oversize). The text is scanned and capped with
 /// the marker reserved inside the limit.
 fn read_scanned(path: &std::path::Path, cap: usize) -> Option<String> {
-    let payload = paths::read_bounded(path, 64 * 1024, "memory document").ok()??;
+    read_scanned_with(path, cap, paths::ModePolicy::Owned)
+}
+
+fn read_scanned_with(
+    path: &std::path::Path,
+    cap: usize,
+    policy: paths::ModePolicy,
+) -> Option<String> {
+    let payload = paths::read_bounded_with(path, 64 * 1024, "memory document", policy).ok()??;
     let raw = String::from_utf8(payload).ok()?;
     if raw.trim().is_empty() {
         return None;
@@ -85,12 +93,12 @@ fn hostname() -> String {
 /// private route, the shared tree (§7 read rule). Rejected, superseded,
 /// retention-expired, closed and observation records are excluded (§4.4).
 fn eligible_facts(route: &Route, now: DateTime<Utc>) -> Result<Vec<FactRecord>> {
-    let mut roots = vec![route.clone()];
-    if let Some(shared) = route.shared_route() {
-        roots.push(shared);
-    }
     let mut eligible = Vec::new();
-    for route in roots {
+    // §7 dedup: the legacy tree is the source the live tree was migrated
+    // from, so ids differ while the text is the same. Dedup on the normalized
+    // text the write gates already use, keeping the earlier (live) lane.
+    let mut seen_text = std::collections::HashSet::new();
+    for route in route.read_routes() {
         let file = match facts::load(&route) {
             Ok(file) => file,
             // Fail-open (§5.1): an unreadable store contributes nothing.
@@ -113,6 +121,10 @@ fn eligible_facts(route: &Route, now: DateTime<Utc>) -> Result<Vec<FactRecord>> 
             }
             if !recall::retention_keeps(record, now) {
                 continue;
+            }
+            let key = facts::normalize(&record.text);
+            if !key.is_empty() && !seen_text.insert(key) {
+                continue; // an earlier lane already carries this fact
             }
             eligible.push(record.clone());
         }
@@ -280,7 +292,18 @@ pub fn assemble(route: &Route, options: &SnapshotOptions) -> Result<String> {
     );
 
     // 1. resume — omitted entirely when absent.
-    let resume = read_scanned(&route.resume_file(), RESUME_CAP);
+    // Same fallback rule as the working state: live first, legacy only when
+    // the live tree has no resume pointer at all.
+    let resume_route = if read_scanned(&route.resume_file(), RESUME_CAP).is_some() {
+        route.clone()
+    } else {
+        route.legacy_route().unwrap_or_else(|| route.clone())
+    };
+    let resume = read_scanned_with(
+        &resume_route.resume_file(),
+        RESUME_CAP,
+        resume_route.mode_policy(),
+    );
     if let Some(resume) = &resume {
         body.push_str("▶ 직전 세션에서 이어서:\n");
         body.push_str(resume);
@@ -295,12 +318,21 @@ pub fn assemble(route: &Route, options: &SnapshotOptions) -> Result<String> {
 
     // 3. MEMORY + USER.
     let mut memories = String::new();
-    for file in ["MEMORY.md", "USER.md"] {
-        if let Some(doc) = read_scanned(&route.memories_dir().join(file), MEMORY_CAP) {
-            if !memories.is_empty() {
-                memories.push('\n');
+    // §7 merge order: the live lanes first, the read-only legacy tree last.
+    // The whole block is re-scanned under MEMORY_CAP below, so an extra lane
+    // cannot widen the budget — it only competes for the same cap.
+    for lane in route.read_routes() {
+        for file in ["MEMORY.md", "USER.md"] {
+            if let Some(doc) = read_scanned_with(
+                &lane.memories_dir().join(file),
+                MEMORY_CAP,
+                lane.mode_policy(),
+            ) {
+                if !memories.is_empty() {
+                    memories.push('\n');
+                }
+                memories.push_str(&doc);
             }
-            memories.push_str(&doc);
         }
     }
     let memory_block = if memories.is_empty() {
@@ -312,11 +344,27 @@ pub fn assemble(route: &Route, options: &SnapshotOptions) -> Result<String> {
     body.push_str(&memory_block);
 
     // 4. working-state with the STALE warning (§5.1: mtime age ≥ threshold).
-    let working_state = read_scanned(&route.working_state_file(), WORKING_STATE_CAP);
+    // The live tree wins outright; the legacy checkpoint is a fallback for a
+    // tree that has not been written yet (the migration case). Letting an old
+    // ccc checkpoint sit beside the current one would present two conflicting
+    // "current" states, which is worse than presenting none.
+    let working_route = if read_scanned(&route.working_state_file(), WORKING_STATE_CAP).is_some() {
+        route.clone()
+    } else {
+        route.legacy_route().unwrap_or_else(|| route.clone())
+    };
+    let working_state = read_scanned_with(
+        &working_route.working_state_file(),
+        WORKING_STATE_CAP,
+        working_route.mode_policy(),
+    );
     let mut working_block = String::from("## Working-state checkpoint\n");
     if let Some(body_text) = &working_state {
+        if working_route.is_legacy() {
+            working_block.push_str("> legacy lane (read-only ccc tree)\n");
+        }
         if options.stale_days > 0 {
-            let age_days = std::fs::symlink_metadata(route.working_state_file())
+            let age_days = std::fs::symlink_metadata(working_route.working_state_file())
                 .ok()
                 .and_then(|meta| meta.modified().ok())
                 .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
@@ -450,7 +498,10 @@ pub fn inject_into_context(
         .root
         .clone()
         .unwrap_or_else(super::MemoryConfig::default_root);
-    let route = Route::new(&root, &config.scope)?;
+    let mut route = Route::new(&root, &config.scope)?;
+    if let Some(dir) = &config.legacy_read {
+        route = route.with_legacy(dir)?;
+    }
     let query: Option<String> = match &config.query {
         Some(query) => Some(query.clone()),
         None => Some(auto_query(prompt, cwd)),
@@ -750,6 +801,7 @@ mod tests {
             max_bytes: SNAPSHOT_MAX_BYTES_DEFAULT,
             as_of: None,
             refresh: crate::memory::RefreshMode::default(),
+            legacy_read: None,
         };
         inject_into_context(&mut ctx, &config, "prompt", dir.path(), Utc::now()).unwrap();
         assert!(ctx.starts_with("system base"));

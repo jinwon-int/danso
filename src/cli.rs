@@ -71,6 +71,11 @@ pub struct Args {
     /// Context refresh cadence: per-run | per-request (re-assembles after compaction).
     #[arg(long, value_parser = ["per-run", "per-request"], default_value = "per-run")]
     pub memory_refresh: String,
+    /// Read-only legacy ccc tree merged into recall (#52 §9): an absolute
+    /// directory holding `state/` and `memories/`. Never written. Refused
+    /// with `--memory-scope shared`.
+    #[arg(long)]
+    pub memory_legacy_read: Option<PathBuf>,
     /// Execution backend: host uses current-user permissions; bubblewrap isolates tools.
     #[arg(long, default_value = "host", value_enum)]
     pub sandbox: SandboxArg,
@@ -203,6 +208,7 @@ impl Args {
                     .memory_max_bytes
                     .unwrap_or(danso::memory::snapshot::SNAPSHOT_MAX_BYTES_DEFAULT),
                 as_of: self.memory_as_of.clone(),
+                legacy_read: self.memory_legacy_read.clone(),
                 refresh: match self.memory_refresh.as_str() {
                     "per-request" => danso::memory::RefreshMode::PerRequest,
                     _ => danso::memory::RefreshMode::PerRun,

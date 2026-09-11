@@ -145,6 +145,7 @@ pub fn commit_extraction(
     now: DateTime<Utc>,
     timeout_ms: u64,
 ) -> Result<usize> {
+    route.require_writable()?;
     let job_id = context.job_id;
     let transcript = context.transcript;
     let audience = super::super::audience_for_scope(route.scope());

@@ -15,7 +15,7 @@ with no Python, Node, Shell, or SQLite runtime dependency. Design source:
 | M3 | Working-state + checkpoints (harness-written `working-state.md`) | Done (M1–M3) |
 | M2½ | `--memory-refresh per-request` (runtime context hook) | Done |
 | M4 | Distill extraction + journal + transactions (`--memory read-write`, `distill/drain/rollback`) | Done; #65 PR-1 fixed the read-write blocking defects, PR-2 unified manual add/close onto the rollback transaction, wired the audit ledger, and added the wiki-candidate queue |
-| M5 | Scope diagnostics (`check`, audit ledger, legacy read) | Done except legacy read: `--memory-legacy-read` is not implemented (#86). The `memory_requests` counter landed with #86; promotion landed earlier as `danso memory promote` (see Promotion below) |
+| M5 | Scope diagnostics (`check`, audit ledger, legacy read) | Done. `--memory-legacy-read` and the `memory_requests` counter landed with #86; promotion landed earlier as `danso memory promote` (see Promotion below) |
 
 ## On-disk layout (§3)
 
@@ -31,7 +31,9 @@ $DANSO_MEMORY_DIR (default ~/.danso/memory)
 
 Every directory is 0700, every file 0600, owner == euid, `st_nlink == 1`,
 symlinks refused. Violations fail open on read paths (the source is skipped)
-and fail closed on write paths.
+and fail closed on write paths. The one exception is the read-only legacy
+lane (§9), a foreign tree Danso never created and never writes — see *Legacy
+read lane* below.
 
 ## Fact records (§4.1)
 
@@ -68,7 +70,10 @@ changes nothing never touches the file.
 The index is derived in-process on every call — no on-disk index, no
 index/source drift. Documents: `memory` (MEMORY.md/USER.md, boost 3.0),
 `structured` (one record = one document, path `<facts>#L<n>:<id>`, boost 2.5),
-`state` (resume/working-state, boost 0.5). Scoring is the ccc formula
+`state` (resume/working-state, boost 0.5). A legacy lane contributes the
+same three kinds at lower boosts (`legacy-memory` 2.0, `legacy-structured`
+1.5, `legacy-state` 0.25) so a migration source never outranks the live tree.
+Scoring is the ccc formula
 (`token_hits×4 + phrase×3 + boosts`), the fuzzy lane is character 3-gram
 containment ≥ 0.34 scored `sim×8`, and the lanes fuse with RRF (k = 60). BM25
 tiebreaks and usage boosts are deliberately not ported.
@@ -187,6 +192,58 @@ ledger `state/audit.jsonl` records `MemoryCommit` and `DistillJob` events
 wherever it must appear; fact bodies and raw session ids never enter
 diagnostics.
 
+## Legacy read lane (§7–§9, #86)
+
+`--memory-legacy-read <abs dir>` merges a read-only ccc tree into recall. It
+is off by default; without it the memory paths are byte-for-byte what they
+were before.
+
+The directory is the tree root, laid out the way a ccc node lays out
+`~/.claude`:
+
+```
+<dir>/state/memory-facts.jsonl    both writer variants (§4.1 defaults-fill)
+<dir>/state/resume.md
+<dir>/state/working-state.md
+<dir>/memories/MEMORY.md, USER.md
+```
+
+That is the same shape as a Danso scope directory, so every derived path
+follows without a special case.
+
+**Read matrix (§7/§8).** Allowed for `global` (the CLI default, and the main
+migration case) and for `private-*`. Refused for `shared`: the M5 completion
+rule is that a shared run never opens a personal or legacy tree, so the
+combination is a configuration error rather than a silently ignored flag.
+Lanes merge in the order `private → shared → legacy`.
+
+**Dedup.** The legacy tree is usually what the live tree was migrated from,
+so the same fact sits in both under different ids. Documents and facts are
+deduplicated on the normalized text the write gates already use, and the
+earlier (live) lane wins. Legacy sources also score below their live
+counterparts, so a stale copy never outranks the current one.
+
+**`resume.md` and `working-state.md` are fallbacks, not additions.** The live
+file wins outright; the legacy one is used only when the live tree has none.
+Two conflicting "current" states side by side would be worse than one. A
+legacy working state is marked as such in the snapshot.
+
+**Permissions (§6.1).** Danso's own state must be exactly 0600, because
+Danso created it and can promise that. A legacy tree is foreign: the ccc
+hooks own it, and they do not all write 0600 — a real ccc node keeps
+`working-state.md` at 0644, and it is the most frequently updated file in the
+tree. Requiring 0600 there would silently drop it. What still matters for a
+file Danso reads and injects is integrity, not secrecy, so the legacy lane
+requires owner-owned and not group- or world-*writable*, and accepts any read
+bits. Symlink, hardlink and owner checks are unchanged. Violations are
+fail-open per source (§5.1): the offending file is skipped, the rest of the
+lane still reads.
+
+**Never written (§9).** The ccc hooks are still writing that tree, so it has
+exactly one writer and it is not Danso. The lane refuses every write path,
+and the tests prove read-only by byte and mtime comparison rather than by
+inspecting the call graph.
+
 ## Working state (§5.3, M3)
 
 The harness — not the model — records `state/working-state.md`:
@@ -233,8 +290,11 @@ queue|inline|off`, `--memory-refresh per-run|per-request` (per-request
 re-assembles the context right after each compaction through a
 memory-agnostic runtime hook), `--memory-dir`, `--memory-scope`,
 `--memory-query` (default: task + cwd + git branch/changed paths, capped at
-1400 bytes), `--memory-max-bytes` (1..=24576, default 12000) and
-`--memory-as-of`. Memory configuration failures are configuration errors
+1400 bytes), `--memory-max-bytes` (1..=24576, default 12000),
+`--memory-as-of` and `--memory-legacy-read <abs dir>` (read-only legacy ccc
+tree; refused with `--memory-scope shared`). `danso memory` accepts
+`--memory-legacy-read` as a global flag too, so `search`/`show` see the same
+lanes a run does. Memory configuration failures are configuration errors
 (exit 2, category `memory` for assembly failures such as marker forgery).
 
 ## Evaluation
