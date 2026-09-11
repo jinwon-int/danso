@@ -133,7 +133,13 @@ class Host(unittest.TestCase):
         (self.repo / 'main.rs').write_text(source)
         (self.repo / 'payload.bin').write_bytes(b'x' * (20 * 1024 * 1024))
         self.tool('bash', {'command': f'{shlex.quote(str(rustc_path))} main.rs -O -o compiled && ./compiled'})
-        p = self.run_cli()
+        # This tool call really compiles a binary carrying a 20 MiB static
+        # array with -O. It takes ~3s on an idle machine, but it is memory- and
+        # I/O-heavy, so a loaded CI runner has overrun the shared 15s deadline
+        # (#95). The assertion here is that the host backend *can* build a
+        # large artifact, never that it does so within a given time, so the
+        # deadline only has to be generous enough to tell work from a hang.
+        p = self.run_cli(timeout=120)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertFalse(self.results()[0]['isError'], self.results())
         self.assertGreater((self.repo / 'compiled').stat().st_size, 16 * 1024 * 1024)

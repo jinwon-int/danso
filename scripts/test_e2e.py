@@ -103,9 +103,15 @@ class Acceptance(unittest.TestCase):
         return [str(BIN), '--sandbox', 'bubblewrap', '--cwd', str(self.repo), '--session', str(self.session),
                 '--model', 'fixture-model', *extra, 'do the task']
 
-    def run_cli(self, *extra):
+    def run_cli(self, *extra, timeout=15):
+        # 15s is the harness deadline for a fixture-backed run: the provider is
+        # a local stub, so anything slower is a hang, not work. Tests whose
+        # tool actually does heavy work (compiling, large I/O) pass their own
+        # deadline rather than raising it for every suite — a global raise
+        # would delay hang detection in all eight suites that share this
+        # helper. See #95.
         return subprocess.run(self.command(*extra), env=self.env, text=True,
-                              capture_output=True, timeout=15)
+                              capture_output=True, timeout=timeout)
 
     def final(self):
         self.responses.append((200, reply([{'type': 'text', 'text': 'done'}])))
