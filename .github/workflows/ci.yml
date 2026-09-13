@@ -1,6 +1,8 @@
 name: Rust contracts
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
 permissions:
@@ -14,6 +16,8 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
+      - name: Check merge queue workflow contract
+        run: python3 scripts/test_merge_queue.py
       - name: Install toolchain and sandbox
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
