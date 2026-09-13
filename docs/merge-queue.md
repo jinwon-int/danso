@@ -5,6 +5,15 @@ without path or PR-only job filters. Queue builds run the same Rust, sandbox and
 release-artifact tests as PR builds. `scripts/test_merge_queue.py` guards this
 wiring offline; it does not replace a GitHub queue run.
 
+## Queue verification checklist
+
+- Record the reviewed PR head and the `merge_group` run URL separately; the
+  synthetic queue SHA is not the PR SHA.
+- Confirm the `contracts` job runs its substantive tests, not merely a skipped
+  job or the PR's earlier green check.
+- Read back the PR's merged state and merge commit. Queue admission alone is
+  not completion; retain failure evidence before considering rollback.
+
 ## Activation (separate settings action)
 
 Merge this CI preparation before enabling a `main` merge-queue ruleset. Preserve
