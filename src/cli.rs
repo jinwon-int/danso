@@ -310,12 +310,12 @@ mod tests {
 
     #[test]
     fn followup_requires_explicit_resume_and_preserves_the_new_prompt() {
-        assert!(try_parse(&["--task-followup", "latest instruction"]).is_err());
-        let args = parse(&["--resume-task", "--task-followup", "latest instruction"]);
+        assert!(try_parse(&["--task-followup"]).is_err());
+        let args = parse(&["--resume-task", "--task-followup"]);
         let config = args.config();
         let task = config.long_task.unwrap();
         assert!(task.resume && task.follow_up);
-        assert_eq!(config.prompt, "latest instruction");
+        assert_eq!(config.prompt, "a prompt");
         assert_eq!(task.explicit_limits, 0);
         assert!(
             !parse(&["--resume-task"])
