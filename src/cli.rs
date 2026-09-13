@@ -135,6 +135,9 @@ pub struct Args {
     /// Resume a previously paused long task without appending a new prompt.
     #[arg(long, conflicts_with = "task_status")]
     pub resume_task: bool,
+    /// Append a new user message while resuming a safe checkpoint; keep cumulative limits.
+    #[arg(long, requires = "resume_task")]
+    pub task_followup: bool,
     /// Inspect a session without creating or mutating it, or contacting a provider.
     #[arg(long, conflicts_with_all = ["long_task", "resume_task", "print", "progress_jsonl"])]
     pub task_status: bool,
@@ -260,6 +263,7 @@ impl Args {
                     | (u8::from(self.task_max_tokens.is_some()) << 3)
                     | (u8::from(self.task_repeat_limit.is_some()) << 4),
                 resume: self.resume_task,
+                follow_up: self.task_followup,
                 pause_after_stage: self.task_pause_after_stage,
             }),
             task_progress: self.task_progress,
@@ -302,6 +306,24 @@ mod tests {
         let mut argv = BASE.to_vec();
         argv.extend_from_slice(extra);
         Args::try_parse_from(argv)
+    }
+
+    #[test]
+    fn followup_requires_explicit_resume_and_preserves_the_new_prompt() {
+        assert!(try_parse(&["--task-followup", "latest instruction"]).is_err());
+        let args = parse(&["--resume-task", "--task-followup", "latest instruction"]);
+        let config = args.config();
+        let task = config.long_task.unwrap();
+        assert!(task.resume && task.follow_up);
+        assert_eq!(config.prompt, "latest instruction");
+        assert_eq!(task.explicit_limits, 0);
+        assert!(
+            !parse(&["--resume-task"])
+                .config()
+                .long_task
+                .unwrap()
+                .follow_up
+        );
     }
 
     #[test]

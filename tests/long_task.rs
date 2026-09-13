@@ -207,6 +207,7 @@ async fn pause_and_explicit_resume_keep_prompt_and_effects_exactly_once() {
                 limits: task_limits,
                 explicit_limits: 31,
                 resume: false,
+                follow_up: false,
                 pause_after_stage: Some(1),
             },
         ),
@@ -238,6 +239,7 @@ async fn pause_and_explicit_resume_keep_prompt_and_effects_exactly_once() {
                 limits: task_limits,
                 explicit_limits: 31,
                 resume: true,
+                follow_up: false,
                 pause_after_stage: None,
             },
         ),
@@ -281,6 +283,7 @@ async fn graceful_pause_flag_stops_before_first_provider_request() {
             limits: limits(),
             explicit_limits: 31,
             resume: false,
+            follow_up: false,
             pause_after_stage: None,
         },
     );
@@ -338,6 +341,7 @@ async fn compaction_summary_can_overshoot_stage_target_before_tool_checkpoint() 
             },
             explicit_limits: 31,
             resume: false,
+            follow_up: false,
             pause_after_stage: Some(1),
         },
     );
@@ -398,6 +402,7 @@ async fn reported_token_budget_applies_to_compaction_without_action_dispatch() {
             },
             explicit_limits: 31,
             resume: false,
+            follow_up: false,
             pause_after_stage: None,
         },
     );
@@ -446,6 +451,7 @@ async fn cancelled_provider_requires_explicit_resume_and_preserves_unknown_usage
                 limits,
                 explicit_limits: 31,
                 resume: false,
+                follow_up: false,
                 pause_after_stage: None,
             },
         ),
@@ -475,6 +481,7 @@ async fn cancelled_provider_requires_explicit_resume_and_preserves_unknown_usage
                 limits,
                 explicit_limits: 31,
                 resume: true,
+                follow_up: false,
                 pause_after_stage: None,
             },
         ),
@@ -528,6 +535,7 @@ async fn repeated_batches_stop_before_the_fourth_provider_request() {
                 },
                 explicit_limits: 31,
                 resume: false,
+                follow_up: false,
                 pause_after_stage: None,
             },
         ),
@@ -572,6 +580,7 @@ async fn reported_token_limit_stops_before_next_http_request() {
                 limits,
                 explicit_limits: 31,
                 resume: false,
+                follow_up: false,
                 pause_after_stage: None,
             },
         ),
@@ -794,6 +803,7 @@ async fn repeated_provider_cancellation_consumes_durable_budget_without_tools() 
                     limits: limits(),
                     explicit_limits: 31,
                     resume: attempt > 0,
+                    follow_up: false,
                     pause_after_stage: None,
                 },
             ),
@@ -830,6 +840,7 @@ async fn repeated_provider_cancellation_consumes_durable_budget_without_tools() 
                     limits: limits(),
                     explicit_limits: 31,
                     resume: true,
+                    follow_up: false,
                     pause_after_stage: None
                 }
             ),
@@ -881,6 +892,7 @@ async fn output_failure_after_assistant_append_cannot_be_reclassified_as_provide
                     limits: limits(),
                     explicit_limits: 31,
                     resume: false,
+                    follow_up: false,
                     pause_after_stage: None
                 }
             ),
@@ -909,4 +921,162 @@ async fn output_failure_after_assistant_append_cannot_be_reclassified_as_provide
     drop(session);
     assert!(Session::read_status(&path).is_err());
     assert!(effects.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn followup_appends_latest_instruction_without_resetting_saved_budgets() {
+    struct FollowupProvider;
+    impl Provider for FollowupProvider {
+        fn validate_history(&self, _: &[Value]) -> Result<()> {
+            Ok(())
+        }
+        async fn complete(&mut self, request: ModelRequest<'_>, _: &mut Usage) -> Result<Value> {
+            let last = request.messages.last().unwrap();
+            assert_eq!(last["role"], "user");
+            assert_eq!(
+                last["content"],
+                "Stop editing; explain the current result only."
+            );
+            Ok(final_reply("Current result explained."))
+        }
+    }
+    for interrupted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("followup.jsonl");
+        let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+        let entry = session
+            .append_message(json!({"role":"user","content":"original task"}))
+            .unwrap();
+        let saved_limits = Limits {
+            max_requests: 2,
+            ..limits()
+        };
+        session
+            .record_long_task(saved_limits.json(
+                session.header()["id"].as_str().unwrap(),
+                entry["id"].as_str().unwrap(),
+            ))
+            .unwrap();
+        if interrupted {
+            session.record_long_task(json!({"version":1,"event":"request_started","sequence":1,"stage":0,"elapsed_ms":10})).unwrap();
+            session.record_long_task(json!({"version":1,"event":"provider_interrupted","sequence":1,"stage":0,"elapsed_ms":50,"reason":"signal_termination","request_kind":"action"})).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let effects = Rc::new(RefCell::new(Vec::new()));
+        let executor = FakeExecutor {
+            calls: effects.clone(),
+            outputs: RefCell::new(VecDeque::new()),
+        };
+        runtime::run(
+            input(
+                "Stop editing; explain the current result only.",
+                LongTaskRun {
+                    limits: saved_limits,
+                    explicit_limits: 31,
+                    resume: true,
+                    follow_up: true,
+                    pause_after_stage: None,
+                },
+            ),
+            &mut FollowupProvider,
+            &executor,
+            &mut session,
+            &mut Sink::default(),
+            &mut Usage::default(),
+        )
+        .await
+        .unwrap();
+        assert!(effects.borrow().is_empty());
+        assert!(std::fs::read(&path).unwrap().starts_with(&before));
+        assert_eq!(
+            session
+                .long_task_records()
+                .unwrap()
+                .iter()
+                .filter(|r| r["event"] == "created")
+                .count(),
+            1
+        );
+        let messages = session.messages().unwrap();
+        assert_eq!(messages.iter().filter(|m| m["role"] == "user").count(), 2);
+        drop(session);
+        let status = Session::read_status(&path).unwrap();
+        assert_eq!(status["state"], "completed");
+        assert_eq!(status["usage"]["requests"], if interrupted { 2 } else { 1 });
+        assert_eq!(
+            status["usage"]["unknown_usage_requests"],
+            if interrupted { 1 } else { 0 }
+        );
+        assert_eq!(status["limits"]["max_requests"], 2);
+        if interrupted {
+            assert!(status["elapsed_ms"].as_u64().unwrap() >= 50);
+        }
+    }
+}
+
+#[tokio::test]
+async fn followup_never_appends_or_dispatches_for_uncertain_or_exhausted_tasks() {
+    for boundary in ["pending", "budget", "empty", "legacy_prompt"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blocked.jsonl");
+        let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+        let entry = session
+            .append_message(json!({"role":"user","content":"original"}))
+            .unwrap();
+        let saved = Limits {
+            max_requests: 1,
+            ..limits()
+        };
+        session
+            .record_long_task(saved.json(
+                session.header()["id"].as_str().unwrap(),
+                entry["id"].as_str().unwrap(),
+            ))
+            .unwrap();
+        if matches!(boundary, "pending" | "budget") {
+            session.record_long_task(json!({"version":1,"event":"request_started","sequence":1,"stage":0,"elapsed_ms":10})).unwrap();
+        }
+        if boundary == "budget" {
+            session.record_long_task(json!({"version":1,"event":"provider_interrupted","sequence":1,"stage":0,"elapsed_ms":20,"reason":"user_stop","request_kind":"action"})).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let effects = Rc::new(RefCell::new(Vec::new()));
+        let executor = FakeExecutor {
+            calls: effects.clone(),
+            outputs: RefCell::new(VecDeque::new()),
+        };
+        let mut provider = FakeProvider {
+            replies: VecDeque::new(),
+            calls: 0,
+            delay: None,
+        };
+        assert!(
+            runtime::run(
+                input(
+                    if boundary == "empty" {
+                        " "
+                    } else {
+                        "new direction"
+                    },
+                    LongTaskRun {
+                        limits: saved,
+                        explicit_limits: 31,
+                        resume: true,
+                        follow_up: boundary != "legacy_prompt",
+                        pause_after_stage: None,
+                    }
+                ),
+                &mut provider,
+                &executor,
+                &mut session,
+                &mut Sink::default(),
+                &mut Usage::default()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(provider.calls, 0);
+        assert!(effects.borrow().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 }
