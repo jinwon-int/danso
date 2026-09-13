@@ -13,8 +13,12 @@ and conversation resolution. Do not add bypass actors or relax checks to unblock
 the queue. Start with `ALLGREEN`, `SQUASH`, one entry per build/merge and a
 60-minute check timeout. These are rollout targets, not proof settings are active.
 
-Use `gh pr merge NUMBER --auto --squash` to request queue admission. GitHub owns
-eligibility and the final merge; do not use `--admin`. Verify a `merge_group` run
+Record the full reviewed PR head, then use
+`gh pr merge NUMBER --squash --match-head-commit REVIEWED_FULL_SHA` once required
+checks pass to request queue admission. Add `--auto` only if repository auto-merge
+is enabled and admission must wait. A head change requires re-review; do not
+silently refresh the expected SHA. GitHub owns eligibility and the final merge;
+do not use `--admin`. Verify a `merge_group` run
 on `gh-readonly-queue/main/...` succeeds before declaring rollout complete.
 Branch cleanup happens after the PR actually merges, not merely after enqueue.
 
