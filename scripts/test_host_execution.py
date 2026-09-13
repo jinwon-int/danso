@@ -273,6 +273,30 @@ class Host(unittest.TestCase):
 class LongTask(providers.Fixture):
     """Cross-process long-task checks against the real native CLI."""
 
+    def test_followup_keeps_history_effects_and_immutable_limits(self):
+        self.responses.append((200, self.tool_response("echo once >> effects")))
+        paused = self.run_long('--timeout-seconds', '60', '--task-stage-requests', '1',
+                               '--task-pause-after-stage', '1', '--task-max-requests', '5',
+                               prompt='original objective')
+        self.assertNotEqual(paused.returncode, 0)
+        before = self.session.read_bytes()
+        old = json.loads(self.status().stdout)
+        self.assertTrue(old['resume_allowed'])
+        self.responses.append((200, providers.response('glm', text='EXPLAINED')))
+        new_message = 'Stop editing; explain what is done so far.'
+        result = self.run_long('--resume-task', '--task-followup', prompt=new_message)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'EXPLAINED')
+        self.assertEqual(len(self.users()), 2)
+        self.assertEqual(self.requests[-1]['messages'][-1]['content'], new_message)
+        self.assertEqual((self.repo / 'effects').read_text(), 'once\n')
+        self.assertTrue(self.session.read_bytes().startswith(before))
+        status = json.loads(self.status().stdout)
+        self.assertEqual(status['limits'], old['limits'])
+        self.assertEqual(status['usage']['requests'], old['usage']['requests'] + 1)
+        self.assertGreaterEqual(status['elapsed_ms'], old['elapsed_ms'])
+
+
     def command(self, *extra, prompt=None):
         args = [str(providers.BIN), '--sandbox', 'host', '--cwd', str(self.repo),
                 '--session', str(self.session), '--provider', 'glm', '--model',

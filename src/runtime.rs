@@ -20,6 +20,8 @@ pub struct LongTaskRun {
     /// Resume may fill omitted fields from the immutable journal record.
     pub explicit_limits: u8,
     pub resume: bool,
+    /// Append an explicit new user message at a safe resume boundary.
+    pub follow_up: bool,
     pub pause_after_stage: Option<u64>,
 }
 
@@ -385,6 +387,12 @@ pub async fn run(
             input.execution_context.len() <= crate::context::EXECUTION_CONTEXT_LIMIT,
             "execution context exceeds 32768 bytes"
         );
+        if let Some(task) = input.long_task {
+            ensure!(
+                !task.follow_up || (task.resume && !input.prompt.trim().is_empty()),
+                "task-followup requires resume-task and a nonempty prompt"
+            );
+        }
         if let Some(limit) = input.compact_at_bytes {
             ensure!(
                 (crate::compaction::MIN_THRESHOLD..=crate::compaction::MAX_THRESHOLD)
@@ -426,8 +434,8 @@ pub async fn run(
                     .ensure_safe_resume()
                     .map_err(at(Kind::Session))?;
                 ensure!(
-                    input.prompt.trim().is_empty(),
-                    "resume-task takes no prompt"
+                    task.follow_up || input.prompt.trim().is_empty(),
+                    "resume-task takes no prompt without task-followup"
                 );
             } else {
                 if !matches!(
@@ -482,7 +490,10 @@ pub async fn run(
     sink.emit(Event::Session(session.header()))
         .map_err(at(Kind::Output))?;
     let mut created_user_entry_id = None;
-    if !input.long_task.is_some_and(|task| task.resume) {
+    if !input
+        .long_task
+        .is_some_and(|task| task.resume && !task.follow_up)
+    {
         let user = json!({"role":"user","content":input.prompt,"timestamp":millis()});
         let entry = session
             .append_message(user.clone())

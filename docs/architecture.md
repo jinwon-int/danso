@@ -457,3 +457,20 @@ interim bubbles. Old consumers can continue to buffer final-only output.
 This is milestone reporting, not token streaming or a timer-driven model call.
 A provider or tool blocked inside a request cannot produce a new model-authored
 update; the caller's existing elapsed-time/status heartbeat covers that gap.
+
+## User follow-ups at a long-task checkpoint
+
+`--resume-task --task-followup -- "new user message"` accepts an explicit new
+user instruction at a validated `ready` or `paused` checkpoint. It appends that
+message to the same conversation before the next model request. The original
+creation record, elapsed runtime, request/token/repetition limits, tool-call IDs,
+and unknown-usage interruption count remain intact. The latest instruction can
+redirect the work or ask for status; it is not discarded in favor of a no-prompt
+resume. Plain `--resume-task` still requires no prompt.
+
+The native session writer lock and recovery validation run before appending the
+follow-up. Pending providers without a durable interruption record, unresolved
+tool effects, torn journals and exhausted budgets remain blocked. No timer,
+startup scan, signal handler or provider retry invokes this mode automatically.
+Embedders must select it only for a new user message, and probe `--task-followup`
+before using it with an older binary. Read-only task status remains unchanged.
