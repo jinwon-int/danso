@@ -123,16 +123,15 @@ impl EventSink for PrintSink {
             // ignores them; the transcript frames are unchanged. The records
             // are hand-written so the key order stays stable for adapters
             // (serde_json maps serialize alphabetically).
-            (Mode::Text, Event::TextDelta(text)) => {
-                writeln!(
-                    stdout,
-                    "{{\"type\":\"danso_text_delta\",\"version\":1,\"text\":{}}}",
-                    serde_json::to_string(text)?
-                )?
-            }
-            (Mode::Text, Event::MessageCompleted) => {
-                writeln!(stdout, "{{\"type\":\"danso_message_completed\",\"version\":1}}")?
-            }
+            (Mode::Text, Event::TextDelta(text)) => writeln!(
+                stdout,
+                "{{\"type\":\"danso_text_delta\",\"version\":1,\"text\":{}}}",
+                serde_json::to_string(text)?
+            )?,
+            (Mode::Text, Event::MessageCompleted) => writeln!(
+                stdout,
+                "{{\"type\":\"danso_message_completed\",\"version\":1}}"
+            )?,
             _ => {}
         }
         stdout.flush()?;

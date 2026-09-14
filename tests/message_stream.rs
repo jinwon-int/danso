@@ -99,7 +99,10 @@ impl EventSink for StreamSink {
             Event::ToolStarted(tool) => self.frames.push(Frame::ToolStarted(tool.to_owned())),
             Event::ToolSettled { is_error } => self.frames.push(Frame::ToolSettled(is_error)),
             Event::FinalAnswer(message) => {
-                let text = message["content"][0]["text"].as_str().expect("text").to_owned();
+                let text = message["content"][0]["text"]
+                    .as_str()
+                    .expect("text")
+                    .to_owned();
                 self.frames.push(Frame::FinalAnswer(text))
             }
             _ => {}
