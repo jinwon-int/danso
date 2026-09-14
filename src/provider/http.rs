@@ -569,7 +569,7 @@ mod retry_tests {
     }
 
     fn client(base: &str, retries: u32) -> Http {
-        let mut client = Http::with_timeouts(
+        let mut client = Http::with_timeouts_with_budget(
             base,
             "test",
             reqwest::header::AUTHORIZATION,
@@ -577,6 +577,7 @@ mod retry_tests {
             "PRIVATE_KEY_MARKER",
             Duration::from_secs(5),
             Duration::from_secs(1),
+            crate::provider::DEFAULT_REQUEST_BUDGET_BYTES,
         )
         .unwrap();
         client.set_retries(retries);
