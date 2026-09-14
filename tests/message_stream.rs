@@ -90,8 +90,11 @@ struct StreamSink {
 impl EventSink for StreamSink {
     fn emit(&mut self, event: Event<'_>) -> Result<()> {
         match event {
-            Event::Message(message) => {
-                let role = message["role"].as_str().expect("role").to_owned();
+            Event::Message(entry) => {
+                // Event::Message carries the journal entry envelope
+                // ({"type":"message","message":{...}}); the role lives on
+                // the wrapped message.
+                let role = entry["message"]["role"].as_str().expect("role").to_owned();
                 self.frames.push(Frame::Message(role))
             }
             Event::TextDelta(text) => self.frames.push(Frame::TextDelta(text.to_owned())),
