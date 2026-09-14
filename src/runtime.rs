@@ -360,6 +360,31 @@ fn pause_if_requested<S: SessionStore>(
     }
 }
 
+/// Issue #98 (item a): stream the text blocks of an interim assistant
+/// message as TextDelta frames closed by MessageCompleted. Called only at
+/// the durable message boundary — after the journal append and before any
+/// tool dispatch — so a stream consumer can render the text immediately
+/// while the journal keeps recording completed messages only.
+fn stream_assistant_text(sink: &mut impl EventSink, message: &Value) -> Result<()> {
+    if message["role"] != "assistant" {
+        return Ok(());
+    }
+    let mut streamed = false;
+    for text in crate::contracts::text_blocks(message) {
+        if text.is_empty() {
+            continue;
+        }
+        sink.emit(Event::TextDelta(text))
+            .map_err(at(Kind::Output))?;
+        streamed = true;
+    }
+    if streamed {
+        sink.emit(Event::MessageCompleted)
+            .map_err(at(Kind::Output))?;
+    }
+    Ok(())
+}
+
 pub async fn run(
     input: RunInput<'_>,
     provider: &mut impl Provider,
@@ -829,6 +854,13 @@ pub async fn run(
                 .map_err(at(Kind::Session))?,
         ))
         .map_err(at(Kind::Output))?;
+        if !calls.is_empty() {
+            // Interim boundary: the message is durable and the loop is about
+            // to run tools, so the text can stream without attaching any
+            // tool effect to partial output. The final answer keeps its own
+            // FinalAnswer event and rendering.
+            stream_assistant_text(sink, &message)?;
+        }
         messages.push(message.clone());
         if input.long_task.is_some() {
             settle_pending_action(

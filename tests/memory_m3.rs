@@ -198,6 +198,8 @@ impl EventSink for Collecting {
             Event::Message(_) => "message",
             Event::Compaction(_) => "compaction",
             Event::FinalAnswer(_) => "final",
+            Event::TextDelta(_) => "text-delta",
+            Event::MessageCompleted => "message-completed",
             Event::ToolStarted(_) => "tool-started",
             Event::Request { .. } => "request",
             Event::ToolSettled { .. } => "tool-settled",

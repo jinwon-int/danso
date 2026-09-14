@@ -21,6 +21,11 @@ CAP = 1024 * 1024
 TASK_PROGRESS_CAP = 4096
 TASK_PROGRESS_LINE_CAP = 64 * 1024
 TASK_RESUME_CONTROL = "__CCC_DANSO_TASK_RESUME_V1__"
+# Issue #98 (item a): interim assistant text arrives on stdout at durable
+# message boundaries, one strict JSON record per text block plus a closing
+# record. Anything else on stdout stays final-answer text.
+TEXT_DELTA_KEYS = {'type', 'version', 'text'}
+MESSAGE_COMPLETED_KEYS = {'type', 'version'}
 PROVIDERS = {
     'glm': ('ZAI_API_KEY', 'DANSO_GLM_BASE_URL'),
     'openai': ('OPENAI_API_KEY', 'DANSO_OPENAI_BASE_URL'),
@@ -325,6 +330,66 @@ def _task_progress(line):
         return TaskProgressEvent(state=diagnostic['state'], **values)
     except (ValueError, TypeError, RecursionError):
         return None
+
+
+def _stream_frame(line):
+    """Parse one strict native interim-text frame, or None for answer bytes."""
+    if not (line.startswith('{"type":"danso_text_delta"')
+            or line.startswith('{"type":"danso_message_completed"')):
+        return None
+    try:
+        record = json.loads(line, object_pairs_hook=_unique_object)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    if (type(record) is not dict or type(record.get('version')) is not int
+            or record['version'] != 1):
+        return None
+    if record.get('type') == 'danso_text_delta' and set(record) == TEXT_DELTA_KEYS:
+        text = record['text']
+        if type(text) is not str or not text:
+            return None
+        return TextDeltaEvent(text=text)
+    if (record.get('type') == 'danso_message_completed'
+            and set(record) == MESSAGE_COMPLETED_KEYS):
+        return MessageCompletedEvent()
+    return None
+
+
+async def _read_stdout(stream, stream_queue):
+    """Yield interim text frames live; retain only final-answer stdout bytes."""
+    retained = bytearray()
+    frame_bytes = 0
+    pending = bytearray()
+
+    async def consume(line):
+        nonlocal frame_bytes
+        if len(retained) + frame_bytes + len(line) + 1 > CAP:
+            raise ValueError('output limit')
+        event = _stream_frame(line.decode('utf-8', errors='replace'))
+        if event is None:
+            retained.extend(line)
+            retained.extend(b'\n')
+            return
+        frame_bytes += len(line) + 1
+        await stream_queue.put(event)
+
+    try:
+        while chunk := await stream.read(65536):
+            pending.extend(chunk)
+            if len(retained) + frame_bytes + len(pending) > CAP:
+                raise ValueError('output limit')
+            while b'\n' in pending:
+                line, _, pending = pending.partition(b'\n')
+                if line.endswith(b'\r'):
+                    line = line[:-1]
+                await consume(line)
+            if len(retained) + frame_bytes + len(pending) > CAP:
+                raise ValueError('output limit')
+        if pending:
+            await consume(bytes(pending))
+        return bytes(retained)
+    finally:
+        await stream_queue.put(None)
 
 
 async def _read_stderr(stream, progress_queue, *, parse_progress):
@@ -753,8 +818,10 @@ class DansoSession:
                         max_requests=effective_max_requests,
                         max_tokens=effective_max_tokens,
                     ):
-                        if isinstance(event, TaskProgressEvent):
-                            # Progress is consumed incrementally and never
+                        if isinstance(event, (TaskProgressEvent, TextDeltaEvent,
+                                              MessageCompletedEvent)):
+                            # Progress and interim assistant text (issue #98
+                            # a) are consumed incrementally and never
                             # retained alongside the final answer.
                             yield event
                         else:
@@ -794,7 +861,8 @@ class DansoSession:
         if self._interrupted:
             await self.interrupt()
         progress_queue = asyncio.Queue()
-        stdout_task = asyncio.create_task(_read(self._process.stdout))
+        stdout_task = asyncio.create_task(
+            _read_stdout(self._process.stdout, progress_queue))
         if r.long_task:
             stderr_task = asyncio.create_task(
                 _read_stderr(self._process.stderr, progress_queue, parse_progress=True))
@@ -803,7 +871,7 @@ class DansoSession:
             # long-task progress records are only a long-mode protocol.
             stderr_task = asyncio.create_task(_read(self._process.stderr))
         readers.extend([stdout_task, stderr_task])
-        progress_task = (asyncio.create_task(progress_queue.get()) if r.long_task else None)
+        queued = asyncio.create_task(progress_queue.get())
         stdout = stderr = None
         stdout_done = stderr_done = False
         last_progress = None
@@ -811,38 +879,40 @@ class DansoSession:
             async with asyncio.timeout(timeout_seconds + 5):
                 while True:
                     # A caller can pause an async-generator consumer after a
-                    # progress event.  Drain every task that finished during
-                    # that pause before constructing the next wait set; a
-                    # completed future must never be silently dropped.
+                    # progress or interim-text event.  Drain every task that
+                    # finished during that pause before constructing the next
+                    # wait set; a completed future must never be silently
+                    # dropped.
                     if not stdout_done and stdout_task.done():
                         stdout = stdout_task.result()
                         stdout_done = True
                     if not stderr_done and stderr_task.done():
                         stderr = stderr_task.result()
                         stderr_done = True
-                    if progress_task is not None and progress_task.done():
-                        item = progress_task.result()
+                    if queued.done():
+                        item = queued.result()
                         if item is None:
-                            progress_task = None
+                            queued = None
                         else:
-                            last_progress = item
-                            if item.state == 'checkpoint' and not self._task_progress_seen:
-                                self._task_progress_seen = True
-                                # New tasks must prove native readiness with
-                                # the stage-zero record.  A resumed task's
-                                # first record legitimately carries its
-                                # persisted nonzero stage/cumulative usage.
-                                if ((resume_task and (
-                                        resume_stage is None or item.stage >= resume_stage))
-                                        or (
-                                        item.stage == 0 and item.requests == 0
-                                        and item.reported_tokens == 0
-                                        and item.elapsed_seconds == 0)):
-                                    self._task_progress_ready = True
-                            progress_task = asyncio.create_task(progress_queue.get())
+                            if isinstance(item, TaskProgressEvent):
+                                last_progress = item
+                                if item.state == 'checkpoint' and not self._task_progress_seen:
+                                    self._task_progress_seen = True
+                                    # New tasks must prove native readiness with
+                                    # the stage-zero record.  A resumed task's
+                                    # first record legitimately carries its
+                                    # persisted nonzero stage/cumulative usage.
+                                    if ((resume_task and (
+                                            resume_stage is None or item.stage >= resume_stage))
+                                            or (
+                                            item.stage == 0 and item.requests == 0
+                                            and item.reported_tokens == 0
+                                            and item.elapsed_seconds == 0)):
+                                        self._task_progress_ready = True
+                            queued = asyncio.create_task(progress_queue.get())
                             yield item
                         continue
-                    wait_for = {task for task in (stdout_task, stderr_task, progress_task)
+                    wait_for = {task for task in (stdout_task, stderr_task, queued)
                                 if task is not None and not task.done()}
                     if not wait_for:
                         break
@@ -856,10 +926,10 @@ class DansoSession:
                     stderr = stderr_task.result()
                 code = await self._process.wait()
         finally:
-            if progress_task is not None and not progress_task.done():
-                progress_task.cancel()
-            if progress_task is not None:
-                await asyncio.gather(progress_task, return_exceptions=True)
+            if queued is not None and not queued.done():
+                queued.cancel()
+            if queued is not None:
+                await asyncio.gather(queued, return_exceptions=True)
         if self._interrupted:
             events.append(ErrorEvent(code='danso_cancelled', message='Worker interrupted; journal retained. No automatic replay.'))
         elif code != 0:
@@ -888,6 +958,9 @@ class DansoSession:
             usage = _usage(stderr.decode('utf-8'))
             if not text:
                 raise ValueError('empty result')
+            # The final answer (interim messages were already streamed as
+            # live frames) is wrapped only after a successful exit and
+            # validated usage; it is never implied by streamed frames.
             events.append(TextDeltaEvent(text=text))
             events.append(MessageCompletedEvent())
             events.append(ResultEvent(result={'text': text, 'usage': usage}))
