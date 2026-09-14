@@ -15,12 +15,7 @@ pub struct ChatGpt {
     request_budget_bytes: usize,
 }
 impl ChatGpt {
-    pub fn new(
-        path: &Path,
-        base: &str,
-        timeout: u64,
-        request_budget_bytes: usize,
-    ) -> Result<Self> {
+    pub fn new(path: &Path, base: &str, timeout: u64, request_budget_bytes: usize) -> Result<Self> {
         let url =
             reqwest::Url::parse(base).map_err(|_| anyhow::anyhow!("invalid ChatGPT endpoint"))?;
         ensure!(

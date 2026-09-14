@@ -45,9 +45,7 @@ pub const fn request_budget_for_context(
     context_window_tokens: usize,
     bytes_per_token: usize,
 ) -> usize {
-    let token_budget = context_window_tokens
-        .saturating_mul(REQUEST_BUDGET_PERCENT)
-        / 100;
+    let token_budget = context_window_tokens.saturating_mul(REQUEST_BUDGET_PERCENT) / 100;
     token_budget.saturating_mul(bytes_per_token)
 }
 

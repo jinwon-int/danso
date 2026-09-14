@@ -428,12 +428,10 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     // A missing CLI threshold follows the selected provider/model rather than
     // a process-wide byte constant. Reserve one maximum managed snapshot so
     // refreshed memory still fits after compaction.
-    let compact_at_bytes = Some(
-        args.compact_at_bytes
-            .unwrap_or_else(|| {
-                crate::compaction::default_threshold(provider.request_budget_bytes())
-            }),
-    );
+    let compact_at_bytes =
+        Some(args.compact_at_bytes.unwrap_or_else(|| {
+            crate::compaction::default_threshold(provider.request_budget_bytes())
+        }));
     provider.set_retries(args.provider_retries);
     let limits =
         tools::resource_limits(args.backend, Duration::from_secs(args.tool_timeout_seconds));
