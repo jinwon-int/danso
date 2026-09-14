@@ -6,6 +6,12 @@ four builtin tools, sandbox, budgets, usage output, durable operation gates and
 token-streaming output. Text deltas are delivered to the output sink only; the
 completed assistant message remains the sole journal entry and source of tool
 effects.
+
+The runtime requests whole responses by default and delivers interim text at
+durable message boundaries (issue #98 a). Setting `DANSO_PROVIDER_STREAM=1`
+opts the runtime into provider SSE ingestion (issue #98 b): deltas stream to
+the sink as they arrive, the boundary emits only the completion marker, and
+the final answer is not re-printed after it was streamed.
 The original three paths are tested against local HTTP fixtures. Real account/model
 acceptance remains pending; no API access is inferred from a model name.
 
