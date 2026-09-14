@@ -17,6 +17,17 @@ BIN = Path(os.environ.get('DANSO_BIN', 'target/debug/danso')).resolve()
 
 
 def response(provider, actions=(), text='done', reasoning=True):
+    if provider == 'anthropic':
+        content = []
+        if text and not actions:
+            content.append({'type': 'text', 'text': text})
+        for i, (name, args) in enumerate(actions):
+            content.append({'type': 'tool_use', 'id': f'call{i}', 'name': name, 'input': args})
+        return {'model': 'fixture', 'role': 'assistant', 'content': content,
+                'stop_reason': 'tool_use' if actions else 'end_turn',
+                'usage': {'input_tokens': 10, 'output_tokens': 5,
+                          'cache_read_input_tokens': 2,
+                          'cache_creation_input_tokens': 0}}
     if provider == 'openai':
         serial = next(IDS)
         output = []
@@ -42,6 +53,122 @@ def response(provider, actions=(), text='done', reasoning=True):
             'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'prompt_tokens_details': {'cached_tokens': 2}, 'total_tokens': 15}}
 
 
+def sse(event, payload):
+    prefix = f'event: {event}\n' if event else ''
+    data = payload if isinstance(payload, str) else json.dumps(payload, separators=(',', ':'))
+    return (prefix + f'data: {data}\n\n').encode()
+
+
+def split_text(text):
+    if len(text) > 100_000:
+        return []
+    midpoint = max(1, len(text) // 2)
+    return [text[:midpoint], text[midpoint:]] if text[midpoint:] else [text]
+
+
+def anthropic_stream(value):
+    frames = [sse('message_start', {
+        'type': 'message_start',
+        'message': {'model': value.get('model', 'fixture'), 'role': 'assistant', 'content': [],
+                    'usage': {'input_tokens': value['usage']['input_tokens'],
+                              'cache_read_input_tokens': value['usage'].get('cache_read_input_tokens', 0),
+                              'cache_creation_input_tokens': value['usage'].get('cache_creation_input_tokens', 0)}},
+    })]
+    for index, block in enumerate(value['content']):
+        if block['type'] == 'text':
+            frames.append(sse('content_block_start', {'type': 'content_block_start', 'index': index,
+                                                       'content_block': {'type': 'text', 'text': ''}}))
+            for text in split_text(block['text']) or [block['text']]:
+                frames.append(sse('content_block_delta', {'type': 'content_block_delta', 'index': index,
+                                                           'delta': {'type': 'text_delta', 'text': text}}))
+        else:
+            frames.append(sse('content_block_start', {'type': 'content_block_start', 'index': index,
+                                                       'content_block': {'type': 'tool_use', 'id': block['id'],
+                                                                         'name': block['name'], 'input': {}}}))
+            raw = json.dumps(block['input'], separators=(',', ':'))
+            for part in split_text(raw) or [raw]:
+                frames.append(sse('content_block_delta', {'type': 'content_block_delta', 'index': index,
+                                                           'delta': {'type': 'input_json_delta',
+                                                                     'partial_json': part}}))
+        frames.append(sse('content_block_stop', {'type': 'content_block_stop', 'index': index}))
+    frames.append(sse('message_delta', {'type': 'message_delta',
+                                        'delta': {'stop_reason': value['stop_reason']},
+                                        'usage': {'output_tokens': value['usage']['output_tokens']}}))
+    frames.append(sse('message_stop', {'type': 'message_stop'}))
+    return b''.join(frames)
+
+
+def openai_stream(value):
+    frames = []
+    for index, item in enumerate(value.get('output', [])):
+        if item.get('type') == 'message':
+            for text in item.get('content', []):
+                if text.get('type') == 'output_text':
+                    for part in split_text(text['text']):
+                        frames.append(sse('response.output_text.delta', {
+                            'type': 'response.output_text.delta', 'output_index': index,
+                            'delta': part}))
+        elif item.get('type') == 'function_call':
+            raw = item.get('arguments', '')
+            for part in split_text(raw) or [raw]:
+                frames.append(sse('response.function_call_arguments.delta', {
+                    'type': 'response.function_call_arguments.delta', 'output_index': index,
+                    'delta': part}))
+        if not any(len(content.get('text', '')) > 100_000 for content in item.get('content', [])):
+            frames.append(sse('response.output_item.done', {
+                'type': 'response.output_item.done', 'output_index': index, 'item': item}))
+    terminal = {'type': 'response.completed', 'response': value}
+    frames.append(sse('response.completed', terminal))
+    return b''.join(frames)
+
+
+def glm_stream(value):
+    if len(value.get('choices', [])) != 1:
+        return sse(None, value) + sse(None, '[DONE]')
+    choice = value['choices'][0]
+    message = choice['message']
+    frames = [sse(None, {'id': 'fixture', 'model': value.get('model', 'fixture'),
+                         'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}],
+                         'usage': None})]
+    if message.get('content'):
+        for part in split_text(message['content']) or [message['content']]:
+            frames.append(sse(None, {'id': 'fixture', 'model': value.get('model', 'fixture'),
+                                     'choices': [{'index': 0, 'delta': {'content': part}, 'finish_reason': None}],
+                                     'usage': None}))
+    if message.get('reasoning_content'):
+        for part in split_text(message['reasoning_content']) or [message['reasoning_content']]:
+            frames.append(sse(None, {'id': 'fixture', 'model': value.get('model', 'fixture'),
+                                     'choices': [{'index': 0, 'delta': {'reasoning_content': part}, 'finish_reason': None}],
+                                     'usage': None}))
+    for index, call in enumerate(message.get('tool_calls', [])):
+        function = call['function']
+        raw = function['arguments'] if isinstance(function['arguments'], str) else json.dumps(function['arguments'])
+        parts = split_text(raw) or [raw]
+        for part_index, part in enumerate(parts):
+            tool = {'index': index, 'function': {'arguments': part}}
+            if part_index == 0:
+                tool.update({'id': call['id'], 'type': 'function', 'function': {'name': function['name'],
+                                                                                   'arguments': part}})
+            frames.append(sse(None, {'id': 'fixture', 'model': value.get('model', 'fixture'),
+                                     'choices': [{'index': 0, 'delta': {'tool_calls': [tool]}, 'finish_reason': None}],
+                                     'usage': None}))
+    frames.append(sse(None, {'id': 'fixture', 'model': value.get('model', 'fixture'),
+                             'choices': [{'index': 0, 'delta': {}, 'finish_reason': choice['finish_reason']}],
+                             'usage': value['usage']}))
+    frames.append(sse(None, '[DONE]'))
+    return b''.join(frames)
+
+
+def streamed_body(path, value):
+    if path.endswith('/messages'):
+        return anthropic_stream(value)
+    if path.endswith('/responses'):
+        return openai_stream(value)
+    if path.endswith('/chat/completions'):
+        return glm_stream(value)
+    return None
+
+
 class Fixture(unittest.TestCase):
     execution_args = ['--sandbox', 'bubblewrap']
     def setUp(self):
@@ -58,6 +185,8 @@ class Fixture(unittest.TestCase):
         self.paths = []
         self.retry_after = None
         self.error_body_delay = 0
+        self.stream_delay = 0
+        self.first_stream_chunk = threading.Event()
         owner = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -69,17 +198,36 @@ class Fixture(unittest.TestCase):
                 if callable(body):
                     body = body(owner.requests[-1])
                 data = body if isinstance(body, bytes) else json.dumps(body).encode()
+                stream = (status == 200 and not isinstance(body, bytes)
+                          and owner.requests[-1].get('stream') is True
+                          and streamed_body(self.path, body))
+                if stream:
+                    data = stream
                 self.send_response(status)
                 if status == 302:
                     self.send_header('Location', f'http://127.0.0.1:{owner.server.server_port}/redirected')
                 if owner.retry_after is not None:
                     self.send_header('Retry-After', owner.retry_after)
+                if stream:
+                    self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
                 if status != 200:
                     time.sleep(owner.error_body_delay)
                 try:
-                    self.wfile.write(data)
+                    if stream and owner.stream_delay:
+                        for part in data.split(b'\n\n'):
+                            if not part:
+                                continue
+                            self.wfile.write(part + b'\n\n')
+                            self.wfile.flush()
+                            owner.first_stream_chunk.set()
+                            time.sleep(owner.stream_delay)
+                    else:
+                        self.wfile.write(data)
+                        self.wfile.flush()
+                        if stream:
+                            owner.first_stream_chunk.set()
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
@@ -97,10 +245,17 @@ class Fixture(unittest.TestCase):
         self.tmp.cleanup()
 
     def env(self, provider):
-        prefix = 'OPENAI' if provider == 'openai' else 'GLM'
-        key_name = 'OPENAI_API_KEY' if provider == 'openai' else 'ZAI_API_KEY'
+        prefix = {'openai': 'OPENAI', 'glm': 'GLM', 'anthropic': 'ANTHROPIC'}[provider]
+        key_name = {'openai': 'OPENAI_API_KEY', 'glm': 'ZAI_API_KEY',
+                    'anthropic': 'ANTHROPIC_API_KEY'}[provider]
         return {'PATH': '/usr/bin:/bin', 'HOME': str(self.home), key_name: 'synthetic-key',
                 f'DANSO_{prefix}_BASE_URL': f'http://127.0.0.1:{self.server.server_port}/api'}
+
+    def streaming_env(self, provider):
+        # Opt the runtime into provider SSE ingestion (issue #98 b).
+        env = self.env(provider)
+        env['DANSO_PROVIDER_STREAM'] = '1'
+        return env
 
     def run_cli(self, provider, *extra, env=None, model='fixture'):
         return subprocess.run([str(BIN), *self.execution_args, '--cwd', str(self.repo), '--session', str(self.session),
@@ -116,6 +271,83 @@ class Fixture(unittest.TestCase):
 
 
 class Providers(Fixture):
+    def test_sse_delta_order_and_anthropic_transport(self):
+        for provider in ('anthropic', 'openai', 'glm'):
+            with self.subTest(provider=provider):
+                self.session = self.root / f'delta-{provider}.jsonl'
+                text = f'{provider}-delta-order'
+                self.responses.append((200, response(provider, text=text)))
+                p = self.run_cli(provider, '--no-tools', env=self.streaming_env(provider))
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertTrue(self.requests[-1]['stream'])
+                # Live deltas stream as frames; the FinalAnswer render is
+                # suppressed so the text is never written twice.
+                deltas, tail = [], []
+                for line in p.stdout.splitlines():
+                    if line.startswith('{"type":"danso_text_delta"'):
+                        deltas.append(json.loads(line)['text'])
+                    elif line.strip():
+                        tail.append(line)
+                self.assertTrue(deltas, p.stdout)
+                self.assertEqual(''.join(deltas), text)
+                # FinalAnswer render is suppressed: the frames carried the text.
+                self.assertEqual(tail, [])
+                self.assertEqual(
+                    self.paths[-1],
+                    {'anthropic': '/api/v1/messages', 'openai': '/api/responses',
+                     'glm': '/api/chat/completions'}[provider],
+                )
+
+    def test_incomplete_sse_fails_closed_without_journaling_or_replay(self):
+        partial = {
+            'anthropic': b'event: message_start\ndata: {"type":"message_start"}\n\n',
+            'openai': b'event: response.created\ndata: {"type":"response.created"}\n\n',
+            'glm': b'data: {"choices":[],"usage":null}\n\n',
+        }
+        for provider, body in partial.items():
+            with self.subTest(provider=provider):
+                self.session = self.root / f'incomplete-{provider}.jsonl'
+                before_requests = len(self.requests)
+                self.responses.append((200, body))
+                p = self.run_cli(provider, '--provider-retries', '3', '--no-tools',
+                                 env=self.streaming_env(provider))
+                self.assertEqual(p.returncode, 3, p.stderr)
+                self.assertNotIn('"role":"assistant"', self.session.read_text())
+                self.assertEqual(len(self.requests), before_requests + 1)
+
+    def test_mid_stream_cancellation_does_not_retry_or_journal_partial_response(self):
+        self.stream_delay = 0.1
+        for provider in ('anthropic', 'openai', 'glm'):
+            with self.subTest(provider=provider):
+                self.session = self.root / f'cancel-{provider}.jsonl'
+                before_requests = len(self.requests)
+                self.responses.append((200, response(provider, text='cancel-after-first-delta')))
+                self.first_stream_chunk.clear()
+                command = [str(BIN), *self.execution_args, '--cwd', str(self.repo), '--session', str(self.session),
+                           '--provider', provider, '--model', 'fixture', '--provider-retries', '3', '--no-tools',
+                           '-p', 'do task']
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           text=True, env=self.streaming_env(provider))
+                self.assertTrue(self.first_stream_chunk.wait(5), 'fixture did not start the SSE response')
+                process.terminate()
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 143, stderr)
+                # Any cancelled text may only ever appear inside a live
+                # delta frame — never as final output or a journal entry.
+                for line in stdout.splitlines():
+                    if 'cancel-after-first-delta' in line:
+                        self.assertIn('danso_text_delta', line)
+                self.assertNotIn('"role":"assistant"', self.session.read_text())
+                self.assertEqual(len(self.requests), before_requests + 1)
+
+    def test_anthropic_tool_stream_is_only_committed_after_completion(self):
+        self.responses.extend([(200, response('anthropic', [('write', {'path': 'anthropic-streamed', 'content': 'ok'})])),
+                               (200, response('anthropic', text='done-after-tool'))])
+        p = self.run_cli('anthropic')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual((self.repo / 'anthropic-streamed').read_text(), 'ok')
+        self.assertEqual(p.stdout.strip(), 'done-after-tool')
+
     def test_no_tools_rejects_unsolicited_side_effect_and_remains_resumable(self):
         self.responses.append((200, response('openai', actions=[('bash', {'command':'touch forbidden'})])))
         failed = self.run_cli('openai', '--no-tools')

@@ -108,16 +108,35 @@ pub enum Mode {
     Text,
 }
 
-pub struct PrintSink(pub Mode);
+pub struct PrintSink {
+    mode: Mode,
+    /// A text delta arrived since the last message boundary. When the final
+    /// answer itself was streamed, its FinalAnswer rendering is suppressed so
+    /// the text is never written twice (issue #98 b).
+    delta_since_boundary: bool,
+}
+impl PrintSink {
+    pub fn new(mode: Mode) -> Self {
+        Self {
+            mode,
+            delta_since_boundary: false,
+        }
+    }
+}
 impl EventSink for PrintSink {
     fn emit(&mut self, event: Event<'_>) -> Result<()> {
         let mut stdout = std::io::stdout().lock();
-        match (self.0, event) {
+        match (self.mode, event) {
             (
                 Mode::Json,
                 Event::Session(entry) | Event::Message(entry) | Event::Compaction(entry),
             ) => writeln!(stdout, "{entry}")?,
             (Mode::Text, Event::FinalAnswer(message)) => {
+                if self.delta_since_boundary {
+                    // The streamed deltas already carried this text.
+                    self.delta_since_boundary = false;
+                    return Ok(());
+                }
                 if let Some(blocks) = message["content"].as_array() {
                     for block in blocks {
                         if let Some(text) = block["text"].as_str() {
@@ -131,15 +150,21 @@ impl EventSink for PrintSink {
             // ignores them; the transcript frames are unchanged. The records
             // are hand-written so the key order stays stable for adapters
             // (serde_json maps serialize alphabetically).
-            (Mode::Text, Event::TextDelta(text)) => writeln!(
-                stdout,
-                "{{\"type\":\"danso_text_delta\",\"version\":1,\"text\":{}}}",
-                serde_json::to_string(text)?
-            )?,
-            (Mode::Text, Event::MessageCompleted) => writeln!(
-                stdout,
-                "{{\"type\":\"danso_message_completed\",\"version\":1}}"
-            )?,
+            (Mode::Text, Event::TextDelta(text)) => {
+                self.delta_since_boundary = true;
+                writeln!(
+                    stdout,
+                    "{{\"type\":\"danso_text_delta\",\"version\":1,\"text\":{}}}",
+                    serde_json::to_string(text)?
+                )?
+            }
+            (Mode::Text, Event::MessageCompleted) => {
+                self.delta_since_boundary = false;
+                writeln!(
+                    stdout,
+                    "{{\"type\":\"danso_message_completed\",\"version\":1}}"
+                )?
+            }
             _ => {}
         }
         stdout.flush()?;

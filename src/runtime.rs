@@ -217,6 +217,27 @@ impl<P: Provider, S: SessionStore> Provider for LongTaskProvider<'_, P, S> {
     }
 
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
+        self.complete_with(request, usage, None).await
+    }
+
+    async fn complete_streaming(
+        &mut self,
+        request: ModelRequest<'_>,
+        usage: &mut Usage,
+        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<Value> {
+        self.complete_with(request, usage, Some(on_delta)).await
+    }
+}
+
+impl<P: Provider, S: SessionStore> LongTaskProvider<'_, P, S> {
+    #[allow(clippy::type_complexity)]
+    async fn complete_with(
+        &mut self,
+        request: ModelRequest<'_>,
+        usage: &mut Usage,
+        on_delta: Option<&mut dyn FnMut(&str) -> Result<()>>,
+    ) -> Result<Value> {
         if let Some(limits) = self.ledger.limits
             && (self.ledger.requests >= limits.max_requests
                 || self.ledger.reported_tokens >= limits.max_tokens)
@@ -238,7 +259,14 @@ impl<P: Provider, S: SessionStore> Provider for LongTaskProvider<'_, P, S> {
                 armed: true,
             };
             let provider_started = Instant::now();
-            let response = self.provider.complete(request, usage).await;
+            let response = match on_delta {
+                Some(on_delta) => {
+                    self.provider
+                        .complete_streaming(request, usage, on_delta)
+                        .await
+                }
+                None => self.provider.complete(request, usage).await,
+            };
             guard.armed = false;
             // Timing receipt (issue #98 e): only action requests count as
             // provider requests; gated summary requests stay in
@@ -817,46 +845,94 @@ pub async fn run(
                 "long-task paused at a settled boundary"
             )));
         }
-        let message = if input.long_task.is_some() {
-            let mut gated = LongTaskProvider::new(
-                provider,
-                session,
-                &mut long_ledger,
-                GateMode::Action,
-                task_started,
-                task_base_elapsed_ms,
-                input.cancellation_reason,
-            );
-            gated
-                .complete(
-                    ModelRequest {
-                        system: crate::provider::SystemParts {
-                            stable: &base_system,
-                            volatile: &guidance,
-                        },
-                        messages: &messages,
-                        tools: &definitions,
-                    },
-                    usage,
-                )
-                .await
-        } else {
-            let provider_started = Instant::now();
-            let response = provider
-                .complete(
-                    ModelRequest {
-                        system: crate::provider::SystemParts {
-                            stable: &base_system,
-                            volatile: &guidance,
-                        },
-                        messages: &messages,
-                        tools: &definitions,
-                    },
-                    usage,
-                )
-                .await;
-            usage.record_provider_request(checked_elapsed_ms(provider_started));
-            response
+        // The action path defaults to whole responses: interim text reaches
+        // the sink at durable message boundaries (issue #98 a). Setting
+        // DANSO_PROVIDER_STREAM=1 opts the runtime into provider SSE
+        // ingestion (issue #98 b): deltas stream to the sink as they arrive
+        // and the boundary emits only the completion marker, so consumers
+        // never see the same text twice.
+        let provider_streaming = std::env::var("DANSO_PROVIDER_STREAM").as_deref() == Ok("1");
+        let mut streamed = false;
+        let message = {
+            let mut on_delta = |delta: &str| {
+                streamed = true;
+                sink.emit(Event::TextDelta(delta))
+            };
+            if input.long_task.is_some() {
+                let mut gated = LongTaskProvider::new(
+                    provider,
+                    session,
+                    &mut long_ledger,
+                    GateMode::Action,
+                    task_started,
+                    task_base_elapsed_ms,
+                    input.cancellation_reason,
+                );
+                if provider_streaming {
+                    gated
+                        .complete_streaming(
+                            ModelRequest {
+                                system: crate::provider::SystemParts {
+                                    stable: &base_system,
+                                    volatile: &guidance,
+                                },
+                                messages: &messages,
+                                tools: &definitions,
+                            },
+                            usage,
+                            &mut on_delta,
+                        )
+                        .await
+                } else {
+                    gated
+                        .complete(
+                            ModelRequest {
+                                system: crate::provider::SystemParts {
+                                    stable: &base_system,
+                                    volatile: &guidance,
+                                },
+                                messages: &messages,
+                                tools: &definitions,
+                            },
+                            usage,
+                        )
+                        .await
+                }
+            } else {
+                let provider_started = Instant::now();
+                let response = if provider_streaming {
+                    provider
+                        .complete_streaming(
+                            ModelRequest {
+                                system: crate::provider::SystemParts {
+                                    stable: &base_system,
+                                    volatile: &guidance,
+                                },
+                                messages: &messages,
+                                tools: &definitions,
+                            },
+                            usage,
+                            &mut on_delta,
+                        )
+                        .await
+                } else {
+                    provider
+                        .complete(
+                            ModelRequest {
+                                system: crate::provider::SystemParts {
+                                    stable: &base_system,
+                                    volatile: &guidance,
+                                },
+                                messages: &messages,
+                                tools: &definitions,
+                            },
+                            usage,
+                        )
+                        .await
+                };
+                usage.record_provider_request(checked_elapsed_ms(provider_started));
+                response
+            }
         }
         .map_err(at(Kind::Provider))?;
         let calls = (|| {
@@ -904,8 +980,15 @@ pub async fn run(
             // Interim boundary: the message is durable and the loop is about
             // to run tools, so the text can stream without attaching any
             // tool effect to partial output. The final answer keeps its own
-            // FinalAnswer event and rendering.
-            stream_assistant_text(sink, &message)?;
+            // FinalAnswer event and rendering. When the provider already
+            // streamed this text as live deltas (issue #98 b), the boundary
+            // only closes the message.
+            if streamed {
+                sink.emit(Event::MessageCompleted)
+                    .map_err(at(Kind::Output))?;
+            } else {
+                stream_assistant_text(sink, &message)?;
+            }
         }
         messages.push(message.clone());
         if input.long_task.is_some() {

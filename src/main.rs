@@ -168,7 +168,7 @@ fn main() {
     if config.long_task.is_some() {
         config.pause_requested = Some(Arc::clone(&pause_requested));
     }
-    let mut sink = ProgressSink::new(PrintSink(args.output_mode()), args.progress_jsonl)
+    let mut sink = ProgressSink::new(PrintSink::new(args.output_mode()), args.progress_jsonl)
         .with_task_progress(args.task_progress)
         .with_request_progress(args.stream_requests);
     // Startup ends where the run begins (issue #98 e).

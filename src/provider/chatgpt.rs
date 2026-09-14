@@ -73,6 +73,54 @@ impl ChatGpt {
         .await?;
         terminal_response(&data)
     }
+
+    pub async fn post_streaming(
+        &self,
+        body: &Value,
+        usage: &mut crate::usage::Usage,
+        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<Value> {
+        let (token, account) =
+            super::chatgpt_auth::access(&self.path, &self.base, self.timeout).await?;
+        ensure!(
+            account == self.account,
+            "ChatGPT account changed during run; start a new run"
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut id = reqwest::header::HeaderValue::from_str(&account)
+            .map_err(|_| anyhow::anyhow!("invalid ChatGPT account header"))?;
+        id.set_sensitive(true);
+        headers.insert("chatgpt-account-id", id);
+        headers.insert(
+            "originator",
+            reqwest::header::HeaderValue::from_static("danso"),
+        );
+        headers.insert(
+            "openai-beta",
+            reqwest::header::HeaderValue::from_static("responses=experimental"),
+        );
+        headers.insert(
+            "accept",
+            reqwest::header::HeaderValue::from_static("text/event-stream"),
+        );
+        let mut stream = super::openai::ResponsesStream::default();
+        Http::new_with_budget(
+            &self.base,
+            "responses",
+            &token,
+            self.timeout,
+            crate::provider::DEFAULT_REQUEST_BUDGET_BYTES,
+        )?
+        .post_sse(body, usage, headers, |frame| {
+            stream
+                .event(frame, on_delta)
+                .map_err(crate::failure::provider_context(
+                    crate::failure::ProviderReason::InvalidStream,
+                ))
+        })
+        .await?;
+        stream.response()
+    }
 }
 
 fn completed_prefix(data: &[u8]) -> Result<Option<usize>> {

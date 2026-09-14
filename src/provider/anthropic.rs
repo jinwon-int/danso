@@ -78,7 +78,14 @@ impl Anthropic {
         if !request.system.volatile.is_empty() {
             system_blocks.push(json!({"type":"text","text":request.system.volatile}));
         }
-        let body = json!({"model":self.model,"max_tokens":self.max_output_tokens,"system":system_blocks,"messages":provider_messages(request.messages)?,"tools":definitions});
+        let body = json!({"model":self.model,"max_tokens":self.max_output_tokens,"system":system_blocks,"messages":provider_messages(request.messages)?,"tools":definitions,"stream":true});
+        Ok(body)
+    }
+    fn non_streaming_body(&self, request: &ModelRequest<'_>) -> Result<Value> {
+        let mut body = self.body(request)?;
+        body.as_object_mut()
+            .context("invalid Anthropic request body")?
+            .remove("stream");
         Ok(body)
     }
 }
@@ -97,7 +104,7 @@ impl Provider for Anthropic {
         Ok(serde_json::to_vec(&self.body(request)?)?.len())
     }
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
-        let body = self.body(&request)?;
+        let body = self.non_streaming_body(&request)?;
         // Http enforces the provider/model request budget, the 1 MiB response
         // bound, HTTP status and credential-safe transport errors.
         let bytes = self
@@ -113,6 +120,295 @@ impl Provider for Anthropic {
         usage.add("anthropic", &response_model, tokens)?;
         assistant(&response, &response_model, &tokens)
     }
+    async fn complete_streaming(
+        &mut self,
+        request: ModelRequest<'_>,
+        usage: &mut Usage,
+        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<Value> {
+        let body = self.body(&request)?;
+        let mut stream = AnthropicStream::default();
+        self.http
+            .post_sse(&body, usage, self.headers.clone(), |frame| {
+                stream
+                    .event(frame, on_delta)
+                    .map_err(crate::failure::provider_context(
+                        crate::failure::ProviderReason::InvalidStream,
+                    ))
+            })
+            .await?;
+        let response = stream.response()?;
+        let response_model = response["model"]
+            .as_str()
+            .unwrap_or(&self.model)
+            .to_string();
+        let tokens = tokens(&response["usage"])?;
+        usage.add("anthropic", &response_model, tokens)?;
+        assistant(&response, &response_model, &tokens)
+    }
+}
+
+#[derive(Default)]
+struct AnthropicStream {
+    model: Option<String>,
+    usage: Option<Value>,
+    blocks: Vec<AnthropicBlock>,
+    stop_reason: Option<String>,
+    message_started: bool,
+    message_delta_seen: bool,
+    message_stopped: bool,
+}
+
+struct AnthropicBlock {
+    kind: &'static str,
+    text: String,
+    id: Option<String>,
+    name: Option<String>,
+    input_json: String,
+    stopped: bool,
+}
+
+impl AnthropicStream {
+    fn event(
+        &mut self,
+        frame: &[u8],
+        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<bool> {
+        let Some((event, value)) = parse_sse_frame(frame)? else {
+            return Ok(false);
+        };
+        let kind = value["type"]
+            .as_str()
+            .context("missing Anthropic SSE event type")?;
+        ensure!(
+            event.as_deref().is_none_or(|event| event == kind),
+            "Anthropic SSE event type mismatch"
+        );
+        match kind {
+            "message_start" => {
+                ensure!(!self.message_started, "duplicate Anthropic message_start");
+                let message = &value["message"];
+                ensure!(
+                    message["role"] == "assistant",
+                    "invalid Anthropic message role"
+                );
+                self.model = message["model"].as_str().map(str::to_owned);
+                ensure!(
+                    message["usage"].is_object(),
+                    "missing Anthropic start usage"
+                );
+                self.usage = Some(message["usage"].clone());
+                self.message_started = true;
+            }
+            "content_block_start" => {
+                ensure!(
+                    self.message_started,
+                    "Anthropic content before message_start"
+                );
+                let index = value["index"]
+                    .as_u64()
+                    .context("missing Anthropic block index")?;
+                ensure!(
+                    index == self.blocks.len() as u64,
+                    "out-of-order Anthropic content block"
+                );
+                let block = &value["content_block"];
+                match block["type"].as_str() {
+                    Some("text") => {
+                        let text = block["text"].as_str().unwrap_or_default().to_owned();
+                        if !text.is_empty() {
+                            on_delta(&text)?;
+                        }
+                        self.blocks.push(AnthropicBlock {
+                            kind: "text",
+                            text,
+                            id: None,
+                            name: None,
+                            input_json: String::new(),
+                            stopped: false,
+                        });
+                    }
+                    Some("tool_use") => {
+                        let id = block["id"].as_str().context("missing Anthropic tool id")?;
+                        let name = block["name"]
+                            .as_str()
+                            .context("missing Anthropic tool name")?;
+                        ensure!(block["input"].is_object(), "invalid Anthropic tool input");
+                        ensure!(
+                            block["input"]
+                                .as_object()
+                                .is_some_and(|input| input.is_empty()),
+                            "nonempty Anthropic initial tool input"
+                        );
+                        self.blocks.push(AnthropicBlock {
+                            kind: "tool_use",
+                            text: String::new(),
+                            id: Some(id.to_owned()),
+                            name: Some(name.to_owned()),
+                            input_json: String::new(),
+                            stopped: false,
+                        });
+                    }
+                    _ => {
+                        return Err(crate::failure::provider_error(
+                            crate::failure::ProviderReason::UnsupportedStreamEvent,
+                        ));
+                    }
+                }
+            }
+            "content_block_delta" => {
+                let index = value["index"]
+                    .as_u64()
+                    .context("missing Anthropic block index")?;
+                let block = self
+                    .blocks
+                    .get_mut(usize::try_from(index).context("invalid Anthropic block index")?)
+                    .context("Anthropic delta for unknown block")?;
+                ensure!(!block.stopped, "Anthropic delta after block stop");
+                let delta = &value["delta"];
+                match delta["type"].as_str() {
+                    Some("text_delta") => {
+                        ensure!(block.kind == "text", "Anthropic text delta for tool block");
+                        let text = delta["text"]
+                            .as_str()
+                            .context("missing Anthropic text delta")?;
+                        if !text.is_empty() {
+                            on_delta(text)?;
+                        }
+                        block.text.push_str(text);
+                    }
+                    Some("input_json_delta") => {
+                        ensure!(
+                            block.kind == "tool_use",
+                            "Anthropic input delta for text block"
+                        );
+                        block.input_json.push_str(
+                            delta["partial_json"]
+                                .as_str()
+                                .context("missing Anthropic input delta")?,
+                        );
+                    }
+                    _ => {
+                        return Err(crate::failure::provider_error(
+                            crate::failure::ProviderReason::UnsupportedStreamEvent,
+                        ));
+                    }
+                }
+            }
+            "content_block_stop" => {
+                let index = value["index"]
+                    .as_u64()
+                    .context("missing Anthropic block index")?;
+                let block = self
+                    .blocks
+                    .get_mut(usize::try_from(index).context("invalid Anthropic block index")?)
+                    .context("Anthropic stop for unknown block")?;
+                ensure!(!block.stopped, "duplicate Anthropic block stop");
+                block.stopped = true;
+            }
+            "message_delta" => {
+                ensure!(self.message_started, "Anthropic delta before message_start");
+                ensure!(
+                    !self.message_delta_seen,
+                    "duplicate Anthropic message_delta"
+                );
+                self.stop_reason = Some(
+                    value["delta"]["stop_reason"]
+                        .as_str()
+                        .context("missing Anthropic stop reason")?
+                        .to_owned(),
+                );
+                let output = value["usage"]["output_tokens"]
+                    .as_u64()
+                    .context("missing Anthropic output usage")?;
+                self.usage
+                    .as_mut()
+                    .context("missing Anthropic start usage")?["output_tokens"] = json!(output);
+                self.message_delta_seen = true;
+            }
+            "message_stop" => {
+                ensure!(self.message_started, "Anthropic stop before message_start");
+                ensure!(!self.message_stopped, "duplicate Anthropic message_stop");
+                ensure!(
+                    self.message_delta_seen,
+                    "Anthropic stop without message_delta"
+                );
+                ensure!(
+                    self.blocks.iter().all(|block| block.stopped),
+                    "Anthropic block did not stop"
+                );
+                self.message_stopped = true;
+                return Ok(true);
+            }
+            "ping" => {}
+            "error" => {
+                return Err(crate::failure::provider_error(
+                    crate::failure::ProviderReason::ResponseError,
+                ));
+            }
+            _ => {
+                return Err(crate::failure::provider_error(
+                    crate::failure::ProviderReason::UnsupportedStreamEvent,
+                ));
+            }
+        }
+        Ok(false)
+    }
+
+    fn response(&self) -> Result<Value> {
+        ensure!(self.message_stopped, "incomplete Anthropic stream");
+        let mut content = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            match block.kind {
+                "text" => content.push(json!({"type":"text", "text":block.text})),
+                "tool_use" => {
+                    let input = if block.input_json.is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_str(&block.input_json)
+                            .context("invalid Anthropic streamed tool input")?
+                    };
+                    ensure!(
+                        input.is_object(),
+                        "Anthropic streamed tool input is not an object"
+                    );
+                    content.push(
+                        json!({"type":"tool_use","id":block.id,"name":block.name,"input":input}),
+                    );
+                }
+                _ => unreachable!("validated Anthropic block kind"),
+            }
+        }
+        Ok(json!({
+            "model": self.model.as_deref().unwrap_or(""),
+            "content": content,
+            "stop_reason": self.stop_reason,
+            "usage": self.usage.clone().context("missing Anthropic usage")?
+        }))
+    }
+}
+
+fn parse_sse_frame(frame: &[u8]) -> Result<Option<(Option<String>, Value)>> {
+    let text = std::str::from_utf8(frame).context("invalid Anthropic SSE encoding")?;
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.trim_end_matches('\n');
+    let mut event = None;
+    let mut data = Vec::new();
+    for line in normalized.lines() {
+        if let Some(value) = line.strip_prefix("event:") {
+            ensure!(event.is_none(), "duplicate Anthropic SSE event field");
+            event = Some(value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.strip_prefix(' ').unwrap_or(value));
+        } else if !line.is_empty() && !line.starts_with(':') {
+            bail!("unsupported Anthropic SSE field");
+        }
+    }
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let value = serde_json::from_str(&data.join("\n")).context("invalid Anthropic SSE JSON")?;
+    Ok(Some((event, value)))
 }
 
 fn provider_messages(messages: &[Value]) -> Result<Vec<Value>> {

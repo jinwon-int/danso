@@ -346,6 +346,17 @@ pub trait Provider {
         0
     }
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value>;
+    /// Complete a request while forwarding validated text deltas to the
+    /// caller. Deltas are notifications only: the returned value remains the
+    /// sole message eligible for persistence and tool dispatch.
+    async fn complete_streaming(
+        &mut self,
+        request: ModelRequest<'_>,
+        usage: &mut Usage,
+        _on_delta: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<Value> {
+        self.complete(request, usage).await
+    }
 }
 
 /// Runtime selection without introducing provider-specific branches in the loop.
@@ -388,6 +399,18 @@ impl Provider for Selected {
             Self::Anthropic(p) => p.complete(request, usage).await,
             Self::OpenAi(p) => p.complete(request, usage).await,
             Self::Glm(p) => p.complete(request, usage).await,
+        }
+    }
+    async fn complete_streaming(
+        &mut self,
+        request: ModelRequest<'_>,
+        usage: &mut Usage,
+        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<Value> {
+        match self {
+            Self::Anthropic(p) => p.complete_streaming(request, usage, on_delta).await,
+            Self::OpenAi(p) => p.complete_streaming(request, usage, on_delta).await,
+            Self::Glm(p) => p.complete_streaming(request, usage, on_delta).await,
         }
     }
 }
