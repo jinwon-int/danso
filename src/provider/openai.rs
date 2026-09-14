@@ -11,6 +11,7 @@ pub struct OpenAi {
     model: String,
     effort: Option<String>,
     max_output_tokens: u32,
+    request_budget_bytes: usize,
 }
 impl OpenAi {
     pub fn new(model: String, key: String, base: &str, effort: Option<String>) -> Result<Self> {
@@ -32,12 +33,20 @@ impl OpenAi {
         max_output_tokens: u32,
         timeout_seconds: u64,
     ) -> Result<Self> {
+        let request_budget_bytes = super::effective_request_budget("openai", &model);
         Ok(Self {
-            http: Some(Http::new(base, "responses", &key, timeout_seconds)?),
+            http: Some(Http::new_with_budget(
+                base,
+                "responses",
+                &key,
+                timeout_seconds,
+                request_budget_bytes,
+            )?),
             chatgpt: None,
             model,
             effort,
             max_output_tokens,
+            request_budget_bytes,
         })
     }
     pub fn new_chatgpt(
@@ -47,16 +56,19 @@ impl OpenAi {
         effort: Option<String>,
         timeout_seconds: u64,
     ) -> Result<Self> {
+        let request_budget_bytes = super::effective_request_budget("openai-codex", &model);
         Ok(Self {
             http: None,
             chatgpt: Some(super::chatgpt::ChatGpt::new(
                 auth_file,
                 base,
                 timeout_seconds,
+                request_budget_bytes,
             )?),
             model,
             effort,
             max_output_tokens: super::MAX_OUTPUT_TOKENS_DEFAULT,
+            request_budget_bytes,
         })
     }
     /// Bounded wire-retry budget (issue #67 B); 0 disables. The ChatGPT
@@ -95,6 +107,10 @@ impl OpenAi {
     }
 }
 impl Provider for OpenAi {
+    fn request_budget_bytes(&self) -> usize {
+        self.request_budget_bytes
+    }
+
     fn max_output_tokens(&self) -> u32 {
         self.max_output_tokens
     }
@@ -486,6 +502,7 @@ mod image_admission_tests {
             model: "synthetic-model".into(),
             effort: None,
             max_output_tokens: crate::provider::MAX_OUTPUT_TOKENS_DEFAULT,
+            request_budget_bytes: crate::provider::DEFAULT_REQUEST_BUDGET_BYTES,
         };
         let secret = "PRIVATE_SYNTHETIC_IMAGE_DO_NOT_ECHO";
         for role in ["user", "toolResult", "assistant"] {

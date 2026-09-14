@@ -251,9 +251,9 @@ class Fixture(unittest.TestCase):
         return {'PATH': '/usr/bin:/bin', 'HOME': str(self.home), key_name: 'synthetic-key',
                 f'DANSO_{prefix}_BASE_URL': f'http://127.0.0.1:{self.server.server_port}/api'}
 
-    def run_cli(self, provider, *extra, env=None):
+    def run_cli(self, provider, *extra, env=None, model='fixture'):
         return subprocess.run([str(BIN), *self.execution_args, '--cwd', str(self.repo), '--session', str(self.session),
-                               '--provider', provider, '--model', 'fixture', *extra, '-p', 'do task'],
+                               '--provider', provider, '--model', model, *extra, '-p', 'do task'],
                               capture_output=True, text=True, timeout=15, env=env or self.env(provider))
 
     def usage(self, p):
@@ -454,17 +454,26 @@ class Providers(Fixture):
             # Clear captures before next provider's config checks.
             self.requests.clear()
 
-    def test_request_cap_and_unresolved_recovery_before_dispatch(self):
+    def test_derived_request_budget_and_unresolved_recovery_before_dispatch(self):
         for provider in ('openai', 'glm'):
             self.session = self.root / f'large-{provider}.jsonl'
-            self.responses.append((200, response(provider, text='x' * (530 * 1024))))
-            p = self.run_cli(provider)
+            model = 'gpt-5.6-luna' if provider == 'openai' else 'glm-5.3-flash'
+            size = 530 * 1024 if provider == 'openai' else 480 * 1024
+            self.responses.extend([
+                (200, response(provider, text='x' * size)),
+                (200, response(provider, text='within derived budget')),
+            ])
+            p = self.run_cli(provider, model=model)
             self.assertEqual(p.returncode, 0, p.stderr)
             count = len(self.requests)
-            p = self.run_cli(provider)
-            self.assertEqual(p.returncode, 2, p.stderr)
-            self.assertIn('512 KiB', p.stderr)
-            self.assertEqual(len(self.requests), count)
+            p = self.run_cli(provider, model=model)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(len(self.requests), count + 1)
+            if provider == 'openai':
+                self.assertGreater(
+                    len(json.dumps(self.requests[-1], separators=(',', ':')).encode()),
+                    512 * 1024,
+                )
             self.session = self.root / f'unresolved-{provider}.jsonl'
             self.responses.append((200, response(provider)))
             p = self.run_cli(provider)

@@ -5,7 +5,7 @@ use cli::Args;
 use danso::{
     app,
     failure::{self, Kind},
-    output::{PrintSink, ProgressSink, report_budget, report_usage},
+    output::{PrintSink, ProgressSink, report_budget, report_timing, report_usage},
     tools,
     usage::Usage,
 };
@@ -32,6 +32,9 @@ async fn interrupted(reason: &AtomicU8) -> i32 {
 // The tool worker must not initialize Tokio: RLIMIT_AS intentionally leaves
 // room for a shell, not a multithreaded async runtime with many thread stacks.
 fn main() {
+    // Body-free timing receipt (issue #98 e): startup is measured from
+    // process start until the run begins.
+    let process_started = std::time::Instant::now();
     // The memory subcommand is synchronous and provider-free; it short-circuits
     // before the async runtime is touched (issue #52 M1).
     if std::env::args().nth(1).as_deref() == Some("memory") {
@@ -168,6 +171,13 @@ fn main() {
     let mut sink = ProgressSink::new(PrintSink::new(args.output_mode()), args.progress_jsonl)
         .with_task_progress(args.task_progress)
         .with_request_progress(args.stream_requests);
+    // Startup ends where the run begins (issue #98 e).
+    usage.record_startup(
+        process_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
     let code = runtime.block_on(async {
         let pause_listener = if config.long_task.is_some() {
             use tokio::signal::unix::{SignalKind, signal};
@@ -228,5 +238,6 @@ fn main() {
     });
     report_usage(&usage);
     report_budget(&config, &usage);
+    report_timing(&usage);
     std::process::exit(code);
 }

@@ -52,19 +52,49 @@ GLM `thinking` body field.
 
 | Profile | Recommended invocation | Notes |
 | --- | --- | --- |
-| `glm-5.3-flash` | `scripts/danso-glm` (≡ `--provider glm --model glm-5.3-flash --glm-endpoint coding --reasoning-effort low --max-turns 48 --compact-at-bytes 131072 --provider-timeout-seconds 120`) | Fast lane used for the 2026-09-06 compaction measurement (docs/compaction.md). Apply `--repeat-limit 3` when it repeats identical reads. |
+| `glm-5.3-flash` | `scripts/danso-glm` (≡ `--provider glm --model glm-5.3-flash --glm-endpoint coding --reasoning-effort low --max-turns 48 --provider-timeout-seconds 120`) | Fast lane; the native provider/model compaction default is used unless an explicit threshold is supplied. Apply `--repeat-limit 3` when it repeats identical reads. |
 | `glm-5.3` | `--provider glm --model glm-5.3 --glm-endpoint general --reasoning-effort medium` | Thinking-enabled default profile. |
 
-Context window and maximum output tokens are model/service claims that Danso
-does not verify: out-of-range output caps surface as the provider's own 400
-without automatic adjustment (issue #69 A). Confirm current values against
-Z.AI's model documentation before sizing requests; the 2026-09-09 measurement
-environment could not reach docs.z.ai to pin them here. The coding-plan quota
-windows (5h/weekly) are operator-managed upstream. A 429 is retryable under
-the bounded wire retry (issue #67 B); once retries are exhausted the run ends
-with exit code 3 and the `DANSO_PROVIDER http_status=429` record is available
-to the bridge for quota bookkeeping. Pass `--provider-retries 0` where a
-single attempt is preferred.
+## Provider/model request budgets
+
+The native adapters select an operational token estimate before building their
+HTTP transport. The request budget is `floor(context_tokens × 70%) ×
+bytes_per_token`; the default compaction threshold is that budget minus 32 KiB.
+The table is intentionally an estimate rather than a provider guarantee. Exact
+serialized request bytes, including JSON escaping and provider fields, remain
+the final admission check.
+
+| Provider | Model prefix | Context estimate | Bytes/token | Request budget | Default compaction threshold |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `anthropic` | `claude-opus-4*`, `claude-sonnet-4*`, `claude-3-7-sonnet*`, `claude-3-5-sonnet*` | 200,000 | 4 | 560,000 | 527,232 |
+| `anthropic` | other models | 128,000 | 4 | 358,400 | 325,632 |
+| `openai` | `gpt-4.1*` | 1,000,000 | 4 | 2,800,000 | 2,767,232 |
+| `openai` | `gpt-5*` | 400,000 | 4 | 1,120,000 | 1,087,232 |
+| `openai` | `o3*`, `o4-mini*` | 200,000 | 4 | 560,000 | 527,232 |
+| `openai` | `gpt-4o*` or other models | 128,000 | 4 | 358,400 | 325,632 |
+| `openai-codex` | `gpt-5*` | 400,000 | 4 | 1,120,000 | 1,087,232 |
+| `openai-codex` | `o3*`, `o4-mini*` | 200,000 | 4 | 560,000 | 527,232 |
+| `openai-codex` | other models | 128,000 | 4 | 358,400 | 325,632 |
+| `glm` | `glm-5.3-flash*`, `glm-5.3*` | 200,000 | 4 | 560,000 | 527,232 |
+| `glm` | `glm-4.5*` | 131,072 | 4 | 367,000 | 334,232 |
+| `glm` | other models | 128,000 | 4 | 358,400 | 325,632 |
+
+The 32 KiB reservation is the existing `MANAGED_BLOCK_MAX_BYTES` cap for one
+fully rendered memory snapshot. The former 131,072-byte CCC default was a fixed
+four-times-32-KiB heuristic, not a model context measurement; recomputing the
+reservation from each selected budget keeps the snapshot injectable without
+forcing every model down to roughly 32 KiB of context. An explicit
+`--compact-at-bytes` value may lower the threshold, but cannot exceed the
+provider/model budget after this reservation.
+
+Context-window and maximum-output values are service claims that Danso does not
+verify: out-of-range output caps surface as the provider's own 400 without
+automatic adjustment (issue #69 A). Update the operational table when provider
+documentation changes. The coding-plan quota windows (5h/weekly) are
+operator-managed upstream. A 429 is retryable under the bounded wire retry
+(issue #67 B); once retries are exhausted the run ends with exit code 3 and the
+`DANSO_PROVIDER http_status=429` record is available to the bridge for quota
+bookkeeping. Pass `--provider-retries 0` where a single attempt is preferred.
 
 `scripts/danso-glm` execs danso with the flash profile above; `ZAI_API_KEY`
 must exist in the environment and `DANSO_GLM_MODEL` optionally swaps the
@@ -113,10 +143,11 @@ model. Extra arguments are forwarded, so a later `--model` in argv wins.
   and keeps `totalTokens` free of double counting. Per-response and cumulative
   arithmetic are checked; overflow fails without changing the last valid summary. Cost remains unknown (zero
   solely for Piri schema compatibility).
-- Requests are capped at 512 KiB, responses at 1 MiB, and HTTP transport at 180s by default.
-  The CLI run/turn/tool limits still apply. Large reasoning histories can reach
-  the byte cap; opt-in [context compaction](compaction.md) can summarize portable evidence
-  and start a fresh provider reasoning context while preserving the journal.
+- The serialized request is hard-capped at the selected provider/model budget
+  above, responses remain capped at 1 MiB, and HTTP transport is 180s by
+  default. With no override, [context compaction](compaction.md) starts at the
+  derived threshold and preserves the journal while starting a fresh provider
+  reasoning context. The CLI run/turn/tool limits still apply.
 
 ## Offline verification
 

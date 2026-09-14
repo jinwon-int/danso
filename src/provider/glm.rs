@@ -75,6 +75,7 @@ pub struct Glm {
     effort: Option<String>,
     max_output_tokens: u32,
     thinking: bool,
+    request_budget_bytes: usize,
 }
 impl Glm {
     pub fn new(model: String, key: String, base: &str, effort: Option<String>) -> Result<Self> {
@@ -98,7 +99,14 @@ impl Glm {
         thinking: bool,
         timeout_seconds: u64,
     ) -> Result<Self> {
-        let mut http = Http::new(base, "chat/completions", &key, timeout_seconds)?;
+        let request_budget_bytes = super::effective_request_budget("glm", &model);
+        let mut http = Http::new_with_budget(
+            base,
+            "chat/completions",
+            &key,
+            timeout_seconds,
+            request_budget_bytes,
+        )?;
         http.enable_zai_diagnostics();
         Ok(Self {
             http,
@@ -106,6 +114,7 @@ impl Glm {
             effort,
             max_output_tokens,
             thinking,
+            request_budget_bytes,
         })
     }
     /// Bounded wire-retry budget (issue #67 B); 0 disables.
@@ -140,6 +149,10 @@ impl Glm {
     }
 }
 impl Provider for Glm {
+    fn request_budget_bytes(&self) -> usize {
+        self.request_budget_bytes
+    }
+
     fn max_output_tokens(&self) -> u32 {
         self.max_output_tokens
     }

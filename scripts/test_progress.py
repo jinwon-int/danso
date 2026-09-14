@@ -143,6 +143,52 @@ class Progress(unittest.TestCase):
         p = self.run_cli('-p', '--progress-jsonl')
         self.assertEqual(p.returncode, 2)
 
+    def test_request_frames_carry_body_free_elapsed_ms(self):
+        # Issue #98 e: every per-request danso_request frame carries the
+        # run-clock dispatch stamp; counts only, never bodies or paths.
+        self.tool('bash', {'command': 'printf ok'})
+        p = self.run_cli('--progress-jsonl', '--stream-requests')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        frames = [json.loads(l) for l in p.stdout.splitlines()
+                  if l.startswith('{') and '"danso_request"' in l]
+        self.assertEqual([f['sequence'] for f in frames], [1, 2])
+        elapsed = [f['elapsed_ms'] for f in frames]
+        self.assertTrue(all(isinstance(v, int) and v >= 0 for v in elapsed), elapsed)
+        self.assertEqual(elapsed, sorted(elapsed), 'run clock never moves back')
+
+    def test_timing_line_emitted_once_with_exact_keys(self):
+        self.tool('bash', {'command': 'printf ok'})
+        p = self.run_cli('--progress-jsonl')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        lines = [l for l in p.stderr.splitlines() if l.startswith('DANSO_TIMING=')]
+        self.assertEqual(len(lines), 1, p.stderr)
+        record = json.loads(lines[0].split('=', 1)[1])
+        self.assertEqual(list(record), ['version', 'provider_ms', 'provider_requests',
+                                        'retry_wait_ms', 'tool_ms', 'tool_calls',
+                                        'journal_ms', 'summary_requests', 'startup_ms'])
+        self.assertEqual(record['version'], 1)
+        self.assertEqual(record['provider_requests'], 2)
+        self.assertEqual(record['tool_calls'], 1)
+        self.assertEqual(record['retry_wait_ms'], 0)
+        self.assertEqual(record['summary_requests'], 0)
+        for key in ('provider_ms', 'tool_ms', 'journal_ms', 'startup_ms'):
+            self.assertIsInstance(record[key], int)
+            self.assertGreaterEqual(record[key], 0)
+
+    def test_timing_surfaces_bounded_retry_backoff_wait(self):
+        # Issue #98 e: the 429 backoff slept by the wire retry layer shows up
+        # as retry_wait_ms; the retried request is still one provider request.
+        self.responses.append((429, {'error': 'synthetic-rate-limit'}))
+        self.final()
+        p = self.run_cli('-p')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.requests), 2)
+        lines = [l for l in p.stderr.splitlines() if l.startswith('DANSO_TIMING=')]
+        self.assertEqual(len(lines), 1, p.stderr)
+        record = json.loads(lines[0].split('=', 1)[1])
+        self.assertGreaterEqual(record['retry_wait_ms'], 500)
+        self.assertEqual(record['provider_requests'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,4 +1,4 @@
-"""Opt-in ccc-node AgentRuntime adapter for bounded Danso tasks."""
+"""ccc-node AgentRuntime adapter for bounded Danso tasks."""
 import asyncio
 from dataclasses import dataclass
 import json
@@ -15,6 +15,12 @@ from telegram_bot.core.agent_runtime import (
 )
 
 CAP = 1024 * 1024
+# Keep this bridge-side validation aligned with the native provider table's
+# largest 70%-of-context request budget. The native runtime remains the
+# authority for the selected provider/model; this only admits explicit values.
+REQUEST_BUDGET_MAX_BYTES = 1_000_000 * 70 // 100 * 4
+COMPACTION_MIN_BYTES = 8192
+COMPACTION_MAX_BYTES = REQUEST_BUDGET_MAX_BYTES - 32 * 1024
 # A checkpoint may be emitted at stage start and after each request, with a
 # terminal record as well.  Keep a finite margin above the native 1024-request
 # cumulative limit without buffering arbitrary stderr.
@@ -295,7 +301,7 @@ def _transport(text, category, code):
                 or type(diagnostic['elapsed_ms']) is not int
                 or not 0 <= diagnostic['elapsed_ms'] <= 2**64 - 1
                 or type(diagnostic['request_bytes']) is not int
-                or not 0 <= diagnostic['request_bytes'] <= 512 * 1024
+                or not 0 <= diagnostic['request_bytes'] <= REQUEST_BUDGET_MAX_BYTES
                 or type(diagnostic['attempts']) is not int
                 or not 1 <= diagnostic['attempts'] <= 8):
             raise ValueError('invalid transport diagnostic')
@@ -453,7 +459,7 @@ class DansoRuntime:
         if task_pause_after_stage is not None and task_pause_after_stage > task_max_requests:
             raise ValueError('invalid task pause point')
         if compact_at_bytes is not None and (type(compact_at_bytes) is not int
-                or not 8192 <= compact_at_bytes <= 393216):
+                or not COMPACTION_MIN_BYTES <= compact_at_bytes <= COMPACTION_MAX_BYTES):
             raise ValueError('invalid compaction threshold')
         if sandbox not in {"host", "bubblewrap"}:
             raise ValueError("invalid execution backend")
