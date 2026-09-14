@@ -8,19 +8,38 @@ pub struct Http {
     url: reqwest::Url,
     header: reqwest::header::HeaderName,
     key: reqwest::header::HeaderValue,
+    request_budget_bytes: usize,
     retries: u32,
     zai_diagnostics: bool,
 }
 impl Http {
     /// Bearer-authenticated transport (OpenAI, GLM).
     pub fn new(base: &str, suffix: &str, key: &str, timeout_seconds: u64) -> Result<Self> {
-        Self::with_auth(
+        Self::new_with_budget(
+            base,
+            suffix,
+            key,
+            timeout_seconds,
+            super::DEFAULT_REQUEST_BUDGET_BYTES,
+        )
+    }
+    /// Bearer-authenticated transport with a provider/model-derived request
+    /// budget.
+    pub fn new_with_budget(
+        base: &str,
+        suffix: &str,
+        key: &str,
+        timeout_seconds: u64,
+        request_budget_bytes: usize,
+    ) -> Result<Self> {
+        Self::with_auth_with_budget(
             base,
             suffix,
             reqwest::header::AUTHORIZATION,
             &format!("Bearer {key}"),
             key,
             timeout_seconds,
+            request_budget_bytes,
         )
     }
     /// Transport for providers that authenticate with a non-Bearer header
@@ -34,11 +53,32 @@ impl Http {
         key: &str,
         timeout_seconds: u64,
     ) -> Result<Self> {
+        Self::with_auth_with_budget(
+            base,
+            suffix,
+            header,
+            header_value,
+            key,
+            timeout_seconds,
+            super::DEFAULT_REQUEST_BUDGET_BYTES,
+        )
+    }
+    /// Header-authenticated transport with a provider/model-derived request
+    /// budget.
+    pub fn with_auth_with_budget(
+        base: &str,
+        suffix: &str,
+        header: reqwest::header::HeaderName,
+        header_value: &str,
+        key: &str,
+        timeout_seconds: u64,
+        request_budget_bytes: usize,
+    ) -> Result<Self> {
         ensure!(
             (1..=300).contains(&timeout_seconds),
             "invalid provider timeout"
         );
-        Self::with_timeouts(
+        Self::with_timeouts_with_budget(
             base,
             suffix,
             header,
@@ -46,6 +86,7 @@ impl Http {
             key,
             Duration::from_secs(timeout_seconds),
             Duration::from_secs(10),
+            request_budget_bytes,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -58,6 +99,29 @@ impl Http {
         request_timeout: Duration,
         connect_timeout: Duration,
     ) -> Result<Self> {
+        Self::with_timeouts_with_budget(
+            base,
+            suffix,
+            header,
+            header_value,
+            key,
+            request_timeout,
+            connect_timeout,
+            super::DEFAULT_REQUEST_BUDGET_BYTES,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn with_timeouts_with_budget(
+        base: &str,
+        suffix: &str,
+        header: reqwest::header::HeaderName,
+        header_value: &str,
+        key: &str,
+        request_timeout: Duration,
+        connect_timeout: Duration,
+        request_budget_bytes: usize,
+    ) -> Result<Self> {
+        ensure!(request_budget_bytes > 0, "invalid provider request budget");
         ensure!(!key.trim().is_empty(), "provider API key is empty");
         let mut url =
             reqwest::Url::parse(base).map_err(|_| anyhow::anyhow!("invalid provider base URL"))?;
@@ -89,6 +153,7 @@ impl Http {
             url,
             header,
             key,
+            request_budget_bytes,
             retries: 0,
             zai_diagnostics: false,
         })
@@ -129,8 +194,9 @@ impl Http {
     ) -> Result<Vec<u8>> {
         let bytes = serde_json::to_vec(body)?;
         ensure!(
-            bytes.len() <= 512 * 1024,
-            "request context exceeds 512 KiB; start a new session"
+            bytes.len() <= self.request_budget_bytes,
+            "request context exceeds provider/model request budget of {} bytes; start a new session",
+            self.request_budget_bytes
         );
         let request_bytes = bytes.len();
         // Bounded retries (issue #67 B): only before any effect — connect /
@@ -395,6 +461,32 @@ mod tests {
         );
         let rendered = error.to_string();
         assert!(!rendered.contains("PRIVATE") && !rendered.contains(&base));
+    }
+
+    #[tokio::test]
+    async fn request_budget_is_enforced_before_dispatch() {
+        let client = Http::with_timeouts_with_budget(
+            "http://127.0.0.1:1",
+            "test",
+            reqwest::header::AUTHORIZATION,
+            "Bearer PRIVATE_KEY_MARKER",
+            "PRIVATE_KEY_MARKER",
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            32,
+        )
+        .unwrap();
+        let mut usage = crate::usage::Usage::default();
+        let error = client
+            .post(
+                &serde_json::json!({"content":"request is larger than this budget"}),
+                &mut usage,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider/model request budget of 32 bytes"));
+        assert!(!usage.attempted);
     }
 }
 

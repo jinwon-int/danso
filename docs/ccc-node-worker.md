@@ -119,13 +119,15 @@ show a new-chat (`/new`) option for uncertain work without auto-resuming,
 resetting, or acknowledging the old journal. This native change alone does not
 claim to fix the deployed Telegram message.
 
-## Optional compaction
+## Compaction
 
-Set `compact_at_bytes=16384` on `DansoRuntime` to opt in to native checkpoint
-compaction (integer range 8192..393216). The default `None` retains the normal
-uncompressed request limit. Summary requests share the same request/turn budget,
-provider timeout and whole-run deadline. Invalid summaries remain failures; the
-adapter does not repair journals or retry failed turns.
+Set `compact_at_bytes=16384` on `DansoRuntime` to use an explicit low native
+checkpoint threshold (integer range 8192..2767232; the selected provider/model
+may impose a lower upper bound). The default `None` delegates to the native
+provider/model-derived threshold, including its 32 KiB memory-snapshot
+headroom. Summary requests share the same request/turn budget, provider timeout
+and whole-run deadline. Invalid summaries remain failures; the adapter does not
+repair journals or retry failed turns.
 
 Resume the saved adapter UUID with a new runtime/session object and the desired
 threshold. Native Danso reads the stored checkpoint and keeps completed tool IDs

@@ -4,6 +4,7 @@ use crate::{
     contracts::{EventSink, SessionStore},
     failure::{Kind, at},
     memory,
+    provider::Provider,
     runtime::{self, RunInput},
     session::Session,
     tools,
@@ -68,6 +69,8 @@ pub struct RunConfig {
     pub report_progress: bool,
     /// Short-mode identical-batch guard (issue #70 D); 0 disables.
     pub repeat_limit: u32,
+    /// Explicit compaction override; `None` uses the selected provider/model
+    /// budget minus the managed memory-snapshot headroom.
     pub compact_at_bytes: Option<usize>,
     pub timeout_seconds: u64,
     pub provider_timeout_seconds: u64,
@@ -422,6 +425,15 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         args.glm_thinking.as_deref(),
         args.glm_endpoint.as_deref(),
     )?;
+    // A missing CLI threshold follows the selected provider/model rather than
+    // a process-wide byte constant. Reserve one maximum managed snapshot so
+    // refreshed memory still fits after compaction.
+    let compact_at_bytes = Some(
+        args.compact_at_bytes
+            .unwrap_or_else(|| {
+                crate::compaction::default_threshold(provider.request_budget_bytes())
+            }),
+    );
     provider.set_retries(args.provider_retries);
     let limits =
         tools::resource_limits(args.backend, Duration::from_secs(args.tool_timeout_seconds));
@@ -503,7 +515,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
                 context: &ctx.prompt,
                 execution_context: &execution_context,
                 max_turns: args.max_turns,
-                compact_at_bytes: args.compact_at_bytes,
+                compact_at_bytes,
                 refresh_context: refresh_context.as_deref(),
                 long_task,
                 repeat_limit: args.repeat_limit,

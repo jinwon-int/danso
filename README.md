@@ -63,10 +63,11 @@ runs retain their short defaults. Use `--task-status` for a provider-free
 read-only status projection and `--task-progress` for body-free checkpoint
 notifications. See [the v0 long-task contract](docs/v0.md#optional-long-task-mode).
 
-Context compaction remains separately opt-in with `--compact-at-bytes 196608`.
-Compacted sessions retain the original journal and resume without replaying
-completed tools. See [compaction and recovery](docs/compaction.md) for limits,
-summary semantics and the offline/live stress workflow.
+Context compaction defaults to the selected provider/model request budget minus
+32 KiB of memory-snapshot headroom; use `--compact-at-bytes` for an explicit
+lower threshold. Compacted sessions retain the original journal and resume
+without replaying completed tools. See [compaction and recovery](docs/compaction.md)
+for limits, summary semantics and the offline/live stress workflow.
 
 ## Extending Danso
 

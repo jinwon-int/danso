@@ -19,6 +19,194 @@ use crate::{contracts::ToolDefinition, usage::Usage};
 use anyhow::Result;
 use serde_json::Value;
 
+/// Operational token-to-byte estimates used to size serialized requests.
+/// Provider context windows are service claims; this table is deliberately
+/// conservative and is updated independently of wire-format code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelTokenEstimate {
+    pub provider: &'static str,
+    /// A model prefix, or `*` for that provider's fallback.
+    pub model_prefix: &'static str,
+    pub context_window_tokens: usize,
+    pub bytes_per_token: usize,
+}
+
+/// Portion of the advertised context window reserved for the serialized
+/// request. The remainder covers output, provider framing and estimation
+/// error; the exact byte count remains the final admission check.
+pub const REQUEST_BUDGET_PERCENT: usize = 70;
+pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
+pub const DEFAULT_BYTES_PER_TOKEN: usize = 4;
+pub const MAX_CONTEXT_WINDOW_TOKENS: usize = 1_000_000;
+
+/// Convert an estimated context window into a conservative serialized-request
+/// budget. The token estimate is floored before converting to bytes.
+pub const fn request_budget_for_context(
+    context_window_tokens: usize,
+    bytes_per_token: usize,
+) -> usize {
+    let token_budget = context_window_tokens
+        .saturating_mul(REQUEST_BUDGET_PERCENT)
+        / 100;
+    token_budget.saturating_mul(bytes_per_token)
+}
+
+pub const DEFAULT_REQUEST_BUDGET_BYTES: usize =
+    request_budget_for_context(DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_BYTES_PER_TOKEN);
+/// The largest budget represented by the table; compaction reserves its
+/// managed-memory headroom below this value.
+pub const MAX_REQUEST_BUDGET_BYTES: usize =
+    request_budget_for_context(MAX_CONTEXT_WINDOW_TOKENS, DEFAULT_BYTES_PER_TOKEN);
+
+/// Model/service estimates used by the native adapters. Specific prefixes must
+/// precede provider fallbacks. `openai-codex` is separate because the
+/// subscription transport has its own provider identity in usage records.
+pub const MODEL_TOKEN_ESTIMATES: &[ModelTokenEstimate] = &[
+    ModelTokenEstimate {
+        provider: "anthropic",
+        model_prefix: "claude-opus-4",
+        context_window_tokens: 200_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "anthropic",
+        model_prefix: "claude-sonnet-4",
+        context_window_tokens: 200_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "anthropic",
+        model_prefix: "claude-3-7-sonnet",
+        context_window_tokens: 200_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "anthropic",
+        model_prefix: "claude-3-5-sonnet",
+        context_window_tokens: 200_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "anthropic",
+        model_prefix: "*",
+        context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+        bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+    },
+    ModelTokenEstimate {
+        provider: "openai",
+        model_prefix: "gpt-4.1",
+        context_window_tokens: 1_000_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "openai",
+        model_prefix: "gpt-5",
+        context_window_tokens: 400_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "openai",
+        model_prefix: "o3",
+        context_window_tokens: 200_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "openai",
+        model_prefix: "o4-mini",
+        context_window_tokens: 200_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "openai",
+        model_prefix: "gpt-4o",
+        context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+        bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+    },
+    ModelTokenEstimate {
+        provider: "openai",
+        model_prefix: "*",
+        context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+        bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+    },
+    ModelTokenEstimate {
+        provider: "openai-codex",
+        model_prefix: "gpt-5",
+        context_window_tokens: 400_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "openai-codex",
+        model_prefix: "o3",
+        context_window_tokens: 200_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "openai-codex",
+        model_prefix: "o4-mini",
+        context_window_tokens: 200_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "openai-codex",
+        model_prefix: "*",
+        context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+        bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+    },
+    ModelTokenEstimate {
+        provider: "glm",
+        model_prefix: "glm-5.3-flash",
+        context_window_tokens: 200_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "glm",
+        model_prefix: "glm-5.3",
+        context_window_tokens: 200_000,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "glm",
+        model_prefix: "glm-4.5",
+        context_window_tokens: 131_072,
+        bytes_per_token: 4,
+    },
+    ModelTokenEstimate {
+        provider: "glm",
+        model_prefix: "*",
+        context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+        bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+    },
+    ModelTokenEstimate {
+        provider: "*",
+        model_prefix: "*",
+        context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+        bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+    },
+];
+
+fn model_prefix_matches(prefix: &str, model: &str) -> bool {
+    prefix == "*" || model.starts_with(prefix)
+}
+
+/// Return the first matching operational estimate. Unknown models use their
+/// provider fallback; unknown providers use the conservative global fallback.
+pub fn model_token_estimate(provider: &str, model: &str) -> ModelTokenEstimate {
+    MODEL_TOKEN_ESTIMATES
+        .iter()
+        .find(|estimate| {
+            (estimate.provider == provider || estimate.provider == "*")
+                && model_prefix_matches(estimate.model_prefix, model)
+        })
+        .copied()
+        .expect("the global provider/model fallback must be present")
+}
+
+/// Effective serialized-request budget for one provider/model pair.
+pub fn effective_request_budget(provider: &str, model: &str) -> usize {
+    let estimate = model_token_estimate(provider, model);
+    request_budget_for_context(estimate.context_window_tokens, estimate.bytes_per_token)
+}
+
 /// Cache-friendly system split (issue #69 E). `stable` carries the base
 /// instructions, discovery context, memory block and execution context —
 /// byte-identical between consecutive requests unless a per-request memory
@@ -147,6 +335,12 @@ pub trait Provider {
     fn request_bytes(&self, request: &ModelRequest<'_>) -> Result<usize> {
         Ok(serde_json::to_vec(&serde_json::json!({"system":request.system.joined(),"messages":request.messages,"tools":request.tools}))?.len())
     }
+    /// Provider/model-derived serialized-request budget. Scripted providers
+    /// use the conservative fallback; production adapters override it with
+    /// the estimate selected during construction.
+    fn request_budget_bytes(&self) -> usize {
+        DEFAULT_REQUEST_BUDGET_BYTES
+    }
     /// Configured output token cap (issue #69 A/B). Scripted providers
     /// report 0 (unknown); the runtime uses it only for the `max_tokens`
     /// length diagnosis.
@@ -182,6 +376,13 @@ impl Provider for Selected {
             Self::Anthropic(p) => p.request_bytes(request),
             Self::OpenAi(p) => p.request_bytes(request),
             Self::Glm(p) => p.request_bytes(request),
+        }
+    }
+    fn request_budget_bytes(&self) -> usize {
+        match self {
+            Self::Anthropic(p) => p.request_budget_bytes(),
+            Self::OpenAi(p) => p.request_budget_bytes(),
+            Self::Glm(p) => p.request_budget_bytes(),
         }
     }
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
@@ -240,5 +441,24 @@ mod tests {
             std::env::remove_var("DANSO_MAX_OUTPUT_TOKENS");
         }
         assert_eq!(read(None).unwrap(), MAX_OUTPUT_TOKENS_DEFAULT);
+    }
+
+    #[test]
+    fn model_budget_table_uses_provider_fallbacks_and_exact_headroom_inputs() {
+        let fallback = effective_request_budget("glm", "fixture");
+        assert_eq!(fallback, DEFAULT_REQUEST_BUDGET_BYTES);
+        assert_eq!(
+            effective_request_budget("glm", "glm-5.3-flash"),
+            request_budget_for_context(200_000, 4)
+        );
+        assert_eq!(
+            effective_request_budget("openai", "gpt-4.1-mini"),
+            request_budget_for_context(1_000_000, 4)
+        );
+        assert_eq!(
+            effective_request_budget("unlisted-provider", "unlisted-model"),
+            DEFAULT_REQUEST_BUDGET_BYTES
+        );
+        assert!(effective_request_budget("glm", "glm-5.3-flash") > fallback);
     }
 }

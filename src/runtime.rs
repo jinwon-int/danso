@@ -31,6 +31,9 @@ pub struct RunInput<'a> {
     pub context: &'a str,
     pub execution_context: &'a str,
     pub max_turns: u32,
+    /// Explicit compaction threshold. The composition root resolves `None`
+    /// from the selected provider/model; library callers may keep it unset to
+    /// disable compaction.
     pub compact_at_bytes: Option<usize>,
     /// Optional hook re-resolving the context string (e.g. per-request
     /// memory refresh, §5.3). Called only right after a compaction; the
@@ -207,6 +210,10 @@ impl<P: Provider, S: SessionStore> Provider for LongTaskProvider<'_, P, S> {
 
     fn request_bytes(&self, request: &ModelRequest<'_>) -> Result<usize> {
         self.provider.request_bytes(request)
+    }
+
+    fn request_budget_bytes(&self) -> usize {
+        self.provider.request_budget_bytes()
     }
 
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
@@ -397,7 +404,17 @@ pub async fn run(
             ensure!(
                 (crate::compaction::MIN_THRESHOLD..=crate::compaction::MAX_THRESHOLD)
                     .contains(&limit),
-                "compact-at-bytes must be 8192..393216"
+                "compact-at-bytes must be {}..={}",
+                crate::compaction::MIN_THRESHOLD,
+                crate::compaction::MAX_THRESHOLD
+            );
+            let max_for_provider =
+                crate::compaction::default_threshold(provider.request_budget_bytes());
+            ensure!(
+                limit <= max_for_provider,
+                "compact-at-bytes must leave {} bytes for the managed memory snapshot; provider/model budget allows at most {} bytes",
+                crate::compaction::MEMORY_SNAPSHOT_HEADROOM_BYTES,
+                max_for_provider
             );
             ensure!(
                 session.supports_compaction(),
