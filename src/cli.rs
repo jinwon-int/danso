@@ -113,7 +113,8 @@ pub struct Args {
     /// (issue #69 F).
     #[arg(long, requires = "progress_jsonl")]
     pub stream_requests: bool,
-    /// Opt in to checkpoint compaction above this serialized request size (8192..393216).
+    /// Override the provider/model-derived checkpoint compaction threshold in
+    /// bytes (minimum 8192; maximum is the selected budget minus 32 KiB).
     #[arg(long)]
     pub compact_at_bytes: Option<usize>,
     /// Whole-run wall time. Short mode is 1..3600; long mode is 1..21600.
