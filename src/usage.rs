@@ -26,6 +26,27 @@ pub struct Usage {
     length_stops: u32,
     /// Length stops continued with a follow-up request (issue #69 B/F).
     continuations: u32,
+    /// Body-free timing aggregates (issue #98 e), reported via DANSO_TIMING.
+    timing: Timing,
+}
+
+/// Body-free timing aggregates (issue #98 e): durations in milliseconds and
+/// request/operation counts only. They never carry prompt text, file paths,
+/// model identifiers or response bodies, and formatting stays in the output
+/// adapter. `provider_ms`/`provider_requests` cover the action model requests
+/// dispatched by the agent loop; compaction summaries are broken out
+/// separately through `summary_requests`. `retry_wait_ms` is accumulated by
+/// the bounded wire-retry layer; `journal_ms` by the loop's durable journal
+/// appends; `startup_ms` is set once by the process entry point.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Timing {
+    pub provider_ms: u64,
+    pub provider_requests: u64,
+    pub retry_wait_ms: u64,
+    pub tool_ms: u64,
+    pub tool_calls: u64,
+    pub journal_ms: u64,
+    pub startup_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,6 +122,38 @@ impl Usage {
         self.memory_requests
     }
 
+    /// Record one completed action model request with its wall time (#98 e).
+    pub fn record_provider_request(&mut self, elapsed_ms: u64) {
+        self.timing.provider_requests = self.timing.provider_requests.saturating_add(1);
+        self.timing.provider_ms = self.timing.provider_ms.saturating_add(elapsed_ms);
+    }
+
+    /// Accumulate backoff actually slept by the bounded wire-retry layer (#98 e).
+    pub fn record_retry_wait(&mut self, waited_ms: u64) {
+        self.timing.retry_wait_ms = self.timing.retry_wait_ms.saturating_add(waited_ms);
+    }
+
+    /// Record one settled tool-execution attempt with its wall time (#98 e).
+    pub fn record_tool_execution(&mut self, elapsed_ms: u64) {
+        self.timing.tool_calls = self.timing.tool_calls.saturating_add(1);
+        self.timing.tool_ms = self.timing.tool_ms.saturating_add(elapsed_ms);
+    }
+
+    /// Accumulate time spent in durable journal appends issued by the loop (#98 e).
+    pub fn record_journal_append(&mut self, elapsed_ms: u64) {
+        self.timing.journal_ms = self.timing.journal_ms.saturating_add(elapsed_ms);
+    }
+
+    /// Set once by the process entry point: process start to run start (#98 e).
+    pub fn record_startup(&mut self, elapsed_ms: u64) {
+        self.timing.startup_ms = elapsed_ms;
+    }
+
+    /// The body-free timing snapshot for the DANSO_TIMING record (#98 e).
+    pub fn timing(&self) -> Timing {
+        self.timing
+    }
+
     pub fn record_length_stop(&mut self) {
         self.length_stops = self.length_stops.saturating_add(1);
     }
@@ -148,5 +201,31 @@ mod tests {
             assert_eq!(usage.summary(), before);
             assert_eq!(usage.summary()["totalTokens"], u64::MAX);
         }
+    }
+
+    /// #98 e: the timing counters saturate independently and never leak into
+    /// the Piri-fixed DANSO_USAGE summary or the budget counters.
+    #[test]
+    fn timing_counters_accumulate_without_touching_usage_records() {
+        let mut usage = Usage::default();
+        assert_eq!(usage.timing(), Timing::default());
+        usage.record_startup(7);
+        usage.record_provider_request(17);
+        usage.record_provider_request(u64::MAX);
+        usage.record_retry_wait(875);
+        usage.record_tool_execution(41);
+        usage.record_tool_execution(2);
+        usage.record_journal_append(3);
+        let timing = usage.timing();
+        assert_eq!(timing.startup_ms, 7);
+        assert_eq!(timing.provider_requests, 2);
+        assert_eq!(timing.provider_ms, u64::MAX);
+        assert_eq!(timing.retry_wait_ms, 875);
+        assert_eq!(timing.tool_calls, 2);
+        assert_eq!(timing.tool_ms, 43);
+        assert_eq!(timing.journal_ms, 3);
+        // The fixed usage/budget records do not widen.
+        assert_eq!(usage.summary()["requests"], 0);
+        assert_eq!(usage.budget_counts(), (0, 0, 0));
     }
 }
