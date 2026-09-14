@@ -180,7 +180,13 @@ impl Http {
                     let retryable = crate::failure::transport(&diagnostic)
                         .is_some_and(retryable_transport_phase);
                     if attempt < attempts && retryable {
-                        tokio::time::sleep(retry_delay(attempt, None)).await;
+                        let delay = retry_delay(attempt, None);
+                        let waited = Instant::now();
+                        tokio::time::sleep(delay).await;
+                        // Body-free timing (issue #98 e): the backoff actually slept.
+                        usage.record_retry_wait(
+                            waited.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                        );
                         continue;
                     }
                     return Err(diagnostic);
@@ -190,8 +196,14 @@ impl Http {
                 let status = response.status();
                 let retry_after = retry_after_seconds(response.headers());
                 if attempt < attempts && retryable_status(status.as_u16()) {
+                    let delay = retry_delay(attempt, retry_after);
                     drop(response);
-                    tokio::time::sleep(retry_delay(attempt, retry_after)).await;
+                    let waited = Instant::now();
+                    tokio::time::sleep(delay).await;
+                    // Body-free timing (issue #98 e): the backoff actually slept.
+                    usage.record_retry_wait(
+                        waited.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+                    );
                     continue;
                 }
                 let error = crate::failure::http_status_error(status);
@@ -478,6 +490,11 @@ fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     #[test]
     fn retryable_status_set_is_closed_and_transient_only() {
@@ -514,5 +531,107 @@ mod retry_tests {
             "http-date-form".parse().unwrap(),
         );
         assert_eq!(retry_after_seconds(&headers), None);
+    }
+
+    // Issue #98 e: the backoff actually slept by the bounded wire retry must
+    // surface into Usage, without ever claiming a model request.
+    fn serve_sequence(listener: TcpListener, responses: Vec<&'static [u8]>) {
+        thread::spawn(move || {
+            for response in &responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                socket.write_all(response).unwrap();
+                socket.flush().unwrap();
+            }
+        });
+    }
+
+    fn local_http() -> (String, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        (base, listener)
+    }
+
+    fn client(base: &str, retries: u32) -> Http {
+        let mut client = Http::with_timeouts_with_budget(
+            base,
+            "test",
+            reqwest::header::AUTHORIZATION,
+            "Bearer PRIVATE_KEY_MARKER",
+            "PRIVATE_KEY_MARKER",
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            crate::provider::DEFAULT_REQUEST_BUDGET_BYTES,
+        )
+        .unwrap();
+        client.set_retries(retries);
+        client
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_wait_is_surfaced_into_usage_timing() {
+        let (base, listener) = local_http();
+        let rate_limited = &b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"[..];
+        let ok =
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}"[..];
+        serve_sequence(listener, vec![rate_limited, ok]);
+        let client = client(&base, 1);
+        let mut usage = crate::usage::Usage::default();
+        assert_eq!(usage.timing().retry_wait_ms, 0);
+        let bytes = client
+            .post_bytes(
+                &serde_json::json!({"private":"PRIVATE_BODY_MARKER"}),
+                &mut usage,
+                reqwest::header::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"{\"ok\":true}".to_vec());
+        let timing = usage.timing();
+        assert!(
+            timing.retry_wait_ms >= 1000,
+            "surfaced backoff wait, got {}ms",
+            timing.retry_wait_ms
+        );
+        // The wire layer only reports wait time; model requests are counted
+        // by the runtime loop.
+        assert_eq!(timing.provider_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_status_records_no_backoff_wait() {
+        let (base, listener) = local_http();
+        let bad_request =
+            &b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"[..];
+        serve_sequence(listener, vec![bad_request]);
+        let client = client(&base, 3);
+        let mut usage = crate::usage::Usage::default();
+        assert!(
+            client
+                .post_bytes(
+                    &serde_json::json!({"private":"PRIVATE_BODY_MARKER"}),
+                    &mut usage,
+                    reqwest::header::HeaderMap::new(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(usage.timing().retry_wait_ms, 0);
     }
 }

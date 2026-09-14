@@ -78,10 +78,12 @@ pub enum Event<'a> {
     FinalAnswer(&'a Value),
     /// Body-free opt-in long-task checkpoint notification.
     Task(&'a Value),
-    /// Opt-in per-model-request notification (issue #69 F): body-free.
+    /// Opt-in per-model-request notification (issue #69 F): body-free. The
+    /// frame carries `elapsed_ms`, the run-clock dispatch stamp (issue #98 e).
     Request {
         sequence: u32,
         remaining: u32,
+        elapsed_ms: u64,
     },
     /// Emitted only after the corresponding operation marker is durable.
     ToolStarted(&'a str),

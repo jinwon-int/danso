@@ -68,12 +68,12 @@ impl<S: EventSink> EventSink for ProgressSink<S> {
                 Event::Request {
                     sequence,
                     remaining,
+                    elapsed_ms,
                 } => {
                     if !self.requests_enabled {
                         return Ok(());
                     }
-                    Some(json!({"type":"danso_request", "version":1,
-                        "sequence":sequence, "remaining":remaining}))
+                    Some(request_frame(*sequence, *remaining, *elapsed_ms))
                 }
                 _ => None,
             };
@@ -92,6 +92,14 @@ impl<S: EventSink> EventSink for ProgressSink<S> {
         }
         self.inner.emit(event)
     }
+}
+
+/// The `danso_request` progress frame (issue #69 F) plus the body-free
+/// run-clock `elapsed_ms` dispatch stamp (issue #98 e). Split out so the
+/// field set stays pinned by a test.
+fn request_frame(sequence: u32, remaining: u32, elapsed_ms: u64) -> serde_json::Value {
+    json!({"type":"danso_request", "version":1,
+        "sequence":sequence, "remaining":remaining, "elapsed_ms":elapsed_ms})
 }
 
 #[derive(Clone, Copy)]
@@ -158,4 +166,59 @@ pub fn budget_record(usage: &Usage, requests_total: u32, cap: u32) -> String {
         length_stops,
         continuations
     )
+}
+
+/// Body-free run timing receipt (issue #98 e): printed once on stderr at run
+/// end. Durations and counts only — never prompt text, file paths or response
+/// bodies. Hand-written rather than `json!` so the key order stays stable for
+/// existing adapters.
+pub fn timing_record(usage: &Usage) -> String {
+    let timing = usage.timing();
+    let (summary_requests, _, _) = usage.budget_counts();
+    format!(
+        "{{\"version\":1,\"provider_ms\":{},\"provider_requests\":{},\"retry_wait_ms\":{},\"tool_ms\":{},\"tool_calls\":{},\"journal_ms\":{},\"summary_requests\":{},\"startup_ms\":{}}}",
+        timing.provider_ms,
+        timing.provider_requests,
+        timing.retry_wait_ms,
+        timing.tool_ms,
+        timing.tool_calls,
+        timing.journal_ms,
+        summary_requests,
+        timing.startup_ms
+    )
+}
+
+/// One `DANSO_TIMING=` line at run end (issue #98 e); the record itself is
+/// pinned by tests via `timing_record`.
+pub fn report_timing(usage: &Usage) {
+    eprintln!("DANSO_TIMING={}", timing_record(usage));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_frame_has_the_exact_documented_field_set() {
+        assert_eq!(
+            request_frame(2, 46, 1234),
+            serde_json::json!({"type":"danso_request","version":1,
+                "sequence":2,"remaining":46,"elapsed_ms":1234})
+        );
+    }
+
+    #[test]
+    fn timing_record_has_the_exact_key_set_and_order() {
+        let mut usage = Usage::default();
+        usage.record_startup(5);
+        usage.record_provider_request(17);
+        usage.record_provider_request(3);
+        usage.record_retry_wait(875);
+        usage.record_tool_execution(41);
+        usage.record_journal_append(2);
+        assert_eq!(
+            timing_record(&usage),
+            "{\"version\":1,\"provider_ms\":20,\"provider_requests\":2,\"retry_wait_ms\":875,\"tool_ms\":41,\"tool_calls\":1,\"journal_ms\":2,\"summary_requests\":0,\"startup_ms\":5}"
+        );
+    }
 }
