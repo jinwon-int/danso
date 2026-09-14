@@ -51,6 +51,37 @@ This is tool lifecycle streaming, not token streaming, steering, a bidirectional
 RPC protocol or memory reinjection. Long model reasoning before the first tool
 can still be quiet; whole-run and provider deadlines remain in force.
 
+## Interim assistant text at message boundaries (issue #98 a)
+
+In text mode (`-p`) the stdout stream now carries the text of every interim
+assistant message — one that is followed by tool calls — as soon as it is
+durably journaled, before any tool starts. Each text block is one JSON record
+closed by a completed record, with a stable key order:
+
+```
+{"type":"danso_text_delta","version":1,"text":"..."}
+{"type":"danso_message_completed","version":1}
+```
+
+- Frames are render notifications, not journal entries; the journal keeps
+  recording whole messages only, and frames never carry tool calls, tool
+  output, or arguments.
+- The terminal assistant message keeps its existing `FinalAnswer` rendering:
+  the plain trailing stdout text after a successful exit and validated usage.
+  It is never re-emitted as frames, so `-p` output stays backward compatible
+  for single-response runs.
+- JSON mode (`--print-json`, `--progress-jsonl`) is unchanged; it ignores the
+  new boundary events and keeps rendering full transcript frames.
+- A stream consumer must treat a stdout line as a frame only when it strictly
+  matches the record shapes above; any other byte stays final-answer text.
+  Frames share the adapter output bound with the retained answer text.
+- `integrations/ccc_node.py` consumes the frames incrementally and forwards
+  `TextDeltaEvent`/`MessageCompletedEvent` per interim message while the
+  worker runs; the final answer is still wrapped only after process exit.
+
+Run `python3 scripts/test_progress.py` for the real CLI timing of interim
+frames, and `python3 scripts/test_ccc_node.py` for the adapter-level stream.
+
 Run `python3 scripts/test_progress.py` on the host for actual CLI/bubblewrap
 arrival timing, tool failure and opt-in compatibility checks. The Rust extension
 suite verifies progress occurs after durable markers and that a failed start
