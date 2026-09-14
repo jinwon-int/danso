@@ -110,16 +110,10 @@ pub enum Mode {
 
 pub struct PrintSink {
     mode: Mode,
-    streamed_active: bool,
-    streamed_pending: bool,
 }
 impl PrintSink {
     pub fn new(mode: Mode) -> Self {
-        Self {
-            mode,
-            streamed_active: false,
-            streamed_pending: false,
-        }
+        Self { mode }
     }
 }
 impl EventSink for PrintSink {
@@ -130,27 +124,8 @@ impl EventSink for PrintSink {
                 Mode::Json,
                 Event::Session(entry) | Event::Message(entry) | Event::Compaction(entry),
             ) => writeln!(stdout, "{entry}")?,
-            (Mode::Text, Event::TextDelta(text)) => {
-                if self.streamed_pending {
-                    writeln!(stdout)?;
-                    self.streamed_pending = false;
-                }
-                write!(stdout, "{text}")?;
-                stdout.flush()?;
-                self.streamed_active = true;
-            }
-            (Mode::Text, Event::Message(message))
-                if message["message"]["role"] == "assistant" && self.streamed_active =>
-            {
-                self.streamed_active = false;
-                self.streamed_pending = true;
-            }
             (Mode::Text, Event::FinalAnswer(message)) => {
-                if self.streamed_active || self.streamed_pending {
-                    writeln!(stdout)?;
-                    self.streamed_active = false;
-                    self.streamed_pending = false;
-                } else if let Some(blocks) = message["content"].as_array() {
+                if let Some(blocks) = message["content"].as_array() {
                     for block in blocks {
                         if let Some(text) = block["text"].as_str() {
                             writeln!(stdout, "{text}")?;
@@ -158,6 +133,20 @@ impl EventSink for PrintSink {
                     }
                 }
             }
+            // Issue #98 (item a): interim assistant text streams as framed
+            // records a process consumer can parse incrementally. JSON mode
+            // ignores them; the transcript frames are unchanged. The records
+            // are hand-written so the key order stays stable for adapters
+            // (serde_json maps serialize alphabetically).
+            (Mode::Text, Event::TextDelta(text)) => writeln!(
+                stdout,
+                "{{\"type\":\"danso_text_delta\",\"version\":1,\"text\":{}}}",
+                serde_json::to_string(text)?
+            )?,
+            (Mode::Text, Event::MessageCompleted) => writeln!(
+                stdout,
+                "{{\"type\":\"danso_message_completed\",\"version\":1}}"
+            )?,
             _ => {}
         }
         stdout.flush()?;

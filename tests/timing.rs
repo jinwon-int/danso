@@ -99,9 +99,9 @@ impl EventSink for Shared {
                     _ => "message",
                 });
             }
-            // Stream deltas (issue #98 b): render-only events that carry no
-            // timing signal for this suite.
-            Event::TextDelta(_) => {}
+            // Interim/stream frames (issues #98 a, #98 b): render-only
+            // events that carry no timing signal for this suite.
+            Event::TextDelta(_) | Event::MessageCompleted => {}
             Event::Compaction(_) => events.labels.push("compaction"),
             Event::Request {
                 sequence,

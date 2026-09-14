@@ -22,6 +22,46 @@ class Progress(unittest.TestCase):
     def test_long_task_interim_arrives_before_tool_finishes(self):
         self._assert_interim_before_finish('--long-task', '--task-progress')
 
+    def test_text_mode_streams_interim_frames_and_keeps_final_answer_last(self):
+        # Issue #98 (item a): in text mode an interim assistant message is
+        # streamed as strict danso_text_delta / danso_message_completed
+        # records on stdout before the tool settles; the final answer stays
+        # the plain trailing stdout text. This is the framing consumed by
+        # integrations/ccc_node.py.
+        self.tool('bash', {'command': 'sleep 2; printf PRIVATE_TOOL_OUTPUT'})
+        self.responses[0][1]['content'].insert(0, {'type': 'text', 'text': '중간 안내를 전달합니다.'})
+        process = subprocess.Popen(self.command('-p'), env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        frames = []
+        buffer = b''
+        try:
+            while not any(f['type'] == 'danso_message_completed' for f in frames):
+                self.assertTrue(selector.select(5), 'interim frame did not arrive')
+                chunk = process.stdout.read1(65536)
+                self.assertTrue(chunk, 'CLI exited before interim frame')
+                buffer += chunk
+                while b'\n' in buffer:
+                    line, buffer = buffer.split(b'\n', 1)
+                    frames.append(json.loads(line))
+            self.assertIsNone(process.poll(), 'interim message was buffered until exit')
+            self.assertEqual(frames, [
+                {'type': 'danso_text_delta', 'version': 1, 'text': '중간 안내를 전달합니다.'},
+                {'type': 'danso_message_completed', 'version': 1}])
+            out, err = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, err)
+            # The final answer is still plain text and comes last; tool
+            # output never leaks into the stream.
+            self.assertEqual((buffer + out).decode().strip(), 'done')
+            self.assertNotIn('PRIVATE_TOOL_OUTPUT', (buffer + out).decode())
+            self.assertNotIn('danso_text_delta', self.session.read_text())
+        finally:
+            selector.close()
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
     def _assert_interim_before_finish(self, *flags):
         self.tool('bash', {'command': 'sleep 2; echo PRIVATE_TOOL_OUTPUT'})
         self.responses[0][1]['content'].insert(0, {'type': 'text', 'text': '설정을 확인했고 검증을 실행합니다.'})

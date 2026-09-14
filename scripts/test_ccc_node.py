@@ -77,6 +77,33 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.requests), 3)
         self.assertEqual(journal.stat().st_mode & 0o777, 0o600)
 
+    async def test_interim_text_streams_before_tool_and_final_is_wrapped(self):
+        # Issue #98 (item a): interim assistant text arrives as live
+        # text_delta/message_completed events while the worker is still
+        # running; the final answer is wrapped only after exit and validated
+        # usage, and the journal keeps whole messages only.
+        s = await self.new_session()
+        interim = fixture.response('glm', [('bash', {'command': 'sleep 1; printf ok'})])
+        interim['choices'][0]['message']['content'] = '중간 안내를 전달합니다'
+        self.responses.extend([(200, interim),
+                               (200, fixture.response('glm', text='finished'))])
+        events = []
+        running_at_interim = None
+        async for event in s.send_turn('do the bounded task'):
+            events.append(event)
+            if len(events) == 1:
+                running_at_interim = (s._process is not None
+                                      and s._process.returncode is None)
+        self.assertEqual([e.kind for e in events],
+                         ['text_delta', 'message_completed', 'text_delta',
+                          'message_completed', 'result', 'completion'])
+        self.assertEqual(events[0].text, '중간 안내를 전달합니다')
+        self.assertEqual(events[2].text, 'finished')
+        self.assertEqual(events[4].result['text'], 'finished')
+        self.assertTrue(running_at_interim)
+        journal = self.runtime.root / (s.session_id + '.jsonl')
+        self.assertNotIn('danso_text_delta', journal.read_text())
+
     async def test_provider_failure_is_terminal_and_private(self):
         s = await self.new_session()
         self.responses.append((503, {'error': 'PRIVATE_PROVIDER_MARKER'}))

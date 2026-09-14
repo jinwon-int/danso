@@ -141,7 +141,9 @@ impl Glm {
     }
     fn non_streaming_body(&self, request: &ModelRequest<'_>) -> Result<Value> {
         let mut body = self.body(request)?;
-        body["stream"] = json!(false);
+        body.as_object_mut()
+            .context("invalid GLM request body")?
+            .remove("stream");
         body.as_object_mut()
             .context("invalid GLM request body")?
             .remove("stream_options");

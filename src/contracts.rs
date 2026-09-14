@@ -76,6 +76,14 @@ pub enum Event<'a> {
     Message(&'a Value),
     Compaction(&'a Value),
     FinalAnswer(&'a Value),
+    /// Issue #98 (item a): the complete text of one interim assistant
+    /// message, streamed at its durable message boundary — after the journal
+    /// append, before any tool effect. A render notification only: never a
+    /// journal record and never authorization to act on partial output.
+    TextDelta(&'a str),
+    /// Closes the assistant message whose text the preceding TextDelta
+    /// frames carried. Emitted at most once per streamed message.
+    MessageCompleted,
     /// Body-free opt-in long-task checkpoint notification.
     Task(&'a Value),
     /// Opt-in per-model-request notification (issue #69 F): body-free. The
@@ -90,14 +98,26 @@ pub enum Event<'a> {
     ToolSettled {
         is_error: bool,
     },
-    /// A provider text delta. This is an output notification only; it is
-    /// never a journal entry, tool authorization, or partial assistant
-    /// message.
-    TextDelta(&'a str),
 }
 
 /// An output adapter can render text, JSONL, or collect events in a test.
 /// It cannot mutate the session or authorize tool execution.
 pub trait EventSink {
     fn emit(&mut self, event: Event<'_>) -> Result<()>;
+}
+
+/// The text blocks of a message, in order (issue #98 a). One shared
+/// extraction so the runtime boundary stream and renderers agree on what
+/// counts as assistant text.
+pub fn text_blocks(message: &Value) -> Vec<&str> {
+    message["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
 }
