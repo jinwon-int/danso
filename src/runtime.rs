@@ -210,6 +210,27 @@ impl<P: Provider, S: SessionStore> Provider for LongTaskProvider<'_, P, S> {
     }
 
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
+        self.complete_with(request, usage, None).await
+    }
+
+    async fn complete_streaming(
+        &mut self,
+        request: ModelRequest<'_>,
+        usage: &mut Usage,
+        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<Value> {
+        self.complete_with(request, usage, Some(on_delta)).await
+    }
+}
+
+impl<P: Provider, S: SessionStore> LongTaskProvider<'_, P, S> {
+    #[allow(clippy::type_complexity)]
+    async fn complete_with(
+        &mut self,
+        request: ModelRequest<'_>,
+        usage: &mut Usage,
+        on_delta: Option<&mut dyn FnMut(&str) -> Result<()>>,
+    ) -> Result<Value> {
         if let Some(limits) = self.ledger.limits
             && (self.ledger.requests >= limits.max_requests
                 || self.ledger.reported_tokens >= limits.max_tokens)
@@ -230,7 +251,14 @@ impl<P: Provider, S: SessionStore> Provider for LongTaskProvider<'_, P, S> {
                 reason: self.cancellation_reason,
                 armed: true,
             };
-            let response = self.provider.complete(request, usage).await;
+            let response = match on_delta {
+                Some(on_delta) => {
+                    self.provider
+                        .complete_streaming(request, usage, on_delta)
+                        .await
+                }
+                None => self.provider.complete(request, usage).await,
+            };
             guard.armed = false;
             response
         };
@@ -748,43 +776,48 @@ pub async fn run(
                 "long-task paused at a settled boundary"
             )));
         }
-        let message = if input.long_task.is_some() {
-            let mut gated = LongTaskProvider::new(
-                provider,
-                session,
-                &mut long_ledger,
-                GateMode::Action,
-                task_started,
-                task_base_elapsed_ms,
-                input.cancellation_reason,
-            );
-            gated
-                .complete(
-                    ModelRequest {
-                        system: crate::provider::SystemParts {
-                            stable: &base_system,
-                            volatile: &guidance,
+        let message = {
+            let mut on_delta = |delta: &str| sink.emit(Event::TextDelta(delta));
+            if input.long_task.is_some() {
+                let mut gated = LongTaskProvider::new(
+                    provider,
+                    session,
+                    &mut long_ledger,
+                    GateMode::Action,
+                    task_started,
+                    task_base_elapsed_ms,
+                    input.cancellation_reason,
+                );
+                gated
+                    .complete_streaming(
+                        ModelRequest {
+                            system: crate::provider::SystemParts {
+                                stable: &base_system,
+                                volatile: &guidance,
+                            },
+                            messages: &messages,
+                            tools: &definitions,
                         },
-                        messages: &messages,
-                        tools: &definitions,
-                    },
-                    usage,
-                )
-                .await
-        } else {
-            provider
-                .complete(
-                    ModelRequest {
-                        system: crate::provider::SystemParts {
-                            stable: &base_system,
-                            volatile: &guidance,
+                        usage,
+                        &mut on_delta,
+                    )
+                    .await
+            } else {
+                provider
+                    .complete_streaming(
+                        ModelRequest {
+                            system: crate::provider::SystemParts {
+                                stable: &base_system,
+                                volatile: &guidance,
+                            },
+                            messages: &messages,
+                            tools: &definitions,
                         },
-                        messages: &messages,
-                        tools: &definitions,
-                    },
-                    usage,
-                )
-                .await
+                        usage,
+                        &mut on_delta,
+                    )
+                    .await
+            }
         }
         .map_err(at(Kind::Provider))?;
         let calls = (|| {

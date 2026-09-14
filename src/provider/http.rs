@@ -209,6 +209,129 @@ impl Http {
         }
         Ok(bytes)
     }
+
+    /// Consume a bounded server-sent event response one complete frame at a
+    /// time. Retries are deliberately limited to the same pre-body cases as
+    /// `post_until`: once a response body is available, an interrupted or
+    /// malformed stream is never replayed.
+    pub async fn post_sse(
+        &self,
+        body: &Value,
+        usage: &mut crate::usage::Usage,
+        headers: reqwest::header::HeaderMap,
+        mut event: impl FnMut(&[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(body)?;
+        ensure!(
+            bytes.len() <= 512 * 1024,
+            "request context exceeds 512 KiB; start a new session"
+        );
+        let request_bytes = bytes.len();
+        let attempts = self.retries.saturating_add(1);
+        let mut attempt: u32 = 0;
+        let started = Instant::now();
+        let mut response = loop {
+            attempt += 1;
+            usage.attempted = true;
+            let request = self
+                .client
+                .post(self.url.clone())
+                .headers(headers.clone())
+                .header(self.header.clone(), self.key.clone())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .body(bytes.clone())
+                .build()
+                .map_err(|_| anyhow::anyhow!("could not construct provider request"))?;
+            let attempt_started = Instant::now();
+            let response = match self.client.execute(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    let phase = if error.is_connect() {
+                        "connect"
+                    } else {
+                        "before_response_headers"
+                    };
+                    let diagnostic =
+                        transport_error(&error, phase, attempt_started, request_bytes, attempt);
+                    let retryable = crate::failure::transport(&diagnostic)
+                        .is_some_and(retryable_transport_phase);
+                    if attempt < attempts && retryable {
+                        tokio::time::sleep(retry_delay(attempt, None)).await;
+                        continue;
+                    }
+                    return Err(diagnostic);
+                }
+            };
+            if !response.status().is_success() {
+                let status = response.status();
+                let retry_after = retry_after_seconds(response.headers());
+                if attempt < attempts && retryable_status(status.as_u16()) {
+                    drop(response);
+                    tokio::time::sleep(retry_delay(attempt, retry_after)).await;
+                    continue;
+                }
+                let error = crate::failure::http_status_error(status);
+                return Err(if self.zai_diagnostics {
+                    super::http_diagnostic::capture(response)
+                        .await
+                        .with_source(error)
+                } else {
+                    error
+                });
+            }
+            break response;
+        };
+
+        let mut pending = Vec::new();
+        let mut received = 0usize;
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            transport_error(&error, "response_body", started, request_bytes, attempt)
+        })? {
+            received = received.checked_add(chunk.len()).ok_or_else(|| {
+                crate::failure::provider_error(crate::failure::ProviderReason::ResponseTooLarge)
+            })?;
+            if received > 1024 * 1024 {
+                return Err(crate::failure::provider_error(
+                    crate::failure::ProviderReason::ResponseTooLarge,
+                ));
+            }
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = sse_frame_end(&pending) {
+                let frame: Vec<u8> = pending.drain(..end).collect();
+                if event(&frame)? {
+                    return Ok(());
+                }
+            }
+        }
+        if !pending.is_empty() {
+            return Err(crate::failure::provider_error(
+                crate::failure::ProviderReason::InvalidStream,
+            ));
+        }
+        Err(crate::failure::provider_error(
+            crate::failure::ProviderReason::StreamEnded,
+        ))
+    }
+}
+
+fn sse_frame_end(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len().saturating_sub(1) {
+        match data[i] {
+            b'\n' if data[i + 1] == b'\n' => return Some(i + 2),
+            b'\r' if data[i + 1] == b'\r' => return Some(i + 2),
+            b'\r' if data[i + 1] == b'\n' => {
+                if data.get(i + 2) == Some(&b'\n') {
+                    return Some(i + 3);
+                }
+                if data.get(i + 2) == Some(&b'\r') && data.get(i + 3) == Some(&b'\n') {
+                    return Some(i + 4);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 // Never format reqwest's error: it may include the URL or private

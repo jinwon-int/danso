@@ -54,7 +54,11 @@ interfaces are a source-level contract, not a frozen external library ABI.
 1. Add `src/provider/<name>.rs` and implement `Provider`.
 2. Validate supported history in `validate_history`; translate `ModelRequest`
    and return a validated, terminal Pi-compatible assistant message in `complete`.
-3. Implement `request_bytes` using the exact body builder also used by `complete`.
+   Providers that support token streaming implement `complete_streaming`; its
+   text callback is output-only, while the returned terminal message remains
+   the only value eligible for journaling or tool dispatch.
+3. Implement `request_bytes` using the exact streaming body builder used by
+   `complete_streaming`.
    Enforce request/response/time limits, protect credentials, and mark
    `Usage.attempted` only after local validation, immediately before dispatch.
    Add normalized `TokenUsage` using your provider/model name and propagate
@@ -66,8 +70,9 @@ interfaces are a source-level contract, not a frozen external library ABI.
 
 The async traits use static dispatch. A future routing/failover adapter can
 implement `Provider` and own multiple concrete providers while retaining the
-same runtime contract. Retry semantics, streaming and provider errors require
-their own design and tests; this refactor does not claim those features exist.
+same runtime contract. Retry semantics and provider errors remain adapter-owned
+and require explicit tests; response-body failures never replay a partially
+consumed stream.
 
 ## Adding a builtin tool
 
@@ -86,9 +91,10 @@ registry without enabling extra production tools.
 
 ## Adding output or storage
 
-- Implement `EventSink` to consume session/message/final-answer events. Events
-  are notifications, not approval callbacks. Keep machine-readable usage and
-  process exit handling in the outer application.
+- Implement `EventSink` to consume session/message/final-answer events and
+  optional sink-only text deltas. Events are notifications, not approval
+  callbacks. Keep machine-readable usage and process exit handling in the
+  outer application.
 - Implement `SessionStore` to change persistence. Preserve Pi interchange and
   the recovery contract: durable append before returning, exclusive writer,
   strict unresolved-operation detection, and no automatic replay. Stores enabling

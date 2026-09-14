@@ -202,6 +202,7 @@ impl EventSink for Collecting {
             Event::Request { .. } => "request",
             Event::ToolSettled { .. } => "tool-settled",
             Event::Task(_) => "task",
+            Event::TextDelta(_) => "delta",
         };
         self.events.borrow_mut().push(label);
         Ok(())

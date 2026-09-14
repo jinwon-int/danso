@@ -88,6 +88,10 @@ pub enum Event<'a> {
     ToolSettled {
         is_error: bool,
     },
+    /// A provider text delta. This is an output notification only; it is
+    /// never a journal entry, tool authorization, or partial assistant
+    /// message.
+    TextDelta(&'a str),
 }
 
 /// An output adapter can render text, JSONL, or collect events in a test.

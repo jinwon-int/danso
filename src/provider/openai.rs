@@ -3,6 +3,7 @@ use super::{ModelRequest, Provider, http::Http, wire};
 use crate::usage::Usage;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 pub struct OpenAi {
     http: Option<Http>,
@@ -75,13 +76,20 @@ impl OpenAi {
             })
             .collect();
         let mut body = json!({"model":self.model,"instructions":request.system.joined(),"input":history(request.messages)?,
-            "tools":tools,"store":false,"include":["reasoning.encrypted_content"],"max_output_tokens":self.max_output_tokens});
+            "tools":tools,"store":false,"include":["reasoning.encrypted_content"],"max_output_tokens":self.max_output_tokens,"stream":true});
         if let Some(effort) = &self.effort {
             body["reasoning"] = json!({"effort":effort});
         }
         if self.chatgpt.is_some() {
             body.as_object_mut().unwrap().remove("max_output_tokens");
             body["stream"] = json!(true);
+        }
+        Ok(body)
+    }
+    fn non_streaming_body(&self, request: &ModelRequest<'_>) -> Result<Value> {
+        let mut body = self.body(request)?;
+        if self.chatgpt.is_none() {
+            body["stream"] = json!(false);
         }
         Ok(body)
     }
@@ -97,7 +105,7 @@ impl Provider for OpenAi {
         Ok(serde_json::to_vec(&self.body(request)?)?.len())
     }
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
-        let body = self.body(&request)?;
+        let body = self.non_streaming_body(&request)?;
         let response = match &self.chatgpt {
             Some(auth) => auth.post(&body, usage).await?,
             None => {
@@ -142,6 +150,216 @@ impl Provider for OpenAi {
         message["dansoOpenAIOutput"] = json!(output);
         Ok(message)
     }
+    async fn complete_streaming(
+        &mut self,
+        request: ModelRequest<'_>,
+        usage: &mut Usage,
+        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<Value> {
+        let body = self.body(&request)?;
+        let response = match &self.chatgpt {
+            Some(auth) => auth.post_streaming(&body, usage, on_delta).await?,
+            None => {
+                let http = self.http.as_ref().context("missing OpenAI transport")?;
+                let mut stream = ResponsesStream::default();
+                http.post_sse(&body, usage, reqwest::header::HeaderMap::new(), |frame| {
+                    stream
+                        .event(frame, on_delta)
+                        .map_err(crate::failure::provider_context(
+                            crate::failure::ProviderReason::InvalidStream,
+                        ))
+                })
+                .await?;
+                stream.response()?
+            }
+        };
+        let (provider, api) = if self.chatgpt.is_some() {
+            ("openai-codex", "openai-codex-responses")
+        } else {
+            ("openai", "openai-responses")
+        };
+        let t = wire::tokens(
+            &response["usage"],
+            "input_tokens",
+            "output_tokens",
+            "input_tokens_details",
+        )?;
+        let model = response["model"].as_str().unwrap_or(&self.model);
+        usage.add(
+            provider,
+            model,
+            crate::usage::TokenUsage {
+                input: t.input,
+                output: t.output,
+                cache_read: t.cache_read,
+                cache_write: 0,
+            },
+        )?;
+        ensure!(
+            response["status"] == "completed" && response["error"].is_null(),
+            "OpenAI response did not complete"
+        );
+        let output = response["output"]
+            .as_array()
+            .context("missing OpenAI output")?;
+        let content = output_content(output)?;
+        let mut message = wire::message(content, provider, api, model, &t)?;
+        message["dansoOpenAIOutput"] = json!(output);
+        Ok(message)
+    }
+}
+
+/// Incremental Responses API reconstruction shared by the platform and
+/// subscription OpenAI paths. Only text/refusal deltas reach the callback;
+/// function arguments remain buffered until the completed output is validated.
+#[derive(Default)]
+pub(super) struct ResponsesStream {
+    terminal: Option<Value>,
+    items: BTreeMap<u64, Value>,
+}
+
+impl ResponsesStream {
+    pub(super) fn event(
+        &mut self,
+        frame: &[u8],
+        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<bool> {
+        let Some((event, payload)) = parse_sse_frame(frame)? else {
+            return Ok(false);
+        };
+        if payload == "[DONE]" {
+            if self.terminal.is_none() {
+                return Err(crate::failure::provider_error(
+                    crate::failure::ProviderReason::StreamEnded,
+                ));
+            }
+            return Ok(true);
+        }
+        let value: Value = serde_json::from_str(&payload).context("invalid OpenAI SSE JSON")?;
+        let kind = value["type"]
+            .as_str()
+            .context("missing OpenAI SSE event type")?;
+        ensure!(
+            event.as_deref().is_none_or(|event| event == kind),
+            "OpenAI SSE event type mismatch"
+        );
+        ensure!(self.terminal.is_none(), "OpenAI SSE data after completion");
+        match kind {
+            "response.completed" | "response.done" => {
+                let response = &value["response"];
+                ensure!(
+                    response.is_object()
+                        && response["status"] == "completed"
+                        && response["error"].is_null(),
+                    "OpenAI response did not complete"
+                );
+                let mut response = response.clone();
+                if response.get("output").is_none() {
+                    response["output"] = Value::Array(Vec::new());
+                }
+                let output = response["output"]
+                    .as_array_mut()
+                    .context("missing OpenAI terminal output")?;
+                if output.is_empty() {
+                    for (expected, (index, item)) in self.items.iter().enumerate() {
+                        ensure!(
+                            *index == expected as u64,
+                            "incomplete OpenAI streamed output"
+                        );
+                        output.push(item.clone());
+                    }
+                } else {
+                    for (index, item) in &self.items {
+                        let index =
+                            usize::try_from(*index).context("invalid OpenAI output index")?;
+                        ensure!(
+                            output.get(index) == Some(item),
+                            "conflicting OpenAI terminal output"
+                        );
+                    }
+                }
+                self.terminal = Some(response);
+                Ok(true)
+            }
+            "response.output_item.done" => {
+                let index = value["output_index"]
+                    .as_u64()
+                    .context("missing OpenAI output index")?;
+                ensure!(
+                    value["item"].is_object(),
+                    "missing OpenAI completed output item"
+                );
+                ensure!(
+                    self.items.insert(index, value["item"].clone()).is_none(),
+                    "duplicate OpenAI output index"
+                );
+                Ok(false)
+            }
+            "response.output_text.delta" | "response.refusal.delta" => {
+                let delta = value["delta"]
+                    .as_str()
+                    .context("missing OpenAI text delta")?;
+                if !delta.is_empty() {
+                    on_delta(delta)?;
+                }
+                Ok(false)
+            }
+            "error" => Err(crate::failure::provider_error(
+                crate::failure::ProviderReason::ResponseError,
+            )),
+            "response.failed" => Err(crate::failure::provider_error(
+                crate::failure::ProviderReason::ResponseFailed,
+            )),
+            "response.incomplete" => Err(crate::failure::provider_error(
+                crate::failure::ProviderReason::ResponseIncomplete,
+            )),
+            "response.created"
+            | "response.in_progress"
+            | "response.output_item.added"
+            | "response.content_part.added"
+            | "response.content_part.done"
+            | "response.output_text.done"
+            | "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_text.done" => Ok(false),
+            _ => Err(crate::failure::provider_error(
+                crate::failure::ProviderReason::UnsupportedStreamEvent,
+            )),
+        }
+    }
+
+    pub(super) fn response(self) -> Result<Value> {
+        self.terminal.ok_or_else(|| {
+            crate::failure::provider_error(crate::failure::ProviderReason::StreamEnded)
+        })
+    }
+}
+
+fn parse_sse_frame(frame: &[u8]) -> Result<Option<(Option<String>, String)>> {
+    let text = std::str::from_utf8(frame).context("invalid OpenAI SSE encoding")?;
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.trim_end_matches('\n');
+    let mut event = None;
+    let mut data = Vec::new();
+    for line in normalized.lines() {
+        if let Some(value) = line.strip_prefix("event:") {
+            ensure!(event.is_none(), "duplicate OpenAI SSE event field");
+            event = Some(value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.strip_prefix(' ').unwrap_or(value));
+        } else if !line.is_empty() && !line.starts_with(':') {
+            bail!("unsupported OpenAI SSE field");
+        }
+    }
+    if data.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((event, data.join("\n"))))
 }
 
 fn output_content(output: &[Value]) -> Result<Vec<Value>> {

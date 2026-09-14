@@ -20,6 +20,58 @@ def reply(content, stop='end_turn'):
                       'cache_read_input_tokens': 2, 'cache_creation_input_tokens': 1}}
 
 
+def sse(event, payload):
+    data = payload if isinstance(payload, str) else json.dumps(payload, separators=(',', ':'))
+    return f'event: {event}\ndata: {data}\n\n'.encode()
+
+
+def anthropic_stream(value):
+    usage = value['usage']
+    frames = [sse('message_start', {
+        'type': 'message_start',
+        'message': {
+            'model': value['model'], 'role': 'assistant', 'content': [],
+            'usage': {
+                'input_tokens': usage['input_tokens'],
+                'cache_read_input_tokens': usage.get('cache_read_input_tokens', 0),
+                'cache_creation_input_tokens': usage.get('cache_creation_input_tokens', 0),
+            },
+        },
+    })]
+    for index, block in enumerate(value['content']):
+        if block['type'] == 'text':
+            frames.append(sse('content_block_start', {
+                'type': 'content_block_start', 'index': index,
+                'content_block': {'type': 'text', 'text': ''},
+            }))
+            frames.append(sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': index,
+                'delta': {'type': 'text_delta', 'text': block['text']},
+            }))
+        else:
+            frames.append(sse('content_block_start', {
+                'type': 'content_block_start', 'index': index,
+                'content_block': {
+                    'type': 'tool_use', 'id': block['id'], 'name': block['name'], 'input': {},
+                },
+            }))
+            frames.append(sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': index,
+                'delta': {
+                    'type': 'input_json_delta',
+                    'partial_json': json.dumps(block['input'], separators=(',', ':')),
+                },
+            }))
+        frames.append(sse('content_block_stop', {'type': 'content_block_stop', 'index': index}))
+    frames.append(sse('message_delta', {
+        'type': 'message_delta',
+        'delta': {'stop_reason': value['stop_reason']},
+        'usage': {'output_tokens': usage['output_tokens']},
+    }))
+    frames.append(sse('message_stop', {'type': 'message_stop'}))
+    return b''.join(frames)
+
+
 def call(name, args, id='call1'):
     return {'type': 'tool_use', 'id': id, 'name': name, 'input': args}
 
@@ -59,8 +111,13 @@ class Acceptance(unittest.TestCase):
                 owner.requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
                 status, body = owner.responses.pop(0)
                 data = json.dumps(body).encode()
+                stream = (status == 200 and owner.requests[-1].get('stream') is True
+                          and isinstance(body, dict) and body.get('model') == 'fixture-model'
+                          and isinstance(body.get('content'), list))
+                if stream:
+                    data = anthropic_stream(body)
                 self.send_response(status)
-                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Type', 'text/event-stream' if stream else 'application/json')
                 self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -440,13 +497,13 @@ class Acceptance(unittest.TestCase):
 
     def test_continue_on_length_joins_turn_and_counts_budget(self):
         # Issue #69 B: an opt-in continuation journals the partial assistant
-        # message plus a continuation user message; -p prints only the last
-        # piece and the budget receipt counts the continuation.
+        # message plus a continuation user message; token streaming renders
+        # both pieces and the budget receipt counts the continuation.
         self.responses.append((200, reply([{'type': 'text', 'text': 'PARTIAL1'}], stop='max_tokens')))
         self.final()
         p = self.run_cli('-p', '--continue-on-length', '1')
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(p.stdout.strip(), 'done')
+        self.assertEqual(p.stdout, 'PARTIAL1\ndone\n')
         entries = [json.loads(l) for l in self.session.read_text().splitlines()
                    if e_ok(l)]
         kinds = [(e['message']['role'], e['message'].get('dansoContinuation') is True)
@@ -481,8 +538,9 @@ class Acceptance(unittest.TestCase):
         self.responses.append((200, reply([{'type': 'text', 'text': 'PARTIAL'}], stop='max_tokens')))
         p = self.run_cli('-p')
         self.assertEqual(p.returncode, 3, p.stderr)
-        self.assertEqual(p.stdout, '')
+        self.assertEqual(p.stdout, 'PARTIAL')
         self.assertNotIn('PARTIAL', p.stderr)
+        self.assertIn('"stopReason":"length"', self.session.read_text())
         diagnostics = [l for l in p.stderr.splitlines() if l.startswith('DANSO_PROVIDER=')]
         self.assertEqual(len(diagnostics), 1, p.stderr)
         record = json.loads(diagnostics[0].split('=', 1)[1])

@@ -100,17 +100,49 @@ pub enum Mode {
     Text,
 }
 
-pub struct PrintSink(pub Mode);
+pub struct PrintSink {
+    mode: Mode,
+    streamed_active: bool,
+    streamed_pending: bool,
+}
+impl PrintSink {
+    pub fn new(mode: Mode) -> Self {
+        Self {
+            mode,
+            streamed_active: false,
+            streamed_pending: false,
+        }
+    }
+}
 impl EventSink for PrintSink {
     fn emit(&mut self, event: Event<'_>) -> Result<()> {
         let mut stdout = std::io::stdout().lock();
-        match (self.0, event) {
+        match (self.mode, event) {
             (
                 Mode::Json,
                 Event::Session(entry) | Event::Message(entry) | Event::Compaction(entry),
             ) => writeln!(stdout, "{entry}")?,
+            (Mode::Text, Event::TextDelta(text)) => {
+                if self.streamed_pending {
+                    writeln!(stdout)?;
+                    self.streamed_pending = false;
+                }
+                write!(stdout, "{text}")?;
+                stdout.flush()?;
+                self.streamed_active = true;
+            }
+            (Mode::Text, Event::Message(message))
+                if message["message"]["role"] == "assistant" && self.streamed_active =>
+            {
+                self.streamed_active = false;
+                self.streamed_pending = true;
+            }
             (Mode::Text, Event::FinalAnswer(message)) => {
-                if let Some(blocks) = message["content"].as_array() {
+                if self.streamed_active || self.streamed_pending {
+                    writeln!(stdout)?;
+                    self.streamed_active = false;
+                    self.streamed_pending = false;
+                } else if let Some(blocks) = message["content"].as_array() {
                     for block in blocks {
                         if let Some(text) = block["text"].as_str() {
                             writeln!(stdout, "{text}")?;

@@ -2,7 +2,10 @@
 
 Select the service with `--provider`; `--model` is always explicit. The original
 Anthropic path remains the default. These adapters use the same runtime,
-four builtin tools, sandbox, budgets, usage output and durable operation gates.
+four builtin tools, sandbox, budgets, usage output, durable operation gates and
+token-streaming output. Text deltas are delivered to the output sink only; the
+completed assistant message remains the sole journal entry and source of tool
+effects.
 The original three paths are tested against local HTTP fixtures. Real account/model
 acceptance remains pending; no API access is inferred from a model name.
 
@@ -69,9 +72,14 @@ model. Extra arguments are forwarded, so a later `--model` in argv wins.
 
 ## Protocol details and limits
 
-- OpenAI uses non-streaming Responses with `store: false`, the configured
-  output-token cap (default 16384, `--max-output-tokens`; issue #69 A), and
-  `include: ["reasoning.encrypted_content"]`. It exposes only local
+- Anthropic uses Messages SSE. Text deltas are rendered through the sink while
+  tool-input JSON stays buffered; truncated, failed or incomplete streams do
+  not journal an assistant message, retry the body, or dispatch a tool.
+- OpenAI uses Responses SSE with `store: false`, the configured output-token cap
+  (default 16384, `--max-output-tokens`; issue #69 A), and
+  `include: ["reasoning.encrypted_content"]`. Validated text/refusal deltas
+  are sink-only; function arguments remain buffered until the completed
+  response is validated. It exposes only local
   function tools. Tool schemas use `strict: false` to preserve optional builtin
   parameters. Hosted tools are not enabled.
 - The complete supported OpenAI output sequence (message, function call,
@@ -80,8 +88,8 @@ model. Extra arguments are forwarded, so a later `--model` in argv wins.
   before resending it. Responses must be completed; unsupported output items,
   missing opaque reasoning, malformed calls and incomplete batches fail before
   any tool executes. An OpenAI session missing its preserved output fails closed.
-- GLM uses non-streaming Chat Completions with the configured output-token cap
-  (default 16384, `--max-output-tokens`) and
+- GLM uses streaming Chat Completions with the configured output-token cap
+  (default 16384, `--max-output-tokens`), `stream_options.include_usage`, and
   `thinking: {type: "enabled"|"disabled", clear_thinking: false}`
   (`--glm-thinking`; issue #70 A). This targets the GLM-4.5+
   thinking/tool-capable protocol. Returned `reasoning_content` is stored in
@@ -121,8 +129,9 @@ python3 scripts/test_live_acceptance.py
 
 Provider fixtures cover auth/paths, all four tools, preserved reasoning, usage,
 resume without replay, malformed/incomplete batches, duplicate call IDs,
-response byte caps, HTTP failures, redirect rejection and pre-dispatch config/
-history errors. See [live acceptance](live-acceptance.md) for the separate
+response byte caps, ordered SSE deltas, cancellation without replay, HTTP
+failures, redirect rejection and pre-dispatch config/history errors. See [live
+acceptance](live-acceptance.md) for the separate
 operator-invoked canary.
 
 Protocol references checked for this implementation:
@@ -249,7 +258,8 @@ from zero, and duplicate indices always fail. A nonempty terminal output list
 remains authoritative and must agree with every retained completed item; it does
 not require a separate done event for every terminal item.
 The existing OpenAI output and opaque-reasoning validation still applies.
-No streamed delta is executed. Usage reports `openai-codex` and
+Validated text/refusal deltas are sink-only and no streamed delta is executed.
+Usage reports `openai-codex` and
 `openai-codex-responses`; terminal usage must be valid. The service's subscription
 request does not use the Platform adapter's `max_output_tokens:4096`; this
 adapter enforces byte, request deadline and run/turn limits, not a 4096-token
