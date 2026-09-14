@@ -13,16 +13,6 @@ pub struct Http {
     zai_diagnostics: bool,
 }
 impl Http {
-    /// Bearer-authenticated transport (OpenAI, GLM).
-    pub fn new(base: &str, suffix: &str, key: &str, timeout_seconds: u64) -> Result<Self> {
-        Self::new_with_budget(
-            base,
-            suffix,
-            key,
-            timeout_seconds,
-            super::DEFAULT_REQUEST_BUDGET_BYTES,
-        )
-    }
     /// Bearer-authenticated transport with a provider/model-derived request
     /// budget.
     pub fn new_with_budget(
@@ -40,27 +30,6 @@ impl Http {
             key,
             timeout_seconds,
             request_budget_bytes,
-        )
-    }
-    /// Transport for providers that authenticate with a non-Bearer header
-    /// (Anthropic uses `x-api-key`). The credential is still carried in a
-    /// sensitive `HeaderValue` and the same URL and redirect rules apply.
-    pub fn with_auth(
-        base: &str,
-        suffix: &str,
-        header: reqwest::header::HeaderName,
-        header_value: &str,
-        key: &str,
-        timeout_seconds: u64,
-    ) -> Result<Self> {
-        Self::with_auth_with_budget(
-            base,
-            suffix,
-            header,
-            header_value,
-            key,
-            timeout_seconds,
-            super::DEFAULT_REQUEST_BUDGET_BYTES,
         )
     }
     /// Header-authenticated transport with a provider/model-derived request
@@ -87,27 +56,6 @@ impl Http {
             Duration::from_secs(timeout_seconds),
             Duration::from_secs(10),
             request_budget_bytes,
-        )
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn with_timeouts(
-        base: &str,
-        suffix: &str,
-        header: reqwest::header::HeaderName,
-        header_value: &str,
-        key: &str,
-        request_timeout: Duration,
-        connect_timeout: Duration,
-    ) -> Result<Self> {
-        Self::with_timeouts_with_budget(
-            base,
-            suffix,
-            header,
-            header_value,
-            key,
-            request_timeout,
-            connect_timeout,
-            super::DEFAULT_REQUEST_BUDGET_BYTES,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -351,7 +299,7 @@ mod tests {
         });
         let scheme = if tls { "https" } else { "http" };
         let base = format!("{scheme}://127.0.0.1:{port}");
-        let client = Http::with_timeouts(
+        let client = Http::with_timeouts_with_budget(
             &base,
             "test",
             reqwest::header::AUTHORIZATION,
@@ -359,6 +307,7 @@ mod tests {
             "PRIVATE_KEY_MARKER",
             Duration::from_millis(if tls { 1000 } else { 150 }),
             Duration::from_millis(if tls { 100 } else { 1000 }),
+            crate::provider::DEFAULT_REQUEST_BUDGET_BYTES,
         )
         .unwrap();
         let request = serde_json::json!({"content":"PRIVATE_BODY_MARKER"});
@@ -429,7 +378,7 @@ mod tests {
             thread::sleep(Duration::from_millis(250));
         });
         let base = format!("http://127.0.0.1:{port}");
-        let client = Http::with_timeouts(
+        let client = Http::with_timeouts_with_budget(
             &base,
             "test",
             reqwest::header::AUTHORIZATION,
@@ -437,6 +386,7 @@ mod tests {
             "PRIVATE_KEY_MARKER",
             Duration::from_millis(100),
             Duration::from_secs(1),
+            crate::provider::DEFAULT_REQUEST_BUDGET_BYTES,
         )
         .unwrap();
         let request = serde_json::json!({"private":"PRIVATE_BODY_MARKER"});
