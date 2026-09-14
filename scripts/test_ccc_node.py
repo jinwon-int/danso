@@ -92,7 +92,8 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
         async for event in s.send_turn('do the bounded task'):
             events.append(event)
             if len(events) == 1:
-                running_at_interim = s._process is not None and s._process.poll() is None
+                running_at_interim = (s._process is not None
+                                      and s._process.returncode is None)
         self.assertEqual([e.kind for e in events],
                          ['text_delta', 'message_completed', 'text_delta',
                           'message_completed', 'result', 'completion'])

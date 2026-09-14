@@ -895,7 +895,7 @@ class DansoSession:
                     if not stderr_done and stderr_task.done():
                         stderr = stderr_task.result()
                         stderr_done = True
-                    if queued.done():
+                    if queued is not None and queued.done():
                         item = queued.result()
                         if item is None:
                             queued = None
