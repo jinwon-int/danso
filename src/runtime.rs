@@ -31,6 +31,9 @@ pub struct RunInput<'a> {
     pub context: &'a str,
     pub execution_context: &'a str,
     pub max_turns: u32,
+    /// Explicit compaction threshold. The composition root resolves `None`
+    /// from the selected provider/model; library callers may keep it unset to
+    /// disable compaction.
     pub compact_at_bytes: Option<usize>,
     /// Optional hook re-resolving the context string (e.g. per-request
     /// memory refresh, §5.3). Called only right after a compaction; the
@@ -103,7 +106,7 @@ fn action_system(
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum GateMode {
     Action,
     Summary,
@@ -209,6 +212,10 @@ impl<P: Provider, S: SessionStore> Provider for LongTaskProvider<'_, P, S> {
         self.provider.request_bytes(request)
     }
 
+    fn request_budget_bytes(&self) -> usize {
+        self.provider.request_budget_bytes()
+    }
+
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
         if let Some(limits) = self.ledger.limits
             && (self.ledger.requests >= limits.max_requests
@@ -230,8 +237,15 @@ impl<P: Provider, S: SessionStore> Provider for LongTaskProvider<'_, P, S> {
                 reason: self.cancellation_reason,
                 armed: true,
             };
+            let provider_started = Instant::now();
             let response = self.provider.complete(request, usage).await;
             guard.armed = false;
+            // Timing receipt (issue #98 e): only action requests count as
+            // provider requests; gated summary requests stay in
+            // `summary_requests`.
+            if self.mode == GateMode::Action {
+                usage.record_provider_request(checked_elapsed_ms(provider_started));
+            }
             response
         };
         let delta = token_delta(before, usage.snapshot())?;
@@ -309,6 +323,25 @@ fn token_delta(
 
 fn task_elapsed_ms(base_elapsed_ms: u64, started: Instant) -> u64 {
     base_elapsed_ms.saturating_add(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+/// Saturating wall time for the body-free timing receipt (issue #98 e).
+fn checked_elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// Times one durable journal append for the timing receipt (issue #98 e).
+/// The store keeps its durability/recovery contract; the runtime only
+/// observes elapsed time and never turns it into policy.
+fn journal_timed<S, T>(
+    usage: &mut Usage,
+    session: &mut S,
+    append: impl FnOnce(&mut S) -> Result<T>,
+) -> Result<T> {
+    let started = Instant::now();
+    let result = append(session);
+    usage.record_journal_append(checked_elapsed_ms(started));
+    result
 }
 
 fn fail_pending_action<S: SessionStore>(
@@ -393,6 +426,8 @@ pub async fn run(
     sink: &mut impl EventSink,
     usage: &mut Usage,
 ) -> Result<()> {
+    // Run clock for the per-request frames (issue #98 e).
+    let run_started = Instant::now();
     (|| {
         ensure!(
             (1..=128).contains(&input.max_turns),
@@ -422,7 +457,17 @@ pub async fn run(
             ensure!(
                 (crate::compaction::MIN_THRESHOLD..=crate::compaction::MAX_THRESHOLD)
                     .contains(&limit),
-                "compact-at-bytes must be 8192..393216"
+                "compact-at-bytes must be {}..={}",
+                crate::compaction::MIN_THRESHOLD,
+                crate::compaction::MAX_THRESHOLD
+            );
+            let max_for_provider =
+                crate::compaction::default_threshold(provider.request_budget_bytes());
+            ensure!(
+                limit <= max_for_provider,
+                "compact-at-bytes must leave {} bytes for the managed memory snapshot; provider/model budget allows at most {} bytes",
+                crate::compaction::MEMORY_SNAPSHOT_HEADROOM_BYTES,
+                max_for_provider
             );
             ensure!(
                 session.supports_compaction(),
@@ -520,8 +565,7 @@ pub async fn run(
         .is_some_and(|task| task.resume && !task.follow_up)
     {
         let user = json!({"role":"user","content":input.prompt,"timestamp":millis()});
-        let entry = session
-            .append_message(user.clone())
+        let entry = journal_timed(usage, session, |s| s.append_message(user.clone()))
             .map_err(at(Kind::Session))?;
         created_user_entry_id = entry["id"].as_str().map(str::to_owned);
         sink.emit(Event::Message(&entry))
@@ -738,8 +782,7 @@ pub async fn run(
                         after <= limit && after < before,
                         "compaction did not reduce request below threshold"
                     );
-                    let entry = session
-                        .record_compaction(summary)
+                    let entry = journal_timed(usage, session, |s| s.record_compaction(summary))
                         .map_err(at(Kind::Session))?;
                     // Durable checkpoint before the next request; renderer failure
                     // also stops continuation, leaving a resumable journal.
@@ -761,6 +804,7 @@ pub async fn run(
         sink.emit(Event::Request {
             sequence: request_sequence,
             remaining,
+            elapsed_ms: checked_elapsed_ms(run_started),
         })
         .map_err(at(Kind::Output))?;
         if input.long_task.is_some()
@@ -797,7 +841,8 @@ pub async fn run(
                 )
                 .await
         } else {
-            provider
+            let provider_started = Instant::now();
+            let response = provider
                 .complete(
                     ModelRequest {
                         system: crate::provider::SystemParts {
@@ -809,7 +854,9 @@ pub async fn run(
                     },
                     usage,
                 )
-                .await
+                .await;
+            usage.record_provider_request(checked_elapsed_ms(provider_started));
+            response
         }
         .map_err(at(Kind::Provider))?;
         let calls = (|| {
@@ -849,8 +896,7 @@ pub async fn run(
             ensure!(ids.insert(call.id.clone()), "duplicate tool call id");
         }
         sink.emit(Event::Message(
-            &session
-                .append_message(message.clone())
+            &journal_timed(usage, session, |s| s.append_message(message.clone()))
                 .map_err(at(Kind::Session))?,
         ))
         .map_err(at(Kind::Output))?;
@@ -893,8 +939,7 @@ pub async fn run(
                     "dansoContinuation":true
                 });
                 sink.emit(Event::Message(
-                    &session
-                        .append_message(notice.clone())
+                    &journal_timed(usage, session, |s| s.append_message(notice.clone()))
                         .map_err(at(Kind::Session))?,
                 ))
                 .map_err(at(Kind::Output))?;
@@ -921,11 +966,13 @@ pub async fn run(
         }
         let mut batch = Vec::new();
         for call in calls {
-            session
-                .record_operation(&call.id, OperationState::Started)
-                .map_err(at(Kind::Session))?;
+            journal_timed(usage, session, |s| {
+                s.record_operation(&call.id, OperationState::Started)
+            })
+            .map_err(at(Kind::Session))?;
             sink.emit(Event::ToolStarted(&call.name))
                 .map_err(at(Kind::Output))?;
+            let tool_started = Instant::now();
             let outcome = match executor.execute(&call).await {
                 Ok(result) => result,
                 Err(e) => crate::contracts::ToolOutcome {
@@ -933,6 +980,7 @@ pub async fn run(
                     is_error: true,
                 },
             };
+            usage.record_tool_execution(checked_elapsed_ms(tool_started));
             batch.push((
                 call.name.clone(),
                 call.arguments.clone(),
@@ -941,14 +989,14 @@ pub async fn run(
             ));
             let result = json!({"role":"toolResult","toolCallId":call.id,"toolName":call.name,"content":[{"type":"text","text":outcome.output}],"isError":outcome.is_error,"timestamp":millis()});
             sink.emit(Event::Message(
-                &session
-                    .append_message(result.clone())
+                &journal_timed(usage, session, |s| s.append_message(result.clone()))
                     .map_err(at(Kind::Session))?,
             ))
             .map_err(at(Kind::Output))?;
-            session
-                .record_operation(&call.id, OperationState::Settled)
-                .map_err(at(Kind::Session))?;
+            journal_timed(usage, session, |s| {
+                s.record_operation(&call.id, OperationState::Settled)
+            })
+            .map_err(at(Kind::Session))?;
             sink.emit(Event::ToolSettled {
                 is_error: outcome.is_error,
             })

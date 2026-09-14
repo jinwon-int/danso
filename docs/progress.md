@@ -15,6 +15,17 @@ There is at most one active tool. These records are notifications, not journal
 entries, tool calls, approvals, or input instructions. Do not import the mixed
 stream as a session file; retain the actual `--session` journal instead.
 
+With `--stream-requests`, the same stream also carries one body-free
+`danso_request` frame per model request dispatch (issue #69 F), now including
+the run-clock `elapsed_ms` stamp (issue #98 e):
+
+```json
+{"type":"danso_request","version":1,"sequence":1,"remaining":47,"elapsed_ms":12}
+```
+
+`elapsed_ms` counts milliseconds from run start to the dispatch of that
+request; it is integer telemetry only and never identifies content.
+
 - `started` is emitted and flushed after the native `started` operation marker
   is durably saved and before dispatching the executor.
 - `settled` follows result persistence and the durable `settled` marker.

@@ -46,11 +46,16 @@ class Compaction(fixture.Fixture):
                     'DANSO_ANTHROPIC_BASE_URL': f'http://127.0.0.1:{self.server.server_port}'}
         return super().env(provider)
 
-    def run_cli(self, provider, *extra, env=None):
-        return subprocess.run([str(fixture.BIN), '--sandbox', 'bubblewrap', '--cwd', str(self.repo), '--session', str(self.session),
-                               '--provider', provider, '--model', 'fixture', '--compact-at-bytes', '8192',
-                               '--max-turns', '32', *extra, '-p', 'ORIGINAL_GOAL finish without repeated effects'],
-                              capture_output=True, text=True, timeout=25, env=env or self.env(provider))
+    def run_cli(self, provider, *extra, env=None, model='fixture', compact_at_bytes=8192,
+                max_turns=32, timeout=25):
+        command = [str(fixture.BIN), '--sandbox', 'bubblewrap', '--cwd', str(self.repo),
+                   '--session', str(self.session), '--provider', provider, '--model', model]
+        if compact_at_bytes is not None:
+            command += ['--compact-at-bytes', str(compact_at_bytes)]
+        command += ['--max-turns', str(max_turns), *extra,
+                    '-p', 'ORIGINAL_GOAL finish without repeated effects']
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout,
+                              env=env or self.env(provider))
 
     def test_compaction_executor_retains_isolation(self):
         outside = self.root / 'outside-marker'
@@ -117,7 +122,7 @@ class Compaction(fixture.Fixture):
             self.assertIn('report incomplete work and omitted checks honestly', system)
         self.assertNotIn('Runtime request budget for this run:', self.session.read_text())
 
-    def queue_task(self, provider, rounds=3, bad_summary=None, duplicate=False):
+    def queue_task(self, provider, rounds=3, bad_summary=None, duplicate=False, output_bytes=9000):
         state = {'actions': 0, 'summaries': 0, 'action_requests': [], 'summary_requests': []}
         def serve(body):
             if not body['tools']:
@@ -129,10 +134,31 @@ class Compaction(fixture.Fixture):
             state['actions'] += 1
             if step >= rounds:
                 return reply(provider)
-            action = [('bash', {'command': f"echo step{step} >> effects.txt; printf '%09000d' 0"})]
+            action = [('bash', {'command': f"echo step{step} >> effects.txt; printf '%0{output_bytes}d' 0"})]
             return set_call_id(provider, reply(provider, action), 'effect0' if duplicate else f'effect{step}')
         self.responses.extend([(200, serve)] * 50)
         return state
+
+    def test_provider_budget_reduces_summary_requests_for_same_synthetic_session(self):
+        counts = {}
+        for label, threshold in (('before', 131072), ('after', None)):
+            with self.subTest(label=label):
+                self.session = self.root / f'policy-{label}.jsonl'
+                (self.repo / 'effects.txt').write_text('')
+                self.responses.clear()
+                state = self.queue_task('glm', rounds=28, output_bytes=40000)
+                result = self.run_cli('glm', model='glm-5.3-flash',
+                                      compact_at_bytes=threshold, max_turns=128, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(state['actions'], 29)
+                counts[label] = state['summaries']
+                self.assertGreater(state['summaries'], 0)
+        self.assertGreater(counts['before'], counts['after'])
+        print(
+            'SUMMARY_REQUEST_COMPARISON '
+            f"before={counts['before']} after={counts['after']} "
+            f"reduction={counts['before'] - counts['after']}"
+        )
 
     def test_explicit_memory_survives_compaction_without_journal_copy_or_tool_mount(self):
         memory = self.root / 'private-memory.md'

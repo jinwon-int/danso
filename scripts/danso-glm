@@ -29,6 +29,5 @@ exec "$danso" \
     --glm-endpoint coding \
     --reasoning-effort low \
     --max-turns 48 \
-    --compact-at-bytes 131072 \
     --provider-timeout-seconds 120 \
     "$@"

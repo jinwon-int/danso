@@ -426,3 +426,123 @@ async fn continuation_of_length_stop_journals_notice_and_final_answer_is_last_pi
     let (summaries, length_stops, continuations) = usage.budget_counts();
     assert_eq!((summaries, length_stops, continuations), (0, 1, 1));
 }
+
+struct SyntheticCompactionProvider {
+    action_requests: usize,
+    summary_requests: usize,
+}
+
+impl Provider for SyntheticCompactionProvider {
+    fn validate_history(&self, _: &[Value]) -> Result<()> {
+        Ok(())
+    }
+
+    fn request_budget_bytes(&self) -> usize {
+        effective_request_budget("glm", "glm-5.3-flash")
+    }
+
+    async fn complete(&mut self, request: ModelRequest<'_>, _: &mut Usage) -> Result<Value> {
+        if request.tools.is_empty() {
+            self.summary_requests += 1;
+            return Ok(json!({
+                "role":"assistant",
+                "stopReason":"stop",
+                "content":[{"type":"text","text":compaction::empty_summary().to_string()}]
+            }));
+        }
+        let step = self.action_requests;
+        self.action_requests += 1;
+        if step >= 28 {
+            return Ok(json!({
+                "role":"assistant",
+                "stopReason":"stop",
+                "content":[{"type":"text","text":"synthetic complete"}]
+            }));
+        }
+        Ok(json!({
+            "role":"assistant",
+            "stopReason":"toolUse",
+            "content":[{"type":"toolCall","id":format!("synthetic-{step}"),
+                         "name":"emit","arguments":{}}]
+        }))
+    }
+}
+
+struct SyntheticCompactionExecutor;
+
+impl ToolExecutor for SyntheticCompactionExecutor {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "emit".into(),
+            description: "return a fixed synthetic result".into(),
+            parameters: json!({"type":"object","properties":{}}),
+        }]
+    }
+
+    async fn preflight(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn execute(&self, _: &ToolCall) -> Result<ToolOutcome> {
+        Ok(ToolOutcome {
+            output: "x".repeat(40_000),
+            is_error: false,
+        })
+    }
+}
+
+async fn synthetic_summary_requests(threshold: usize) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("synthetic-session.jsonl");
+    let mut session = Session::open(&path, Path::new("/fixture")).unwrap();
+    let mut provider = SyntheticCompactionProvider {
+        action_requests: 0,
+        summary_requests: 0,
+    };
+    runtime::run(
+        RunInput {
+            no_tools: false,
+            prompt: "run the same synthetic session",
+            context: "",
+            execution_context: "",
+            max_turns: 128,
+            compact_at_bytes: Some(threshold),
+            refresh_context: None,
+            long_task: None,
+            repeat_limit: 0,
+            continuation_limit: 0,
+            stream_requests: false,
+            report_progress: false,
+            pause_requested: None,
+            cancellation_reason: None,
+        },
+        &mut provider,
+        &SyntheticCompactionExecutor,
+        &mut session,
+        &mut Sink,
+        &mut Usage::default(),
+    )
+    .await
+    .unwrap();
+    provider.summary_requests
+}
+
+#[tokio::test]
+async fn provider_budget_reduces_summary_requests_for_the_same_synthetic_session() {
+    let before = synthetic_summary_requests(131_072).await;
+    let budget = effective_request_budget("glm", "glm-5.3-flash");
+    let after = synthetic_summary_requests(compaction::default_threshold(budget)).await;
+    assert!(before > after, "before={before}, after={after}");
+    println!(
+        "SUMMARY_REQUEST_COMPARISON before={before} after={after} reduction={}",
+        before - after
+    );
+    assert_eq!(
+        compaction::default_threshold(budget),
+        budget - compaction::MEMORY_SNAPSHOT_HEADROOM_BYTES
+    );
+    assert_eq!(
+        compaction::MAX_THRESHOLD,
+        MAX_REQUEST_BUDGET_BYTES - compaction::MEMORY_SNAPSHOT_HEADROOM_BYTES
+    );
+}

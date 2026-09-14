@@ -12,9 +12,10 @@ pub struct ChatGpt {
     base: String,
     timeout: u64,
     account: String,
+    request_budget_bytes: usize,
 }
 impl ChatGpt {
-    pub fn new(path: &Path, base: &str, timeout: u64) -> Result<Self> {
+    pub fn new(path: &Path, base: &str, timeout: u64, request_budget_bytes: usize) -> Result<Self> {
         let url =
             reqwest::Url::parse(base).map_err(|_| anyhow::anyhow!("invalid ChatGPT endpoint"))?;
         ensure!(
@@ -28,12 +29,13 @@ impl ChatGpt {
             "ChatGPT endpoint must be the Codex service or literal loopback HTTP fixture"
         );
         let (token, account) = super::chatgpt_auth::inspect(path)?;
-        Http::new(base, "responses", &token, timeout)?;
+        Http::new_with_budget(base, "responses", &token, timeout, request_budget_bytes)?;
         Ok(Self {
             path: path.into(),
             base: base.into(),
             timeout,
             account,
+            request_budget_bytes,
         })
     }
     pub async fn post(&self, body: &Value, usage: &mut crate::usage::Usage) -> Result<Value> {
@@ -60,9 +62,15 @@ impl ChatGpt {
             "accept",
             reqwest::header::HeaderValue::from_static("text/event-stream"),
         );
-        let data = Http::new(&self.base, "responses", &token, self.timeout)?
-            .post_until(body, usage, headers, completed_prefix)
-            .await?;
+        let data = Http::new_with_budget(
+            &self.base,
+            "responses",
+            &token,
+            self.timeout,
+            self.request_budget_bytes,
+        )?
+        .post_until(body, usage, headers, completed_prefix)
+        .await?;
         terminal_response(&data)
     }
 }

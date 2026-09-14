@@ -24,7 +24,13 @@ contract = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = contract
 spec.loader.exec_module(contract)
 sys.path.insert(0, str(ROOT))
-from integrations.ccc_node import DansoRuntime, _failure, _transport
+from integrations.ccc_node import (
+    COMPACTION_MAX_BYTES,
+    REQUEST_BUDGET_MAX_BYTES,
+    DansoRuntime,
+    _failure,
+    _transport,
+)
 
 
 async def collect(session, message='do the bounded task'):
@@ -299,7 +305,7 @@ class Worker(fixture.Fixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_compaction_setting_validation(self):
         self.assertIsNone(self.runtime.compact_at_bytes)
-        for value in (True, False, 8191, 393217, '8192', 8192.0):
+        for value in (True, False, 8191, COMPACTION_MAX_BYTES + 1, '8192', 8192.0):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 DansoRuntime(binary=fixture.BIN, state_directory=self.root / 'state',
                              provider='glm', model='fixture', environment=self.env('glm'),
@@ -563,7 +569,8 @@ class TransportDiagnostics(unittest.IsolatedAsyncioTestCase):
             '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"extra":"PRIVATE"}',
             '{"version":1,"phase":"PRIVATE","elapsed_ms":1,"request_bytes":1}',
             '{"version":1,"phase":"response_body","elapsed_ms":true,"request_bytes":1}',
-            '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":524289}',
+            json.dumps({'version': 1, 'phase': 'response_body', 'elapsed_ms': 1,
+                        'request_bytes': REQUEST_BUDGET_MAX_BYTES + 1, 'attempts': 1}),
             '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"request_bytes":2}',
             '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"attempts":0}',
             '{"version":1,"phase":"response_body","elapsed_ms":1,"request_bytes":1,"attempts":"1"}',
