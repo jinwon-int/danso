@@ -661,7 +661,13 @@ mod tests {
         let route = setup_route(dir.path());
         write(&route.working_state_file(), "## objective\nfinish M2\n");
         let path = route.working_state_file();
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 86400);
+        // Age is computed against options.now (the fixed snapshot clock), so
+        // derive the mtime from that same clock. Deriving it from the real
+        // clock silently decays once real time passes fixed_now + 6 days and
+        // the 20-day-old fixture reads as 13 days old (time-bomb, 2026-09-14).
+        let fixed_now = facts::parse_timestamp("2026-09-08T12:00:00Z").unwrap();
+        let old = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(fixed_now.timestamp() as u64 - 20 * 86400);
         std::fs::File::options()
             .write(true)
             .open(&path)
