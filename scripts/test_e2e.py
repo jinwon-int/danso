@@ -503,7 +503,9 @@ class Acceptance(unittest.TestCase):
         self.final()
         p = self.run_cli('-p', '--continue-on-length', '1')
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(p.stdout, 'PARTIAL1\ndone\n')
+        # Default path (-p) prints only the last piece; provider SSE
+        # streaming stays behind DANSO_PROVIDER_STREAM (issue #98 b).
+        self.assertEqual(p.stdout.strip(), 'done')
         entries = [json.loads(l) for l in self.session.read_text().splitlines()
                    if e_ok(l)]
         kinds = [(e['message']['role'], e['message'].get('dansoContinuation') is True)
@@ -538,7 +540,7 @@ class Acceptance(unittest.TestCase):
         self.responses.append((200, reply([{'type': 'text', 'text': 'PARTIAL'}], stop='max_tokens')))
         p = self.run_cli('-p')
         self.assertEqual(p.returncode, 3, p.stderr)
-        self.assertEqual(p.stdout, 'PARTIAL')
+        self.assertEqual(p.stdout, '')
         self.assertNotIn('PARTIAL', p.stderr)
         self.assertIn('"stopReason":"length"', self.session.read_text())
         diagnostics = [l for l in p.stderr.splitlines() if l.startswith('DANSO_PROVIDER=')]

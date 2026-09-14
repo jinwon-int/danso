@@ -251,6 +251,12 @@ class Fixture(unittest.TestCase):
         return {'PATH': '/usr/bin:/bin', 'HOME': str(self.home), key_name: 'synthetic-key',
                 f'DANSO_{prefix}_BASE_URL': f'http://127.0.0.1:{self.server.server_port}/api'}
 
+    def streaming_env(self, provider):
+        # Opt the runtime into provider SSE ingestion (issue #98 b).
+        env = self.env(provider)
+        env['DANSO_PROVIDER_STREAM'] = '1'
+        return env
+
     def run_cli(self, provider, *extra, env=None, model='fixture'):
         return subprocess.run([str(BIN), *self.execution_args, '--cwd', str(self.repo), '--session', str(self.session),
                                '--provider', provider, '--model', model, *extra, '-p', 'do task'],
@@ -271,10 +277,21 @@ class Providers(Fixture):
                 self.session = self.root / f'delta-{provider}.jsonl'
                 text = f'{provider}-delta-order'
                 self.responses.append((200, response(provider, text=text)))
-                p = self.run_cli(provider, '--no-tools')
+                p = self.run_cli(provider, '--no-tools', env=self.streaming_env(provider))
                 self.assertEqual(p.returncode, 0, p.stderr)
-                self.assertEqual(p.stdout, text + '\n')
                 self.assertTrue(self.requests[-1]['stream'])
+                # Live deltas stream as frames; the FinalAnswer render is
+                # suppressed so the text is never written twice.
+                deltas, tail = [], []
+                for line in p.stdout.splitlines():
+                    if line.startswith('{"type":"danso_text_delta"'):
+                        deltas.append(json.loads(line)['text'])
+                    elif line.strip():
+                        tail.append(line)
+                self.assertTrue(deltas, p.stdout)
+                self.assertEqual(''.join(deltas), text)
+                # FinalAnswer render is suppressed: the frames carried the text.
+                self.assertEqual(tail, [])
                 self.assertEqual(
                     self.paths[-1],
                     {'anthropic': '/api/v1/messages', 'openai': '/api/responses',
@@ -292,7 +309,8 @@ class Providers(Fixture):
                 self.session = self.root / f'incomplete-{provider}.jsonl'
                 before_requests = len(self.requests)
                 self.responses.append((200, body))
-                p = self.run_cli(provider, '--provider-retries', '3', '--no-tools')
+                p = self.run_cli(provider, '--provider-retries', '3', '--no-tools',
+                                 env=self.streaming_env(provider))
                 self.assertEqual(p.returncode, 3, p.stderr)
                 self.assertNotIn('"role":"assistant"', self.session.read_text())
                 self.assertEqual(len(self.requests), before_requests + 1)
@@ -309,12 +327,16 @@ class Providers(Fixture):
                            '--provider', provider, '--model', 'fixture', '--provider-retries', '3', '--no-tools',
                            '-p', 'do task']
                 process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                           text=True, env=self.env(provider))
+                                           text=True, env=self.streaming_env(provider))
                 self.assertTrue(self.first_stream_chunk.wait(5), 'fixture did not start the SSE response')
                 process.terminate()
                 stdout, stderr = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 143, stderr)
-                self.assertNotIn('cancel-after-first-delta', stdout)
+                # Any cancelled text may only ever appear inside a live
+                # delta frame — never as final output or a journal entry.
+                for line in stdout.splitlines():
+                    if 'cancel-after-first-delta' in line:
+                        self.assertIn('danso_text_delta', line)
                 self.assertNotIn('"role":"assistant"', self.session.read_text())
                 self.assertEqual(len(self.requests), before_requests + 1)
 

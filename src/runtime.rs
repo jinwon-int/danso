@@ -845,11 +845,19 @@ pub async fn run(
                 "long-task paused at a settled boundary"
             )));
         }
-        // The action path requests whole responses: interim text reaches the
-        // sink at durable message boundaries (issue #98 a), while provider
-        // SSE ingestion (issue #98 b) stays a Provider-layer capability the
-        // runtime can opt into through complete_streaming later.
+        // The action path defaults to whole responses: interim text reaches
+        // the sink at durable message boundaries (issue #98 a). Setting
+        // DANSO_PROVIDER_STREAM=1 opts the runtime into provider SSE
+        // ingestion (issue #98 b): deltas stream to the sink as they arrive
+        // and the boundary emits only the completion marker, so consumers
+        // never see the same text twice.
+        let provider_streaming = std::env::var("DANSO_PROVIDER_STREAM").as_deref() == Ok("1");
+        let mut streamed = false;
         let message = {
+            let mut on_delta = |delta: &str| {
+                streamed = true;
+                sink.emit(Event::TextDelta(delta))
+            };
             if input.long_task.is_some() {
                 let mut gated = LongTaskProvider::new(
                     provider,
@@ -860,34 +868,68 @@ pub async fn run(
                     task_base_elapsed_ms,
                     input.cancellation_reason,
                 );
-                gated
-                    .complete(
-                        ModelRequest {
-                            system: crate::provider::SystemParts {
-                                stable: &base_system,
-                                volatile: &guidance,
+                if provider_streaming {
+                    gated
+                        .complete_streaming(
+                            ModelRequest {
+                                system: crate::provider::SystemParts {
+                                    stable: &base_system,
+                                    volatile: &guidance,
+                                },
+                                messages: &messages,
+                                tools: &definitions,
                             },
-                            messages: &messages,
-                            tools: &definitions,
-                        },
-                        usage,
-                    )
-                    .await
+                            usage,
+                            &mut on_delta,
+                        )
+                        .await
+                } else {
+                    gated
+                        .complete(
+                            ModelRequest {
+                                system: crate::provider::SystemParts {
+                                    stable: &base_system,
+                                    volatile: &guidance,
+                                },
+                                messages: &messages,
+                                tools: &definitions,
+                            },
+                            usage,
+                        )
+                        .await
+                }
             } else {
                 let provider_started = Instant::now();
-                let response = provider
-                    .complete(
-                        ModelRequest {
-                            system: crate::provider::SystemParts {
-                                stable: &base_system,
-                                volatile: &guidance,
+                let response = if provider_streaming {
+                    provider
+                        .complete_streaming(
+                            ModelRequest {
+                                system: crate::provider::SystemParts {
+                                    stable: &base_system,
+                                    volatile: &guidance,
+                                },
+                                messages: &messages,
+                                tools: &definitions,
                             },
-                            messages: &messages,
-                            tools: &definitions,
-                        },
-                        usage,
-                    )
-                    .await;
+                            usage,
+                            &mut on_delta,
+                        )
+                        .await
+                } else {
+                    provider
+                        .complete(
+                            ModelRequest {
+                                system: crate::provider::SystemParts {
+                                    stable: &base_system,
+                                    volatile: &guidance,
+                                },
+                                messages: &messages,
+                                tools: &definitions,
+                            },
+                            usage,
+                        )
+                        .await
+                };
                 usage.record_provider_request(checked_elapsed_ms(provider_started));
                 response
             }
@@ -938,8 +980,15 @@ pub async fn run(
             // Interim boundary: the message is durable and the loop is about
             // to run tools, so the text can stream without attaching any
             // tool effect to partial output. The final answer keeps its own
-            // FinalAnswer event and rendering.
-            stream_assistant_text(sink, &message)?;
+            // FinalAnswer event and rendering. When the provider already
+            // streamed this text as live deltas (issue #98 b), the boundary
+            // only closes the message.
+            if streamed {
+                sink.emit(Event::MessageCompleted)
+                    .map_err(at(Kind::Output))?;
+            } else {
+                stream_assistant_text(sink, &message)?;
+            }
         }
         messages.push(message.clone());
         if input.long_task.is_some() {

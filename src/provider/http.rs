@@ -283,7 +283,12 @@ impl Http {
                     let retryable = crate::failure::transport(&diagnostic)
                         .is_some_and(retryable_transport_phase);
                     if attempt < attempts && retryable {
+                        let waited = Instant::now();
                         tokio::time::sleep(retry_delay(attempt, None)).await;
+                        // Body-free timing (issue #98 e): the backoff actually slept.
+                        usage.record_retry_wait(
+                            waited.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                        );
                         continue;
                     }
                     return Err(diagnostic);
@@ -294,7 +299,12 @@ impl Http {
                 let retry_after = retry_after_seconds(response.headers());
                 if attempt < attempts && retryable_status(status.as_u16()) {
                     drop(response);
+                    let waited = Instant::now();
                     tokio::time::sleep(retry_delay(attempt, retry_after)).await;
+                    // Body-free timing (issue #98 e): the backoff actually slept.
+                    usage.record_retry_wait(
+                        waited.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+                    );
                     continue;
                 }
                 let error = crate::failure::http_status_error(status);
