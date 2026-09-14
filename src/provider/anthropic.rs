@@ -11,6 +11,7 @@ pub struct Anthropic {
     headers: reqwest::header::HeaderMap,
     model: String,
     max_output_tokens: u32,
+    request_budget_bytes: usize,
 }
 impl Anthropic {
     pub fn new(model: String, key: String, base: &str) -> Result<Self> {
@@ -28,13 +29,15 @@ impl Anthropic {
         // query or fragment in the base URL, no redirects, connect timeout,
         // sensitive credential header, bounded request and response) is the
         // shared one.
-        let http = Http::with_auth(
+        let request_budget_bytes = super::effective_request_budget("anthropic", &model);
+        let http = Http::with_auth_with_budget(
             base,
             "v1/messages",
             reqwest::header::HeaderName::from_static("x-api-key"),
             &key,
             &key,
             timeout_seconds,
+            request_budget_bytes,
         )?;
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -46,6 +49,7 @@ impl Anthropic {
             headers,
             model,
             max_output_tokens,
+            request_budget_bytes,
         })
     }
     /// Bounded wire-retry budget (issue #67 B); 0 disables.
@@ -79,6 +83,10 @@ impl Anthropic {
     }
 }
 impl Provider for Anthropic {
+    fn request_budget_bytes(&self) -> usize {
+        self.request_budget_bytes
+    }
+
     fn max_output_tokens(&self) -> u32 {
         self.max_output_tokens
     }
@@ -90,8 +98,8 @@ impl Provider for Anthropic {
     }
     async fn complete(&mut self, request: ModelRequest<'_>, usage: &mut Usage) -> Result<Value> {
         let body = self.body(&request)?;
-        // Http enforces the 512 KiB request bound, the 1 MiB response bound,
-        // HTTP status and credential-safe transport errors.
+        // Http enforces the provider/model request budget, the 1 MiB response
+        // bound, HTTP status and credential-safe transport errors.
         let bytes = self
             .http
             .post_bytes(&body, usage, self.headers.clone())

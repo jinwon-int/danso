@@ -1,17 +1,23 @@
 # Context compaction and resume
 
-Experimental, opt-in model checkpoints for a long task:
+Provider/model-aware model checkpoints for a long task:
 
 ```sh
 danso-glm --cwd /path/to/repo --session /path/to/sessions/task.jsonl \
   --compact-at-bytes 196608 --max-turns 48 -p 'Complete the task and verify it'
 ```
 
-The session parent must already exist outside the workspace. Compaction is
-opt-in. Without `--compact-at-bytes`, the original hard request limit remains.
-A session containing Danso checkpoints can be resumed with or without this flag;
-the flag enables creation of additional checkpoints, not interpretation of old
-ones. Choose the same provider/model when resuming.
+The session parent must already exist outside the workspace. Without an explicit
+`--compact-at-bytes`, the native adapter derives a request budget from the
+selected provider/model and starts compaction at that budget minus 32 KiB. A
+session containing Danso checkpoints can be resumed with or without an explicit
+override; the threshold controls creation of additional checkpoints, not
+interpretation of old ones. Choose the same provider/model when resuming.
+
+The operational model table and its estimates are documented in
+[providers.md](providers.md#providermodel-request-budgets). The request budget
+is `floor(context_window_tokens × 70%) × bytes_per_token`; exact serialized
+wire bytes remain authoritative.
 
 ## What is preserved
 
@@ -74,9 +80,20 @@ checkpoint; there is no automatic ACK, tool replay or journal repair. A bounded 
 
 ## Limits and accounting
 
-- `--compact-at-bytes`: 8192..393216 bytes. The threshold is measured against
-  the exact serialized provider request, including JSON escaping, instructions,
-  tool schemas and provider fields. It is a byte budget, not a token estimate.
+- `--compact-at-bytes`: 8192..=2767232 bytes globally. The selected
+  provider/model may impose a lower upper bound. The threshold is measured
+  against the exact serialized provider request, including JSON escaping,
+  instructions, tool schemas and provider fields. It is a byte threshold
+  derived from a token estimate, not a token count.
+- The default is `effective_request_budget - 32768`, where 32768 is the
+  `MANAGED_BLOCK_MAX_BYTES` memory-snapshot cap. That headroom is reserved so a
+  maximum rendered snapshot can still be present in the next action request.
+  The old CCC default of 131072 bytes was a fixed four-times-32-KiB heuristic;
+  it caused compaction far below larger model windows. The new threshold
+  recomputes the same 32 KiB reservation for every provider/model pair.
+- The transport hard-fails only when the exact request exceeds the selected
+  provider/model budget. An explicit threshold cannot spend the reserved
+  snapshot headroom, and it cannot exceed that selected budget.
 - The current request and static instructions must leave room for a checkpoint.
   Impossible budgets fail before any summary call; they are not silently cut.
 - Historical evidence is fed to the summarizer in consecutive UTF-8-safe
@@ -103,7 +120,9 @@ python3 scripts/test_compaction.py
 ```
 
 The offline suite forces multiple compactions with an 8 KiB budget across all
-three providers, checks resume and global ID retention, and covers malformed
+three providers, compares summary-request counts for the same synthetic session
+at the old 131072-byte threshold and the derived default, and checks resume and
+global ID retention. It also covers malformed
 summaries, budget exhaustion, corrupt boundaries, unsettled prefixes, interruption
 and disk-write failure. It uses local fake providers and real bubblewrap.
 It also generates real structured worker test receipts for passing and failing
