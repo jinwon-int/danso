@@ -65,7 +65,14 @@ impl EventSink for ChannelSink {
             // Issue #98 (item a): interim assistant text at its durable
             // message boundary. Forwarded as a render notification only;
             // never a journal record and never authorization to act.
-            Event::TextDelta(text) => self.send(AgentEvent::text_delta(text.to_string())),
+            // AgentEvent::text_delta rejects empty text; an empty delta is
+            // a rendering no-op, so skip it rather than failing the sink.
+            Event::TextDelta(text) => {
+                if text.is_empty() {
+                    return Ok(());
+                }
+                self.send(AgentEvent::text_delta(text.to_string())?)
+            }
             Event::MessageCompleted => self.send(AgentEvent::MessageCompleted),
             Event::Message(entry) => {
                 if entry["role"] == "assistant"
