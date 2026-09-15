@@ -133,16 +133,18 @@ pub fn inspect_at(
         .and_then(|config| config.memory.dir.clone())
         .unwrap_or_else(memory::MemoryConfig::default_root);
 
-    let mut checks = Vec::with_capacity(9);
-    checks.push(config_check);
-    checks.push(config_permissions(&config_path));
-    checks.push(home_layout(home, &memory_dir));
-    checks.push(telegram_data_dir_check(telegram_data_dir));
-    checks.push(telegram_health(telegram_data_dir, generated_at));
-    checks.push(telegram_token_lock(telegram_data_dir));
-    checks.push(telegram_token_file(parsed_config.as_ref()));
-    checks.push(telegram_conversations(telegram_data_dir));
-    checks.push(memory_store(&memory_dir));
+    // The nine checks are emitted in this documented order (docs/doctor.md).
+    let checks = vec![
+        config_check,
+        config_permissions(&config_path),
+        home_layout(home, &memory_dir),
+        telegram_data_dir_check(telegram_data_dir),
+        telegram_health(telegram_data_dir, generated_at),
+        telegram_token_lock(telegram_data_dir),
+        telegram_token_file(parsed_config.as_ref()),
+        telegram_conversations(telegram_data_dir),
+        memory_store(&memory_dir),
+    ];
     let summary = Summary::from_checks(&checks);
 
     DoctorReport {
@@ -170,10 +172,7 @@ fn inspect_config(path: &Path) -> (Check, Option<config::Config>) {
             ),
             Err(_) => (Check::fail("config.parse", "config invalid"), None),
         },
-        Err(_) if is_missing(path) => (
-            Check::fail("config.parse", "config file missing"),
-            None,
-        ),
+        Err(_) if is_missing(path) => (Check::fail("config.parse", "config file missing"), None),
         Err(_) => (Check::fail("config.parse", "config invalid"), None),
     }
 }
@@ -274,7 +273,9 @@ fn telegram_health(data_dir: Option<&Path>, now: DateTime<Utc>) -> Check {
     };
     let stats = HealthStats {
         schema_version,
-        service_pid_present: value.get("service_pid").is_some_and(|value| value.is_number()),
+        service_pid_present: value
+            .get("service_pid")
+            .is_some_and(|value| value.is_number()),
         started_age_seconds: age_seconds(&now, &started_at),
         last_poll_age_seconds: age_seconds(&now, &last_poll_at),
     };
@@ -327,9 +328,7 @@ fn telegram_token_lock(data_dir: Option<&Path>) -> Check {
 
 fn telegram_token_file(parsed_config: Option<&config::Config>) -> Check {
     let id = "telegram.token_file";
-    let Some(path) = parsed_config
-        .and_then(|config| config.telegram.token_file.as_deref())
-    else {
+    let Some(path) = parsed_config.and_then(|config| config.telegram.token_file.as_deref()) else {
         return Check::ok(id, "token file not configured");
     };
     let metadata = match fs::symlink_metadata(path) {
@@ -440,18 +439,14 @@ fn memory_store(memory_dir: &Path) -> Check {
         }
 
         let facts_path = state_dir.join(memory::FACTS_FILE_NAME);
-        let (facts_lines, facts_bytes) =
-            match read_bounded(&facts_path, MAX_FACTS_READ_BYTES) {
-                Ok(Some(payload)) => (
-                    Some(count_lines(&payload)),
-                    Some(payload.len() as u64),
-                ),
-                Ok(None) => (None, None),
-                Err(_) => {
-                    warnings.insert("facts");
-                    (None, None)
-                }
-            };
+        let (facts_lines, facts_bytes) = match read_bounded(&facts_path, MAX_FACTS_READ_BYTES) {
+            Ok(Some(payload)) => (Some(count_lines(&payload)), Some(payload.len() as u64)),
+            Ok(None) => (None, None),
+            Err(_) => {
+                warnings.insert("facts");
+                (None, None)
+            }
+        };
 
         let distill_dir = state_dir.join(DISTILL_DIR_NAME);
         let pending_jobs = match count_pending_jobs(&distill_dir) {
@@ -495,17 +490,19 @@ fn memory_store(memory_dir: &Path) -> Check {
             (Some(lines), Some(bytes)) => format!("facts_lines={lines};facts_bytes={bytes}"),
             _ => "facts=absent".to_string(),
         };
-        let pending = scope
-            .pending_jobs
-            .map_or_else(|| "pending_jobs=unreadable".to_string(), |count| {
-                format!("pending_jobs={count}")
-            });
-        let audit = scope
-            .audit_bytes
-            .map_or_else(|| "audit=absent".to_string(), |bytes| {
-                format!("audit_bytes={bytes}")
-            });
-        let layout = if scope.layout_ok { "layout=present" } else { "layout=incomplete" };
+        let pending = scope.pending_jobs.map_or_else(
+            || "pending_jobs=unreadable".to_string(),
+            |count| format!("pending_jobs={count}"),
+        );
+        let audit = scope.audit_bytes.map_or_else(
+            || "audit=absent".to_string(),
+            |bytes| format!("audit_bytes={bytes}"),
+        );
+        let layout = if scope.layout_ok {
+            "layout=present"
+        } else {
+            "layout=incomplete"
+        };
         let scope_name = scope.name;
         detail.push_str(&format!(
             "; scope={scope_name}[{layout};{facts};{pending};{audit}]"
@@ -626,7 +623,9 @@ fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
     }
     let mut file = File::open(path)?;
     let mut payload = Vec::new();
-    file.by_ref().take(max_bytes.saturating_add(1)).read_to_end(&mut payload)?;
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut payload)?;
     if payload.len() as u64 > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -720,10 +719,7 @@ mod tests {
             &memory_dir.join("global/state/distill-journal/job.json"),
             br#"{"job_id":"fixture-job","session_path":"/private/session.jsonl"}"#,
         );
-        private_file(
-            &memory_dir.join("global/state/audit.jsonl"),
-            b"audit\n",
-        );
+        private_file(&memory_dir.join("global/state/audit.jsonl"), b"audit\n");
         private_file(
             &telegram_dir.join(HEALTH_FILE_NAME),
             br#"{"schema_version":1,"started_at":"2026-09-15T00:00:00Z","last_poll_at":"2026-09-15T00:00:00Z","service_pid":42}"#,
@@ -760,14 +756,12 @@ mod tests {
     fn unsafe_config_and_token_modes_warn_without_reading_contents() {
         let (home, telegram_dir, now) = fixture();
         let config_path = home.join(config::FILE_NAME);
-        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o640))
-            .expect("config mode");
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o640)).expect("config mode");
         let token_path = home
             .parent()
             .expect("fixture parent")
             .join("telegram.token");
-        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o644))
-            .expect("token mode");
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o644)).expect("token mode");
         let report = inspect_at(&home, Some(&telegram_dir), now);
         let config = report
             .checks
@@ -794,7 +788,10 @@ mod tests {
         let rendered = serde_json::to_string(&report).expect("report JSON");
         assert!(rendered.contains("config file missing"));
 
-        private_file(&home.join(config::FILE_NAME), b"[telegram]\ntokn = \"SECRET\"\n");
+        private_file(
+            &home.join(config::FILE_NAME),
+            b"[telegram]\ntokn = \"SECRET\"\n",
+        );
         let report = inspect_at(&home, None, Utc::now());
         let rendered = serde_json::to_string(&report).expect("report JSON");
         assert!(rendered.contains("config invalid"));

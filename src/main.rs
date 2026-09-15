@@ -39,9 +39,7 @@ fn main() {
     // of service, memory, config and async runtime setup so inspection cannot
     // acquire a service lock, create state, call a provider or touch a network.
     if std::env::args().nth(1).as_deref() == Some("doctor") {
-        let _args = match danso::doctor::DoctorArgs::try_parse_from(
-            std::env::args_os().skip(1),
-        ) {
+        let _args = match danso::doctor::DoctorArgs::try_parse_from(std::env::args_os().skip(1)) {
             Ok(args) => args,
             Err(_) => {
                 eprintln!("doctor failed: invalid arguments");
