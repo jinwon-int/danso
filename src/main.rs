@@ -35,6 +35,33 @@ fn main() {
     // Body-free timing receipt (issue #98 e): startup is measured from
     // process start until the run begins.
     let process_started = std::time::Instant::now();
+    // The doctor is a synchronous, read-only state projection.  Keep it ahead
+    // of service, memory, config and async runtime setup so inspection cannot
+    // acquire a service lock, create state, call a provider or touch a network.
+    if std::env::args().nth(1).as_deref() == Some("doctor") {
+        let _args = match danso::doctor::DoctorArgs::try_parse_from(
+            std::env::args_os().skip(1),
+        ) {
+            Ok(args) => args,
+            Err(_) => {
+                eprintln!("doctor failed: invalid arguments");
+                std::process::exit(2);
+            }
+        };
+        match danso::doctor::run() {
+            Ok(report) => {
+                let code = report.exit_code();
+                println!("{}", serde_json::to_string(&report).expect("serializable"));
+                std::process::exit(code);
+            }
+            Err(_) => {
+                // Keep the only non-report path body-free.  In particular, do
+                // not echo HOME/DANSO_HOME or any filesystem error text.
+                eprintln!("doctor failed: state home unavailable");
+                std::process::exit(2);
+            }
+        }
+    }
     // Telegram is a service entry point, not a normal prompt positional. It
     // owns one process-wide token lock and keeps all turns in this process.
     if std::env::args().nth(1).as_deref() == Some("telegram") {

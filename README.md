@@ -47,6 +47,7 @@ endpoint, `scripts/danso-glm` applies the documented glm-5.3-flash profile
 Run the environment-configured Telegram service with `danso telegram`; see
 [Telegram B1 service](docs/telegram.md) for its allowlist, persistence, and
 command contract.
+Inspect an installation without writes or network access with `danso doctor`; see [the doctor report](docs/doctor.md).
 
 ## Supervised first use
 
