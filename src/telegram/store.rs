@@ -1,5 +1,6 @@
 use super::{client::Update, ensure_private_dir};
 use anyhow::{Context, Result, ensure};
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -13,6 +14,7 @@ use std::{
 const CONVERSATIONS_DIR: &str = "conversations";
 const POLL_OFFSET_FILE: &str = "poll-offset.json";
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
+pub const MAX_PREVIOUS_SESSIONS: usize = 5;
 
 /// The bounded, provider-neutral counters retained for Telegram's local
 /// `/usage` view. The field names on disk follow the core usage summary, while
@@ -64,6 +66,29 @@ impl UsageRecord {
     }
 }
 
+/// Durable metadata for the one long task that can be resumed for a chat.
+/// Prompts and task output deliberately do not belong in the conversation
+/// record; the session pointer is the only link to the journal.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveTaskRecord {
+    pub kind: String,
+    #[serde(alias = "startedAt")]
+    pub started_at: String,
+    #[serde(alias = "sessionPointer")]
+    pub session_pointer: String,
+}
+
+impl fmt::Debug for ActiveTaskRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActiveTaskRecord")
+            .field("kind", &self.kind)
+            .field("started_at", &self.started_at)
+            .field("session_pointer", &"[redacted]")
+            .finish()
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationRecord {
     pub chat_id: i64,
@@ -71,6 +96,20 @@ pub struct ConversationRecord {
     pub last_update_id: i64,
     #[serde(default)]
     pub session_pointer: Option<String>,
+    /// Newest-first bounded history of displaced session pointers. Entries
+    /// are opaque ids here; timeline rendering derives only short ids and
+    /// timestamps from the corresponding journals.
+    #[serde(
+        default,
+        alias = "previousSessions",
+        alias = "previous_session_pointers",
+        alias = "session_history"
+    )]
+    pub previous_sessions: Vec<String>,
+    /// The currently resumable long task, if any. This remains present while
+    /// the task is paused until an explicit `/new` replacement clears it.
+    #[serde(default, alias = "activeTask")]
+    pub active_task: Option<ActiveTaskRecord>,
     /// Provider selected by the service for this chat. Old records omit this
     /// field and inherit the current service provider on their next turn.
     #[serde(default)]
@@ -123,6 +162,8 @@ impl fmt::Debug for ConversationRecord {
             .field("chat_id", &self.chat_id)
             .field("last_update_id", &self.last_update_id)
             .field("session_pointer", &self.session_pointer)
+            .field("previous_sessions_len", &self.previous_sessions.len())
+            .field("active_task", &self.active_task)
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("effort", &self.effort)
@@ -141,6 +182,8 @@ impl ConversationRecord {
             chat_id,
             last_update_id,
             session_pointer,
+            previous_sessions: Vec::new(),
+            active_task: None,
             provider: None,
             model: None,
             effort: None,
@@ -191,6 +234,19 @@ impl ConversationRecord {
         self.progress_message_id = None;
     }
 
+    pub fn mark_long_task_active(&mut self, session_pointer: String, started_at: String) {
+        self.active_task = Some(ActiveTaskRecord {
+            kind: "long_task".to_string(),
+            started_at,
+            session_pointer,
+        });
+        self.mark_turn_active();
+    }
+
+    pub fn clear_active_task(&mut self) {
+        self.active_task = None;
+    }
+
     pub fn set_progress_message(&mut self, message_id: i64) -> Result<()> {
         ensure!(message_id > 0, "Telegram progress message id is invalid");
         self.turn_active = true;
@@ -201,6 +257,31 @@ impl ConversationRecord {
     pub fn clear_turn_active(&mut self) {
         self.turn_active = false;
         self.progress_message_id = None;
+    }
+
+    /// Remember the displaced head before `/new`. The newest displaced
+    /// pointer is first, and duplicate pointers are moved to the front so a
+    /// resume toggle remains deterministic.
+    pub fn remember_current_session(&mut self) {
+        let Some(current) = self.session_pointer.clone() else {
+            return;
+        };
+        self.previous_sessions.retain(|pointer| pointer != &current);
+        self.previous_sessions.insert(0, current);
+        self.previous_sessions.truncate(MAX_PREVIOUS_SESSIONS);
+    }
+
+    /// Swap the current head with the most recent previous session. Returning
+    /// the newly selected pointer keeps command code from ever displaying a
+    /// full session id.
+    pub fn swap_previous_session(&mut self) -> Option<String> {
+        let previous = self.previous_sessions.first()?.clone();
+        self.previous_sessions.remove(0);
+        if let Some(current) = self.session_pointer.replace(previous.clone()) {
+            self.previous_sessions.insert(0, current);
+            self.previous_sessions.truncate(MAX_PREVIOUS_SESSIONS);
+        }
+        Some(previous)
     }
 }
 
@@ -377,6 +458,40 @@ fn validate_record(record: &ConversationRecord) -> Result<()> {
         ensure!(
             !pointer.is_empty() && pointer.len() <= 4096,
             "Telegram session pointer must be 1..=4096 bytes"
+        );
+    }
+    ensure!(
+        record.previous_sessions.len() <= MAX_PREVIOUS_SESSIONS,
+        "Telegram session history exceeds its bound"
+    );
+    for pointer in &record.previous_sessions {
+        ensure!(
+            !pointer.is_empty() && pointer.len() <= 4096,
+            "Telegram previous session pointer must be 1..=4096 bytes"
+        );
+    }
+    ensure!(
+        record
+            .previous_sessions
+            .windows(2)
+            .all(|window| window[0] != window[1]),
+        "Telegram session history contains duplicate adjacent pointers"
+    );
+    if let Some(task) = &record.active_task {
+        ensure!(task.kind == "long_task", "Telegram active task kind is invalid");
+        ensure!(
+            !task.session_pointer.is_empty() && task.session_pointer.len() <= 4096,
+            "Telegram active task session pointer is invalid"
+        );
+        ensure!(
+            !task.started_at.is_empty()
+                && task.started_at.len() <= 64
+                && !task.started_at.chars().any(char::is_control),
+            "Telegram active task start time is invalid"
+        );
+        ensure!(
+            DateTime::parse_from_rfc3339(&task.started_at).is_ok(),
+            "Telegram active task start time must be RFC 3339"
         );
     }
     if let Some(message_id) = record.progress_message_id {

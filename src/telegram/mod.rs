@@ -1,4 +1,4 @@
-//! Telegram B2 service: Bot API transport, process-wide token ownership,
+//! Telegram B3 service: Bot API transport, process-wide token ownership,
 //! allowlist admission, durable per-chat conversation state, progress edits,
 //! follow-up queueing, and the command/update loop.
 #![allow(dead_code)]
@@ -16,7 +16,9 @@ pub use client::{
 };
 pub use lock::TokenLock;
 pub use service::{TelegramArgs, TelegramService, run};
-pub use store::{ConversationRecord, ConversationStore, UsageRecord};
+pub use store::{
+    ActiveTaskRecord, ConversationRecord, ConversationStore, MAX_PREVIOUS_SESSIONS, UsageRecord,
+};
 
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -514,6 +516,49 @@ mod tests {
         assert_eq!(record.effort, None);
         assert_eq!(record.last_turn_usage, None);
         assert!(record.usage.is_zero());
+    }
+
+    #[test]
+    fn session_history_is_bounded_and_resume_swaps_the_head() {
+        let mut record = ConversationRecord::new(55, 19, Some("session-0".to_string()));
+        for index in 1..=7 {
+            record.remember_current_session();
+            record.session_pointer = Some(format!("session-{index}"));
+        }
+        assert_eq!(record.previous_sessions.len(), 5);
+        assert_eq!(
+            record.previous_sessions,
+            vec![
+                "session-6".to_string(),
+                "session-5".to_string(),
+                "session-4".to_string(),
+                "session-3".to_string(),
+                "session-2".to_string(),
+            ]
+        );
+        let previous = record.swap_previous_session().expect("previous session");
+        assert_eq!(previous, "session-6");
+        assert_eq!(record.session_pointer.as_deref(), Some("session-6"));
+        assert_eq!(record.previous_sessions[0], "session-7");
+        let store_dir = tempfile::tempdir().unwrap();
+        force_private_mode(store_dir.path());
+        ConversationStore::new(store_dir.path())
+            .unwrap()
+            .save(&record)
+            .unwrap();
+    }
+
+    #[test]
+    fn active_long_task_metadata_survives_record_round_trip() {
+        let mut record = ConversationRecord::new(55, 19, Some("session-pointer".to_string()));
+        record.mark_long_task_active(
+            "session-pointer".to_string(),
+            "2026-09-15T00:00:00.000Z".to_string(),
+        );
+        let encoded = serde_json::to_vec(&record).unwrap();
+        let decoded: ConversationRecord = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.active_task, record.active_task);
+        assert!(decoded.turn_active);
     }
 
     #[test]
