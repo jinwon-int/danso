@@ -11,7 +11,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::Path,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -26,12 +26,8 @@ struct Request {
 }
 
 enum ServerMode {
-    Bot {
-        update: Option<String>,
-    },
-    Anthropic {
-        release: Option<Arc<AtomicBool>>,
-    },
+    Bot { update: Option<String> },
+    Anthropic { release: Option<Arc<AtomicBool>> },
 }
 
 struct LoopbackServer {
@@ -44,8 +40,7 @@ struct LoopbackServer {
 impl LoopbackServer {
     fn bot(update: Option<Update>) -> Self {
         Self::new(ServerMode::Bot {
-            update: update
-                .map(|update| serde_json::to_string(&update).expect("fixture update")),
+            update: update.map(|update| serde_json::to_string(&update).expect("fixture update")),
         })
     }
 
@@ -77,25 +72,28 @@ impl LoopbackServer {
                 let Some((path, body)) = read_request(&mut stream) else {
                     continue;
                 };
-                captured.lock().expect("fixture request lock").push(Request {
-                    path: path.clone(),
-                    body: body.clone(),
-                });
+                captured
+                    .lock()
+                    .expect("fixture request lock")
+                    .push(Request {
+                        path: path.clone(),
+                        body: body.clone(),
+                    });
                 let response = match &mode {
                     ServerMode::Bot { update } if path.contains("/getUpdates") => {
                         let result = if !delivered_update {
                             delivered_update = true;
-                            update.as_deref().map_or_else(
-                                || "[]".to_string(),
-                                |update| format!("[{update}]"),
-                            )
+                            update
+                                .as_deref()
+                                .map_or_else(|| "[]".to_string(), |update| format!("[{update}]"))
                         } else {
                             "[]".to_string()
                         };
                         format!(r#"{{"ok":true,"result":{result}}}"#)
                     }
                     ServerMode::Bot { .. } => {
-                        r#"{"ok":true,"result":{"message_id":999,"chat":{"id":42},"text":"sent"}}"#.to_string()
+                        r#"{"ok":true,"result":{"message_id":999,"chat":{"id":42},"text":"sent"}}"#
+                            .to_string()
                     }
                     ServerMode::Anthropic { release } => {
                         if let Some(release) = release {
@@ -308,9 +306,9 @@ impl Drop for Environment {
     }
 }
 
-fn environment_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
+async fn environment_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
 }
 
 async fn wait_for<F>(timeout: Duration, mut condition: F)
@@ -319,21 +317,27 @@ where
 {
     let deadline = Instant::now() + timeout;
     while !condition() {
-        assert!(Instant::now() < deadline, "loopback fixture condition timed out");
+        assert!(
+            Instant::now() < deadline,
+            "loopback fixture condition timed out"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
 async fn wait_for_message(server: &LoopbackServer, expected: &str) {
     wait_for(Duration::from_secs(5), || {
-        server.sent_texts().iter().any(|text| text.contains(expected))
+        server
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains(expected))
     })
     .await;
 }
 
 #[tokio::test]
 async fn service_loop_answers_one_authorized_message_in_process() {
-    let _lock = environment_lock();
+    let _lock = environment_lock().await;
     let root = tempfile::tempdir().expect("test state");
     let message = update(1, 42, "hello from Telegram");
     let bot = LoopbackServer::bot(Some(message));
@@ -346,7 +350,9 @@ async fn service_loop_answers_one_authorized_message_in_process() {
 
     wait_for_message(&bot, "fixture answer").await;
     shutdown.notify_one();
-    task.await.expect("service task join").expect("service loop");
+    task.await
+        .expect("service task join")
+        .expect("service loop");
 
     let record = ConversationStore::new(root.path())
         .expect("conversation store")
@@ -357,17 +363,24 @@ async fn service_loop_answers_one_authorized_message_in_process() {
     assert!(record.session_pointer.is_some());
     assert_eq!(record.provider.as_deref(), Some("anthropic"));
     assert_eq!(record.model.as_deref(), Some("fixture-model"));
-    assert_eq!(record.last_turn_usage.as_ref().map(|usage| usage.requests), Some(1));
+    assert_eq!(
+        record.last_turn_usage.as_ref().map(|usage| usage.requests),
+        Some(1)
+    );
     let session = record.session_pointer.expect("session pointer");
-    let journal = fs::read_to_string(root.path().join("journals").join(format!("{session}.jsonl")))
-        .expect("read session journal");
+    let journal = fs::read_to_string(
+        root.path()
+            .join("journals")
+            .join(format!("{session}.jsonl")),
+    )
+    .expect("read session journal");
     assert!(journal.contains(r#""role":"assistant""#));
     drop(environment);
 }
 
 #[tokio::test]
 async fn new_command_replaces_the_chat_session_pointer() {
-    let _lock = environment_lock();
+    let _lock = environment_lock().await;
     let root = tempfile::tempdir().expect("test state");
     let bot = LoopbackServer::bot(None);
     let provider = LoopbackServer::anthropic(None);
@@ -405,7 +418,7 @@ async fn new_command_replaces_the_chat_session_pointer() {
 
 #[tokio::test]
 async fn stop_cancels_an_in_flight_turn_without_a_replay_or_final_answer() {
-    let _lock = environment_lock();
+    let _lock = environment_lock().await;
     let root = tempfile::tempdir().expect("test state");
     let bot = LoopbackServer::bot(None);
     let release = Arc::new(AtomicBool::new(false));
@@ -443,15 +456,25 @@ async fn stop_cancels_an_in_flight_turn_without_a_replay_or_final_answer() {
     .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let texts = bot.sent_texts();
-    assert_eq!(texts.iter().filter(|text| text.contains("fixture answer")).count(), 0);
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|text| text.contains("fixture answer"))
+            .count(),
+        0
+    );
     let record = ConversationStore::new(root.path())
         .expect("conversation store")
         .load(42)
         .expect("load conversation")
         .expect("conversation record");
     let session = record.session_pointer.expect("session pointer");
-    let journal = fs::read_to_string(root.path().join("journals").join(format!("{session}.jsonl")))
-        .expect("read session journal");
+    let journal = fs::read_to_string(
+        root.path()
+            .join("journals")
+            .join(format!("{session}.jsonl")),
+    )
+    .expect("read session journal");
     assert!(journal.contains("wait for cancellation"));
     assert!(!journal.contains(r#""role":"assistant""#));
     drop(environment);
@@ -459,7 +482,7 @@ async fn stop_cancels_an_in_flight_turn_without_a_replay_or_final_answer() {
 
 #[tokio::test]
 async fn unauthorized_users_are_not_answered() {
-    let _lock = environment_lock();
+    let _lock = environment_lock().await;
     let root = tempfile::tempdir().expect("test state");
     let bot = LoopbackServer::bot(None);
     let provider = LoopbackServer::anthropic(None);
@@ -479,7 +502,7 @@ async fn unauthorized_users_are_not_answered() {
 
 #[tokio::test]
 async fn model_and_effort_overrides_survive_a_service_restart() {
-    let _lock = environment_lock();
+    let _lock = environment_lock().await;
     let root = tempfile::tempdir().expect("test state");
     let bot = LoopbackServer::bot(None);
     let provider = LoopbackServer::anthropic(None);
@@ -521,5 +544,8 @@ async fn model_and_effort_overrides_survive_a_service_restart() {
 }
 
 async fn wait_for_sent_count(server: &LoopbackServer, count: usize) {
-    wait_for(Duration::from_secs(5), || server.sent_texts().len() >= count).await;
+    wait_for(Duration::from_secs(5), || {
+        server.sent_texts().len() >= count
+    })
+    .await;
 }

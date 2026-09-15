@@ -33,8 +33,8 @@ pub struct UsageRecord {
 
 impl UsageRecord {
     pub fn from_summary(summary: &Value) -> Result<Self> {
-        let usage: Self = serde_json::from_value(summary.clone())
-            .context("decode Telegram turn usage")?;
+        let usage: Self =
+            serde_json::from_value(summary.clone()).context("decode Telegram turn usage")?;
         validate_usage(&usage)?;
         Ok(usage)
     }
@@ -119,7 +119,7 @@ impl ConversationRecord {
         self.model.as_deref().unwrap_or(default)
     }
 
-    pub fn effective_effort(&self, default: Option<&str>) -> Option<&str> {
+    pub fn effective_effort<'a>(&'a self, default: Option<&'a str>) -> Option<&'a str> {
         self.effort.as_deref().or(default)
     }
 
@@ -274,7 +274,10 @@ fn validate_record(record: &ConversationRecord) -> Result<()> {
         ("effort", record.effort.as_deref()),
     ] {
         if let Some(value) = value {
-            ensure!(!value.trim().is_empty(), "Telegram {name} must not be empty");
+            ensure!(
+                !value.trim().is_empty(),
+                "Telegram {name} must not be empty"
+            );
             ensure!(value.len() <= 4096, "Telegram {name} is too long");
             ensure!(
                 value.chars().all(|character| !character.is_control()),
@@ -284,8 +287,7 @@ fn validate_record(record: &ConversationRecord) -> Result<()> {
     }
     if let Some(effort) = &record.effort {
         ensure!(
-            ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-                .contains(&effort.as_str()),
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort.as_str()),
             "Telegram effort is invalid"
         );
     }

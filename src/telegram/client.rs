@@ -31,8 +31,8 @@ impl BotApi {
 
     pub fn from_env() -> Result<Self> {
         let token = std::env::var(BOT_TOKEN_ENV).context("DANSO_TELEGRAM_BOT_TOKEN is required")?;
-        let base = std::env::var(API_BASE_URL_ENV)
-            .unwrap_or_else(|_| DEFAULT_API_BASE_URL.to_string());
+        let base =
+            std::env::var(API_BASE_URL_ENV).unwrap_or_else(|_| DEFAULT_API_BASE_URL.to_string());
         let retries = match std::env::var(RETRIES_ENV) {
             Ok(raw) if !raw.trim().is_empty() => raw
                 .trim()

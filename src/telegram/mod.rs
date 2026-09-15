@@ -471,10 +471,12 @@ mod tests {
         record
             .record_turn("anthropic", "fixture-model", None, usage.clone())
             .unwrap();
-        record.record_turn("anthropic", "fixture-model", None, usage).unwrap();
+        record
+            .record_turn("anthropic", "fixture-model", None, usage)
+            .unwrap();
         assert_eq!(record.usage.requests, 2);
         assert_eq!(record.usage.total_tokens, 30);
-        assert_eq!(record.last_turn_usage.unwrap().total_tokens, 15);
+        assert_eq!(record.last_turn_usage.as_ref().unwrap().total_tokens, 15);
         let encoded = serde_json::to_string(&record).unwrap();
         assert!(encoded.contains("\"model\":\"fixture-model\""));
         assert!(encoded.contains("\"totalTokens\":30"));

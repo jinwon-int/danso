@@ -6,8 +6,7 @@
 //! executor may still launch its normal bounded tool workers.
 
 use super::{
-    EFFORT_ENV, MODEL_ENV, PROVIDER_ENV, WORKSPACE_ENV, TelegramConfig,
-    TelegramFoundation, Update,
+    EFFORT_ENV, MODEL_ENV, PROVIDER_ENV, TelegramConfig, TelegramFoundation, Update, WORKSPACE_ENV,
     ensure_private_dir,
     store::{ConversationRecord, ConversationStore, UsageRecord},
 };
@@ -156,10 +155,7 @@ impl RunSettings {
                 &["DANSO_TELEGRAM_TRUST_PROJECT", "DANSO_TRUST_PROJECT"],
                 false,
             )?,
-            no_tools: configured_bool(
-                &["DANSO_TELEGRAM_NO_TOOLS", "DANSO_NO_TOOLS"],
-                false,
-            )?,
+            no_tools: configured_bool(&["DANSO_TELEGRAM_NO_TOOLS", "DANSO_NO_TOOLS"], false)?,
             max_turns,
             timeout_seconds,
             provider_timeout_seconds,
@@ -270,11 +266,9 @@ fn configured_optional_u32(names: &[&str]) -> Result<Option<u32>> {
         return Ok(None);
     };
     ensure!(!raw.trim().is_empty(), "{} must not be empty", names[0]);
-    Ok(Some(
-        raw.trim()
-            .parse::<u32>()
-            .map_err(|_| anyhow::anyhow!("{} must be an integer", names[0]))?,
-    ))
+    Ok(Some(raw.trim().parse::<u32>().map_err(|_| {
+        anyhow::anyhow!("{} must be an integer", names[0])
+    })?))
 }
 
 fn configured_optional_usize(names: &[&str]) -> Result<Option<usize>> {
@@ -282,11 +276,9 @@ fn configured_optional_usize(names: &[&str]) -> Result<Option<usize>> {
         return Ok(None);
     };
     ensure!(!raw.trim().is_empty(), "{} must not be empty", names[0]);
-    Ok(Some(
-        raw.trim()
-            .parse::<usize>()
-            .map_err(|_| anyhow::anyhow!("{} must be an integer", names[0]))?,
-    ))
+    Ok(Some(raw.trim().parse::<usize>().map_err(|_| {
+        anyhow::anyhow!("{} must be an integer", names[0])
+    })?))
 }
 
 fn configured_bool(names: &[&str], default: bool) -> Result<bool> {
@@ -346,7 +338,9 @@ impl crate::contracts::EventSink for TelegramSink {
     fn emit(&mut self, event: crate::contracts::Event<'_>) -> Result<()> {
         if let crate::contracts::Event::FinalAnswer(message) = event {
             let mut text = crate::contracts::text_blocks(message).join("");
-            if text.is_empty() && let Some(content) = message["content"].as_str() {
+            if text.is_empty()
+                && let Some(content) = message["content"].as_str()
+            {
                 text = content.to_string();
             }
             ensure!(!text.is_empty(), "final Telegram answer is empty");
@@ -409,8 +403,8 @@ impl InProcessRunner {
 
     fn require_session_file(&self, session_id: &str) -> Result<PathBuf> {
         let path = self.journal_path(session_id);
-        let metadata = std::fs::symlink_metadata(&path)
-            .context("Telegram session pointer has no journal")?;
+        let metadata =
+            std::fs::symlink_metadata(&path).context("Telegram session pointer has no journal")?;
         ensure!(
             metadata.is_file(),
             "Telegram session journal must be a regular file"
@@ -449,8 +443,8 @@ impl InProcessRunner {
         effort: Option<String>,
         prompt: String,
     ) -> Result<TurnHandle> {
-        let parsed = uuid::Uuid::parse_str(&session_id)
-            .context("invalid Telegram session pointer")?;
+        let parsed =
+            uuid::Uuid::parse_str(&session_id).context("invalid Telegram session pointer")?;
         ensure!(
             parsed.hyphenated().to_string() == session_id,
             "invalid Telegram session pointer"
@@ -466,13 +460,9 @@ impl InProcessRunner {
             cancelled: AtomicBool::new(false),
             session_id: session_id.clone(),
         });
-        let config = self.settings.config(
-            prompt,
-            journal,
-            model,
-            effort,
-            cancellation_reason,
-        );
+        let config = self
+            .settings
+            .config(prompt, journal, model, effort, cancellation_reason);
         let (sender, receiver) = oneshot::channel();
         let thread_name = format!("danso-telegram-turn-{}", &session_id[..8]);
         let _thread = thread::Builder::new()
@@ -500,7 +490,7 @@ fn run_turn(config: crate::app::RunConfig, cancel: Arc<Notify>) -> Result<TurnOu
         .context("could not start Telegram turn runtime")?;
     let mut usage = crate::usage::Usage::default();
     let mut sink = TelegramSink::new();
-    let outcome = runtime.block_on(async {
+    runtime.block_on(async {
         tokio::select! {
             biased;
             _ = cancel.notified() => Err(anyhow::anyhow!("Telegram turn cancelled")),
@@ -646,7 +636,9 @@ impl TelegramService {
         };
         let state = self.chat(chat_id);
         if let Some(command) = parse_command(text) {
-            return self.handle_command(chat_id, update.update_id, state, command).await;
+            return self
+                .handle_command(chat_id, update.update_id, state, command)
+                .await;
         }
         self.handle_prompt(chat_id, update.update_id, state, text.to_string())
             .await
@@ -678,7 +670,7 @@ impl TelegramService {
         state: Arc<ChatState>,
         command: CommandInput,
     ) -> Result<()> {
-        let mut reply = None;
+        let reply;
         {
             let _record = state.record.lock().expect("Telegram record lock");
             let mut record = self.load_record(chat_id)?;
@@ -743,10 +735,12 @@ impl TelegramService {
                                 record.model = Some(model.clone());
                                 reply = Some(format!("Model set to {model}."));
                             }
-                            Err(_) => reply = Some(
-                                "Model must be one non-whitespace token of at most 4096 bytes."
-                                    .to_string(),
-                            ),
+                            Err(_) => {
+                                reply = Some(
+                                    "Model must be one non-whitespace token of at most 4096 bytes."
+                                        .to_string(),
+                                )
+                            }
                         }
                     } else {
                         reply = Some(format!(
@@ -766,9 +760,8 @@ impl TelegramService {
                         if effort == "default" {
                             record.provider = Some(self.inner.settings.provider.clone());
                             record.effort = None;
-                            reply = Some(
-                                "Reasoning effort reset to the service default.".to_string(),
-                            );
+                            reply =
+                                Some("Reasoning effort reset to the service default.".to_string());
                         } else {
                             match validate_effort(Some(&effort), &self.inner.settings.provider) {
                                 Ok(()) => {
@@ -854,10 +847,8 @@ impl TelegramService {
                     .inner
                     .runner
                     .start_turn(session_id, model, effort, prompt)?;
-                *state
-                    .active
-                    .lock()
-                    .expect("Telegram active-turn lock") = Some(Arc::clone(&next.active));
+                *state.active.lock().expect("Telegram active-turn lock") =
+                    Some(Arc::clone(&next.active));
                 handle = Some(next);
             }
             if busy {
@@ -865,7 +856,8 @@ impl TelegramService {
             }
         }
         if busy {
-            self.reply(chat_id, "A turn is already running; use /stop first.").await?;
+            self.reply(chat_id, "A turn is already running; use /stop first.")
+                .await?;
             return Ok(());
         }
         let handle = handle.context("Telegram turn handle disappeared")?;
@@ -910,8 +902,7 @@ impl TelegramService {
                     let mut usage_saved = true;
                     match self.load_record(chat_id) {
                         Ok(mut record) => {
-                            if record.session_pointer.as_deref()
-                                == Some(active.session_id.as_str())
+                            if record.session_pointer.as_deref() == Some(active.session_id.as_str())
                             {
                                 if record
                                     .record_usage(usage)
