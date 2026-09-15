@@ -57,7 +57,7 @@ impl ConversationStore {
 
     pub fn load(&self, chat_id: i64) -> Result<Option<ConversationRecord>> {
         let path = self.record_path(chat_id);
-        let Some(mut file) = open_record(&path)? else {
+        let Some(file) = open_record(&path)? else {
             return Ok(None);
         };
         let mut bytes = Vec::new();

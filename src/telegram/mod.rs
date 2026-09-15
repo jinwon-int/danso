@@ -11,9 +11,9 @@ mod lock;
 mod store;
 
 pub use access::{AccessControl, Allowlist};
-pub use client::{BotApi, Chat, Message, PollResult, Poller, Update, User};
+pub use client::BotApi;
 pub use lock::TokenLock;
-pub use store::{ConversationRecord, ConversationStore};
+pub use store::ConversationStore;
 
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -150,6 +150,7 @@ impl TelegramFoundation {
 
 #[cfg(test)]
 mod tests {
+    use super::store::ConversationRecord;
     use super::*;
     use std::{
         io::{BufRead, BufReader, Read, Write},

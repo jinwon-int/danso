@@ -327,6 +327,7 @@ struct SendMessageRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(bound = "T: serde::de::DeserializeOwned")]
 struct ApiResponse<T> {
     ok: bool,
     #[serde(default)]
