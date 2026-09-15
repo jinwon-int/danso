@@ -1049,6 +1049,16 @@ pub async fn run(
         }
         let mut batch = Vec::new();
         for call in calls {
+            // Policy admission precedes the durable `started` marker: a
+            // refused call never reaches the executor, and a crash between
+            // the marker and the refusal cannot leave an uncertain effect.
+            let refusal = match executor.admit(&call) {
+                crate::contracts::Verdict::Allow => None,
+                crate::contracts::Verdict::Deny { reason } => Some(reason),
+                crate::contracts::Verdict::Ask => {
+                    Some("approval required but no approval route is available".to_string())
+                }
+            };
             journal_timed(usage, session, |s| {
                 s.record_operation(&call.id, OperationState::Started)
             })
@@ -1056,11 +1066,17 @@ pub async fn run(
             sink.emit(Event::ToolStarted(&call.name))
                 .map_err(at(Kind::Output))?;
             let tool_started = Instant::now();
-            let outcome = match executor.execute(&call).await {
-                Ok(result) => result,
-                Err(e) => crate::contracts::ToolOutcome {
-                    output: e.to_string(),
+            let outcome = match refusal {
+                Some(reason) => crate::contracts::ToolOutcome {
+                    output: format!("tool call refused by policy: {reason}"),
                     is_error: true,
+                },
+                None => match executor.execute(&call).await {
+                    Ok(result) => result,
+                    Err(e) => crate::contracts::ToolOutcome {
+                        output: e.to_string(),
+                        is_error: true,
+                    },
                 },
             };
             usage.record_tool_execution(checked_elapsed_ms(tool_started));
