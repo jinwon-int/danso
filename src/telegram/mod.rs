@@ -339,9 +339,20 @@ mod tests {
         assert_eq!(requests.len(), 1, "rejected updates must not send a reply");
     }
 
+    /// tempdir's directory mode follows the process umask on some platforms;
+    /// the data-dir invariant is exactly 0700, so pin it for the test.
+    #[cfg(unix)]
+    fn force_private_mode(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(not(unix))]
+    fn force_private_mode(_path: &std::path::Path) {}
+
     #[test]
     fn token_lock_blocks_a_second_consumer() {
         let dir = tempfile::tempdir().unwrap();
+        force_private_mode(dir.path());
         let first = TokenLock::acquire(dir.path()).unwrap();
         let second = TokenLock::acquire(dir.path()).unwrap_err();
         assert!(second.to_string().contains("already held"));
@@ -352,6 +363,7 @@ mod tests {
     #[test]
     fn conversation_store_round_trips_across_restart() {
         let dir = tempfile::tempdir().unwrap();
+        force_private_mode(dir.path());
         let expected = ConversationRecord::new(55, 19, Some("session-pointer".to_string()));
         let store = ConversationStore::new(dir.path()).unwrap();
         store.save(&expected).unwrap();
