@@ -1,4 +1,4 @@
-//! Telegram service wiring for B2.
+//! Telegram service wiring for B3.
 //!
 //! The service owns polling and command policy, while one small in-process
 //! runner owns the boundary to app::run. A turn is never re-entered through
@@ -15,7 +15,7 @@ use clap::Parser;
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -38,6 +38,36 @@ const DEFAULT_FOLLOWUP_CAP: usize = 5;
 const MAX_HEARTBEAT_SECONDS: u64 = 3600;
 const MAX_FOLLOWUP_CAP: u64 = 100;
 const HEALTH_FILE_NAME: &str = "health.json";
+const TASK_WALL_ENV: [&str; 6] = [
+    "DANSO_TASK_WALL_SECONDS",
+    "DANSO_TASK_TIMEOUT_SECONDS",
+    "DANSO_TELEGRAM_TASK_WALL_SECONDS",
+    "DANSO_TELEGRAM_TASK_TIMEOUT_SECONDS",
+    "DANSO_TELEGRAM_TIMEOUT_SECONDS",
+    "DANSO_TIMEOUT_SECONDS",
+];
+const TASK_STAGE_ENV: [&str; 2] = [
+    "DANSO_TASK_STAGE_REQUESTS",
+    "DANSO_TELEGRAM_TASK_STAGE_REQUESTS",
+];
+const TASK_REQUESTS_ENV: [&str; 2] = [
+    "DANSO_TASK_MAX_REQUESTS",
+    "DANSO_TELEGRAM_TASK_MAX_REQUESTS",
+];
+const TASK_TOKENS_ENV: [&str; 2] = ["DANSO_TASK_MAX_TOKENS", "DANSO_TELEGRAM_TASK_MAX_TOKENS"];
+const TASK_REPEAT_ENV: [&str; 2] = [
+    "DANSO_TASK_REPEAT_LIMIT",
+    "DANSO_TELEGRAM_TASK_REPEAT_LIMIT",
+];
+
+const TASK_USAGE: &str = "Usage: /task <prompt>";
+const TASK_PAUSE_USAGE: &str = "Usage: /task_pause";
+const TASK_RESUME_USAGE: &str = "Usage: /task_resume";
+const DISTILL_USAGE: &str = "Usage: /distill";
+const MEMORY_PROMOTE_USAGE: &str = "Usage: /memory_promote <fact-id>";
+const RESUME_USAGE: &str = "Usage: /resume";
+const HISTORY_USAGE: &str = "Usage: /history";
+const TASK_PAUSE_REQUESTED: &str = "pause requested; takes effect at the next safe checkpoint";
 
 /// The command has deliberately no CLI flags. Runtime and provider
 /// configuration comes from the documented environment so the service cannot
@@ -66,6 +96,9 @@ struct RunSettings {
     compact_at_bytes: Option<usize>,
     heartbeat_seconds: u64,
     followup_cap: usize,
+    memory_root: PathBuf,
+    memory_scope: String,
+    task_limits: crate::long_task::Limits,
 }
 
 impl RunSettings {
@@ -166,6 +199,20 @@ impl RunSettings {
             0,
             MAX_FOLLOWUP_CAP,
         )? as usize;
+        let memory_scope =
+            first_env(&["DANSO_TELEGRAM_MEMORY_SCOPE"])?.unwrap_or_else(|| "global".to_string());
+        ensure!(
+            crate::memory::valid_scope(&memory_scope),
+            "DANSO_TELEGRAM_MEMORY_SCOPE must be global, shared, or private-<32 hex>"
+        );
+        let memory_root = first_env(&["DANSO_MEMORY_DIR"])?
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::memory::MemoryConfig::default_root);
+        ensure!(
+            memory_root.is_absolute(),
+            "DANSO_MEMORY_DIR must be an absolute path"
+        );
+        let task_limits = task_limits_from_env()?;
 
         Ok(Self {
             provider,
@@ -186,17 +233,26 @@ impl RunSettings {
             compact_at_bytes,
             heartbeat_seconds,
             followup_cap,
+            memory_root,
+            memory_scope,
+            task_limits,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn config(
         &self,
         prompt: String,
         session: PathBuf,
         model: String,
         effort: Option<String>,
+        long_task: Option<crate::runtime::LongTaskRun>,
+        pause_requested: Option<Arc<AtomicBool>>,
         cancellation_reason: Arc<AtomicU8>,
     ) -> crate::app::RunConfig {
+        let timeout_seconds = long_task
+            .map(|task| task.limits.wall_seconds)
+            .unwrap_or(self.timeout_seconds);
         crate::app::RunConfig {
             prompt,
             cwd: self.workspace.clone(),
@@ -208,7 +264,8 @@ impl RunSettings {
             no_tools: self.no_tools,
             system_context_file: None,
             memory: crate::memory::MemoryConfig {
-                scope: "global".to_string(),
+                root: Some(self.memory_root.clone()),
+                scope: self.memory_scope.clone(),
                 max_bytes: crate::memory::snapshot::SNAPSHOT_MAX_BYTES_DEFAULT,
                 ..Default::default()
             },
@@ -225,16 +282,53 @@ impl RunSettings {
             report_progress: false,
             repeat_limit: 0,
             compact_at_bytes: self.compact_at_bytes,
-            timeout_seconds: self.timeout_seconds,
+            timeout_seconds,
             provider_timeout_seconds: self.provider_timeout_seconds,
             tool_timeout_seconds: self.tool_timeout_seconds,
             tool_home: None,
-            long_task: None,
+            long_task,
             task_progress: false,
-            pause_requested: None,
+            pause_requested,
             cancellation_reason: Some(cancellation_reason),
         }
     }
+}
+
+fn task_limits_from_env() -> Result<crate::long_task::Limits> {
+    let limits = crate::long_task::Limits {
+        wall_seconds: configured_u64(
+            &TASK_WALL_ENV,
+            crate::long_task::MAX_WALL_SECONDS,
+            1,
+            crate::long_task::MAX_WALL_SECONDS,
+        )?,
+        stage_requests: configured_u64(
+            &TASK_STAGE_ENV,
+            crate::long_task::DEFAULT_STAGE_REQUESTS,
+            crate::long_task::MIN_STAGE_REQUESTS,
+            crate::long_task::MAX_STAGE_REQUESTS,
+        )?,
+        max_requests: configured_u64(
+            &TASK_REQUESTS_ENV,
+            crate::long_task::DEFAULT_MAX_REQUESTS,
+            crate::long_task::MIN_MAX_REQUESTS,
+            crate::long_task::MAX_MAX_REQUESTS,
+        )?,
+        max_tokens: configured_u64(
+            &TASK_TOKENS_ENV,
+            crate::long_task::DEFAULT_MAX_TOKENS,
+            crate::long_task::MIN_MAX_TOKENS,
+            crate::long_task::MAX_MAX_TOKENS,
+        )?,
+        repeat_limit: configured_u64(
+            &TASK_REPEAT_ENV,
+            crate::long_task::DEFAULT_REPEAT_LIMIT,
+            crate::long_task::MIN_REPEAT_LIMIT,
+            crate::long_task::MAX_REPEAT_LIMIT,
+        )?,
+    };
+    limits.validate()?;
+    Ok(limits)
 }
 
 fn first_env(names: &[&str]) -> Result<Option<String>> {
@@ -393,6 +487,7 @@ fn validate_effort(effort: Option<&str>, provider: &str) -> Result<()> {
 
 struct TelegramSink {
     final_text: Option<String>,
+    paused: bool,
     progress: mpsc::UnboundedSender<ProgressEvent>,
     tool_started: Option<(String, Instant)>,
 }
@@ -401,6 +496,7 @@ impl TelegramSink {
     fn new(progress: mpsc::UnboundedSender<ProgressEvent>) -> Self {
         Self {
             final_text: None,
+            paused: false,
             progress,
             tool_started: None,
         }
@@ -409,6 +505,10 @@ impl TelegramSink {
     fn final_text(self) -> Result<String> {
         self.final_text
             .context("completed Telegram turn did not produce a final answer")
+    }
+
+    fn paused(&self) -> bool {
+        self.paused
     }
 }
 
@@ -437,6 +537,9 @@ impl crate::contracts::EventSink for TelegramSink {
                     });
                 }
             }
+            crate::contracts::Event::Task(progress) if progress["state"] == "paused" => {
+                self.paused = true;
+            }
             _ => {}
         }
         Ok(())
@@ -444,8 +547,9 @@ impl crate::contracts::EventSink for TelegramSink {
 }
 
 struct TurnOutcome {
-    text: String,
+    text: Option<String>,
     usage: UsageRecord,
+    paused: bool,
 }
 
 enum ProgressEvent {
@@ -454,23 +558,27 @@ enum ProgressEvent {
 
 struct ActiveTurn {
     cancel: Arc<Notify>,
+    pause_requested: Arc<AtomicBool>,
     cancellation_reason: Arc<AtomicU8>,
     cancelled: AtomicBool,
     completed: AtomicBool,
     progress_message_id: AtomicI64,
     session_id: String,
+    long_task: bool,
     started_at: Instant,
 }
 
 impl ActiveTurn {
-    fn new(session_id: String) -> Arc<Self> {
+    fn new(session_id: String, long_task: bool) -> Arc<Self> {
         Arc::new(Self {
             cancel: Arc::new(Notify::new()),
+            pause_requested: Arc::new(AtomicBool::new(false)),
             cancellation_reason: Arc::new(AtomicU8::new(0)),
             cancelled: AtomicBool::new(false),
             completed: AtomicBool::new(false),
             progress_message_id: AtomicI64::new(0),
             session_id,
+            long_task,
             started_at: Instant::now(),
         })
     }
@@ -483,6 +591,20 @@ impl ActiveTurn {
         // notify_one retains a permit if the turn thread has not reached its
         // select yet; notify_waiters would lose an early /stop notification.
         self.cancel.notify_one();
+    }
+
+    fn request_pause(&self) {
+        if !self.completed.load(Ordering::Acquire) {
+            self.pause_requested.store(true, Ordering::Release);
+        }
+    }
+
+    fn clear_pause_request(&self) {
+        self.pause_requested.store(false, Ordering::Release);
+    }
+
+    fn is_running(&self) -> bool {
+        !self.completed.load(Ordering::Acquire)
     }
 
     fn set_progress_message(&self, message_id: i64) {
@@ -509,6 +631,7 @@ struct PreparedTurn {
     model: String,
     effort: Option<String>,
     prompt: String,
+    long_task: Option<crate::runtime::LongTaskRun>,
 }
 
 /// A root-owned in-process adapter. danso-runtime exposes the same
@@ -536,6 +659,12 @@ impl InProcessRunner {
     }
 
     fn require_session_file(&self, session_id: &str) -> Result<PathBuf> {
+        let parsed =
+            uuid::Uuid::parse_str(session_id).context("invalid Telegram session pointer")?;
+        ensure!(
+            parsed.hyphenated().to_string() == session_id,
+            "invalid Telegram session pointer"
+        );
         let path = self.journal_path(session_id);
         let metadata =
             std::fs::symlink_metadata(&path).context("Telegram session pointer has no journal")?;
@@ -570,6 +699,56 @@ impl InProcessRunner {
         bail!("could not allocate a Telegram session")
     }
 
+    fn session_status(&self, session_id: &str) -> Result<serde_json::Value> {
+        let journal = self.require_session_file(session_id)?;
+        crate::session::Session::read_status(&journal)
+    }
+
+    /// Read only the two journal timestamps needed for `/history`. The
+    /// parser never retains or returns message values, and malformed stamps
+    /// become the fixed `unknown` label rather than being echoed.
+    fn session_timestamps(&self, session_id: &str) -> Result<SessionTimestamps> {
+        let journal = self.require_session_file(session_id)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(journal)?;
+        ensure!(file.metadata()?.len() <= 16 * 1024 * 1024);
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut total_bytes = 0_u64;
+        let mut started_at = None;
+        let mut updated_at = None;
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+            total_bytes = total_bytes
+                .checked_add(read as u64)
+                .context("Telegram session journal size overflow")?;
+            ensure!(total_bytes <= 16 * 1024 * 1024);
+            let entry: JournalTimestamp<'_> = serde_json::from_str(&line)?;
+            let Some(raw) = entry.timestamp else {
+                continue;
+            };
+            let timestamp = safe_timestamp(raw);
+            if started_at.is_none() {
+                started_at = Some(timestamp.clone());
+            }
+            updated_at = Some(timestamp);
+        }
+        Ok(SessionTimestamps {
+            started_at: started_at.unwrap_or_else(|| "unknown".to_string()),
+            updated_at: updated_at.unwrap_or_else(|| "unknown".to_string()),
+        })
+    }
+
     fn start_turn(
         &self,
         active: Arc<ActiveTurn>,
@@ -577,6 +756,7 @@ impl InProcessRunner {
         model: String,
         effort: Option<String>,
         prompt: String,
+        long_task: Option<crate::runtime::LongTaskRun>,
     ) -> Result<TurnHandle> {
         let parsed =
             uuid::Uuid::parse_str(&session_id).context("invalid Telegram session pointer")?;
@@ -592,6 +772,8 @@ impl InProcessRunner {
             journal,
             model,
             effort,
+            long_task,
+            Some(Arc::clone(&active.pause_requested)),
             Arc::clone(&active.cancellation_reason),
         );
         let (sender, receiver) = oneshot::channel();
@@ -621,6 +803,27 @@ impl InProcessRunner {
     }
 }
 
+struct SessionTimestamps {
+    started_at: String,
+    updated_at: String,
+}
+
+#[derive(serde::Deserialize)]
+struct JournalTimestamp<'a> {
+    #[serde(borrow)]
+    timestamp: Option<&'a str>,
+}
+
+fn safe_timestamp(raw: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        })
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
 fn run_turn(
     config: crate::app::RunConfig,
     cancel: Arc<Notify>,
@@ -632,7 +835,7 @@ fn run_turn(
         .context("could not start Telegram turn runtime")?;
     let mut usage = crate::usage::Usage::default();
     let mut sink = TelegramSink::new(progress);
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         tokio::select! {
             biased;
             _ = cancel.notified() => Err(anyhow::anyhow!("Telegram turn cancelled")),
@@ -654,10 +857,22 @@ fn run_turn(
                 }
             },
         }
-    })?;
-    let text = sink.final_text()?;
+    });
+    let paused = sink.paused();
+    if !paused {
+        result?;
+    }
+    let text = if paused {
+        None
+    } else {
+        Some(sink.final_text()?)
+    };
     let usage = UsageRecord::from_summary(&usage.summary())?;
-    Ok(TurnOutcome { text, usage })
+    Ok(TurnOutcome {
+        text,
+        usage,
+        paused,
+    })
 }
 
 struct ChatState {
@@ -893,27 +1108,47 @@ impl TelegramService {
         let mut queued_chats = Vec::new();
         for record in records {
             let state = self.chat(record.chat_id);
-            if record.turn_active {
-                if let Some(message_id) = record.progress_message_id {
-                    if self
-                        .inner
-                        .api
-                        .edit_message_text(record.chat_id, message_id, RESTART_NOTICE)
-                        .await
-                        .is_err()
-                        && self.reply(record.chat_id, RESTART_NOTICE).await.is_err()
-                    {
+            let task_status = record
+                .active_task
+                .as_ref()
+                .and_then(|task| self.inner.runner.session_status(&task.session_pointer).ok());
+            let task_terminal = task_status.as_ref().is_some_and(|status| {
+                matches!(
+                    status["state"].as_str(),
+                    Some("not_long_task" | "completed" | "failed")
+                )
+            });
+            if record.turn_active || task_terminal {
+                if record.turn_active && !task_terminal {
+                    if let Some(message_id) = record.progress_message_id {
+                        if self
+                            .inner
+                            .api
+                            .edit_message_text(record.chat_id, message_id, RESTART_NOTICE)
+                            .await
+                            .is_err()
+                            && self.reply(record.chat_id, RESTART_NOTICE).await.is_err()
+                        {
+                            eprintln!("telegram restart notice delivery failed");
+                        }
+                    } else if self.reply(record.chat_id, RESTART_NOTICE).await.is_err() {
                         eprintln!("telegram restart notice delivery failed");
                     }
-                } else if self.reply(record.chat_id, RESTART_NOTICE).await.is_err() {
-                    eprintln!("telegram restart notice delivery failed");
                 }
                 let _record = state.record.lock().expect("Telegram record lock");
                 let mut current = self.load_record(record.chat_id)?;
                 current.clear_turn_active();
+                if task_terminal {
+                    current.clear_active_task();
+                }
                 self.save_record(&current)?;
             }
-            if !record.follow_up_queue.is_empty() {
+            // A recorded task must remain an explicit operator decision. Do
+            // not consume a queued prompt behind a paused or unresolved task
+            // during restart recovery; `/task_resume` deliberately refuses
+            // until the queue is empty.
+            if !record.follow_up_queue.is_empty() && (record.active_task.is_none() || task_terminal)
+            {
                 queued_chats.push(record.chat_id);
             }
         }
@@ -1000,6 +1235,113 @@ impl TelegramService {
             .unwrap_or_else(|| ConversationRecord::new(chat_id, -1, None)))
     }
 
+    fn memory_route(&self) -> Result<crate::memory::Route> {
+        crate::memory::Route::new(
+            &self.inner.settings.memory_root,
+            &self.inner.settings.memory_scope,
+        )
+    }
+
+    fn distill_reply(&self, record: &ConversationRecord) -> String {
+        let Some(session_id) = &record.session_pointer else {
+            return "No session journal is available for distillation.".to_string();
+        };
+        let Ok(session_path) = self.inner.runner.require_session_file(session_id) else {
+            return "No session journal is available for distillation.".to_string();
+        };
+        let Ok(route) = self.memory_route() else {
+            return "Distillation is unavailable.".to_string();
+        };
+        match crate::memory::distill::journal::enqueue(
+            &route,
+            &session_path,
+            "explicit",
+            chrono::Utc::now(),
+        ) {
+            Ok(crate::memory::distill::journal::EnqueueOutcome::Enqueued { job_id }) => {
+                format!("Distill enqueued: job_id={job_id}.")
+            }
+            Ok(crate::memory::distill::journal::EnqueueOutcome::AlreadyPending { job_id }) => {
+                format!("Distill already pending: job_id={job_id}.")
+            }
+            Ok(crate::memory::distill::journal::EnqueueOutcome::Skipped { reason }) => {
+                format!("Distill skipped: reason={reason}.")
+            }
+            Err(_) => "Distillation is unavailable.".to_string(),
+        }
+    }
+
+    fn memory_promote_reply(&self, fact_id: &str) -> String {
+        let Ok(route) = self.memory_route() else {
+            return "Memory promotion is unavailable.".to_string();
+        };
+        let result = crate::memory::promote::promote(
+            route.root(),
+            &self.inner.settings.memory_scope,
+            fact_id,
+            chrono::Utc::now(),
+            crate::memory::paths::LOCK_TIMEOUT_DEFAULT_MS,
+        );
+        match result {
+            Ok(result) if result.promoted => format!(
+                "Memory fact promoted: destination_fact_id={} promotion_id={}",
+                result.destination_fact_id, result.promotion_id
+            ),
+            Ok(result) => format!(
+                "Memory fact already-promoted: destination_fact_id={} promotion_id={}",
+                result.destination_fact_id, result.promotion_id
+            ),
+            Err(_) => "Memory promotion is unavailable.".to_string(),
+        }
+    }
+
+    fn history_reply(&self, state: &Arc<ChatState>, record: &ConversationRecord) -> String {
+        let Some(current) = &record.session_pointer else {
+            return "No session history is available.".to_string();
+        };
+        let active = state
+            .active
+            .lock()
+            .expect("Telegram active-turn lock")
+            .as_ref()
+            .is_some_and(|active| active.is_running());
+        let mut sessions = Vec::with_capacity(1 + record.previous_sessions.len());
+        sessions.push(("current", current.clone(), active));
+        sessions.extend(
+            record
+                .previous_sessions
+                .iter()
+                .cloned()
+                .map(|session| ("previous", session, false)),
+        );
+        let mut lines = vec!["Session history:".to_string()];
+        for (position, (which, session_id, active)) in sessions.into_iter().enumerate() {
+            let Ok(timestamps) = self.inner.runner.session_timestamps(&session_id) else {
+                return "Session history is unavailable.".to_string();
+            };
+            let category = if active || (position == 0 && record.turn_active) {
+                "active turn"
+            } else if self
+                .inner
+                .runner
+                .session_status(&session_id)
+                .ok()
+                .is_some_and(|status| status["state"] == "paused")
+            {
+                "paused task"
+            } else {
+                "idle"
+            };
+            lines.push(format!(
+                "{which} {} — {category} — created={} updated={}",
+                short_session_id(&session_id),
+                timestamps.started_at,
+                timestamps.updated_at
+            ));
+        }
+        lines.join("\n")
+    }
+
     fn mark_update(&self, chat_id: i64, update_id: i64) -> Result<()> {
         let state = self.chat(chat_id);
         let _record = state.record.lock().expect("Telegram record lock");
@@ -1018,28 +1360,27 @@ impl TelegramService {
         state: Arc<ChatState>,
         command: CommandInput,
     ) -> Result<()> {
-        let reply;
-        {
+        let (reply, prepared) = {
             let _record = state.record.lock().expect("Telegram record lock");
             let mut record = self.load_record(chat_id)?;
             if update_id <= record.last_update_id {
                 return Ok(());
             }
             record.last_update_id = update_id;
-            match command.kind {
-                CommandKind::Start => {
-                    reply = Some(if command.invalid_shape {
-                        "Usage: /start".to_string()
-                    } else {
-                        "Hello! You are authorized to use this Danso bot. \
-                         Access is restricted to the configured Telegram allowlist. \
-                         Send text for one turn, or use /new, /stop, /model, /effort, and /usage."
-                            .to_string()
-                    });
-                }
+            let mut prepared = None;
+            let reply = match command.kind {
+                CommandKind::Start => Some(if command.invalid_shape {
+                    "Usage: /start".to_string()
+                } else {
+                    "Hello! You are authorized to use this Danso bot. \
+                     Access is restricted to the configured Telegram allowlist. \
+                     Send text for one turn, or use /new, /stop, /model, /effort, /usage, \
+                     /task, /task_pause, /task_resume, /distill, /memory_promote, /resume, and /history."
+                        .to_string()
+                }),
                 CommandKind::New => {
                     if command.invalid_shape {
-                        reply = Some("Usage: /new".to_string());
+                        Some("Usage: /new".to_string())
                     } else if state
                         .active
                         .lock()
@@ -1047,19 +1388,21 @@ impl TelegramService {
                         .is_some()
                         || !record.follow_up_queue.is_empty()
                     {
-                        reply = Some(
+                        Some(
                             "Cannot start a new session while a turn or follow-up queue is active; use /stop first."
                                 .to_string(),
-                        );
+                        )
                     } else {
+                        record.remember_current_session();
                         let session_id = self.inner.runner.new_session()?;
                         record.session_pointer = Some(session_id);
-                        reply = Some("Started a new Danso session.".to_string());
+                        record.clear_active_task();
+                        Some("Started a new Danso session.".to_string())
                     }
                 }
                 CommandKind::Stop => {
                     if command.invalid_shape {
-                        reply = Some("Usage: /stop".to_string());
+                        Some("Usage: /stop".to_string())
                     } else {
                         let active = state
                             .active
@@ -1068,67 +1411,67 @@ impl TelegramService {
                             .clone();
                         let queued = !record.follow_up_queue.is_empty();
                         if let Some(active) = &active {
+                            active.clear_pause_request();
                             active.interrupt();
                         }
                         record.follow_up_queue.clear();
-                        reply = Some(if active
-                            .as_ref()
-                            .is_some_and(|active| !active.completed.load(Ordering::Acquire))
-                        {
-                            "Stopping the active turn. Its journal is preserved and will not be replayed."
-                        } else if queued {
-                            "Cleared the queued follow-up turns."
-                        } else {
-                            "No turn is currently running."
-                        }
-                        .to_string());
+                        Some(
+                            if active
+                                .as_ref()
+                                .is_some_and(|active| active.is_running())
+                            {
+                                "Stopping the active turn. Its journal is preserved and will not be replayed."
+                            } else if queued {
+                                "Cleared the queued follow-up turns."
+                            } else {
+                                "No turn is currently running."
+                            }
+                            .to_string(),
+                        )
                     }
                 }
                 CommandKind::Model => {
                     if command.invalid_shape {
-                        reply = Some("Usage: /model [model-name]".to_string());
+                        Some("Usage: /model [model-name]".to_string())
                     } else if let Some(model) = command.argument {
                         match validate_model(&model) {
                             Ok(()) => {
                                 record.provider = Some(self.inner.settings.provider.clone());
                                 record.model = Some(model.clone());
-                                reply = Some(format!("Model set to {model}."));
+                                Some(format!("Model set to {model}."))
                             }
-                            Err(_) => {
-                                reply = Some(
-                                    "Model must be one non-whitespace token of at most 4096 bytes."
-                                        .to_string(),
-                                )
-                            }
+                            Err(_) => Some(
+                                "Model must be one non-whitespace token of at most 4096 bytes."
+                                    .to_string(),
+                            ),
                         }
                     } else {
-                        reply = Some(format!(
+                        Some(format!(
                             "Current model: {}",
                             record.effective_model(&self.inner.settings.default_model)
-                        ));
+                        ))
                     }
                 }
                 CommandKind::Effort => {
                     if command.invalid_shape {
-                        reply = Some(
+                        Some(
                             "Usage: /effort [none|minimal|low|medium|high|xhigh|max|default]"
                                 .to_string(),
-                        );
+                        )
                     } else if let Some(argument) = command.argument {
                         let effort = argument.to_ascii_lowercase();
                         if effort == "default" {
                             record.provider = Some(self.inner.settings.provider.clone());
                             record.effort = None;
-                            reply =
-                                Some("Reasoning effort reset to the service default.".to_string());
+                            Some("Reasoning effort reset to the service default.".to_string())
                         } else {
                             match validate_effort(Some(&effort), &self.inner.settings.provider) {
                                 Ok(()) => {
                                     record.provider = Some(self.inner.settings.provider.clone());
                                     record.effort = Some(effort.clone());
-                                    reply = Some(format!("Reasoning effort set to {effort}."));
+                                    Some(format!("Reasoning effort set to {effort}."))
                                 }
-                                Err(_) => reply = Some(
+                                Err(_) => Some(
                                     "That reasoning effort is not supported by the configured provider."
                                         .to_string(),
                                 ),
@@ -1138,27 +1481,177 @@ impl TelegramService {
                         let effort = record
                             .effective_effort(self.inner.settings.default_effort.as_deref())
                             .unwrap_or("default");
-                        reply = Some(format!("Current reasoning effort: {effort}."));
+                        Some(format!("Current reasoning effort: {effort}."))
                     }
                 }
-                CommandKind::Usage => {
-                    reply = Some(if command.invalid_shape {
-                        "Usage: /usage".to_string()
+                CommandKind::Usage => Some(if command.invalid_shape {
+                    "Usage: /usage".to_string()
+                } else {
+                    format_usage(&record)
+                }),
+                CommandKind::Task => {
+                    let prompt = command.argument;
+                    if command.invalid_shape
+                        || prompt
+                            .as_deref()
+                            .is_none_or(|prompt| prompt.trim().is_empty())
+                    {
+                        Some(TASK_USAGE.to_string())
+                    } else if state
+                        .active
+                        .lock()
+                        .expect("Telegram active-turn lock")
+                        .is_some()
+                        || !record.follow_up_queue.is_empty()
+                    {
+                        Some(
+                            "Cannot start a long task while a turn or follow-up queue is active."
+                                .to_string(),
+                        )
+                    } else if record.active_task.is_some() {
+                        Some(
+                            "A paused long task already exists; use /task_resume or /new first."
+                                .to_string(),
+                        )
                     } else {
-                        format_usage(&record)
-                    });
+                        prepared = Some(self.prepare_long_task_turn(
+                            &state,
+                            &mut record,
+                            prompt.expect("validated task prompt"),
+                        )?);
+                        None
+                    }
                 }
-                CommandKind::Unknown => {
-                    reply = Some(
-                        "Unknown command. Use /start, /new, /stop, /model, /effort, or /usage."
-                            .to_string(),
-                    );
+                CommandKind::TaskPause => {
+                    if command.invalid_shape {
+                        Some(TASK_PAUSE_USAGE.to_string())
+                    } else {
+                        let active = state
+                            .active
+                            .lock()
+                            .expect("Telegram active-turn lock")
+                            .clone();
+                        if active
+                            .as_ref()
+                            .is_some_and(|active| active.is_running() && active.long_task)
+                        {
+                            active.expect("checked above").request_pause();
+                            Some(TASK_PAUSE_REQUESTED.to_string())
+                        } else {
+                            Some("No active long-task turn to pause.".to_string())
+                        }
+                    }
                 }
+                CommandKind::TaskResume => {
+                    if command.invalid_shape {
+                        Some(TASK_RESUME_USAGE.to_string())
+                    } else if state
+                        .active
+                        .lock()
+                        .expect("Telegram active-turn lock")
+                        .is_some()
+                        || !record.follow_up_queue.is_empty()
+                    {
+                        Some(
+                            "Cannot resume a long task while a turn or follow-up queue is active."
+                                .to_string(),
+                        )
+                    } else {
+                        let task = record.active_task.clone();
+                        let resumable = task.as_ref().is_some_and(|task| {
+                            self.inner
+                                .runner
+                                .session_status(&task.session_pointer)
+                                .ok()
+                                .is_some_and(|status| {
+                                    status["state"] == "paused" && status["resume_allowed"] == true
+                                })
+                        });
+                        if !resumable {
+                            Some("No paused long task is available to resume.".to_string())
+                        } else {
+                            let task = task.expect("resumable task has metadata");
+                            record.session_pointer = Some(task.session_pointer.clone());
+                            prepared = Some(self.prepare_resume_turn(&state, &mut record, task)?);
+                            None
+                        }
+                    }
+                }
+                CommandKind::Distill => {
+                    if command.invalid_shape {
+                        Some(DISTILL_USAGE.to_string())
+                    } else {
+                        Some(self.distill_reply(&record))
+                    }
+                }
+                CommandKind::MemoryPromote => {
+                    if command.invalid_shape
+                        || command
+                            .argument
+                            .as_deref()
+                            .is_none_or(|fact| !valid_distill_id(fact))
+                    {
+                        Some(MEMORY_PROMOTE_USAGE.to_string())
+                    } else if !self.inner.settings.memory_scope.starts_with("private-") {
+                        Some("Memory promotion requires a private memory scope.".to_string())
+                    } else {
+                        Some(self.memory_promote_reply(
+                            command.argument.as_deref().expect("validated fact id"),
+                        ))
+                    }
+                }
+                CommandKind::Resume => {
+                    if command.invalid_shape {
+                        Some(RESUME_USAGE.to_string())
+                    } else if state
+                        .active
+                        .lock()
+                        .expect("Telegram active-turn lock")
+                        .is_some()
+                        || !record.follow_up_queue.is_empty()
+                    {
+                        Some(
+                            "Cannot resume a session while a turn or follow-up queue is active."
+                                .to_string(),
+                        )
+                    } else if record.previous_sessions.is_empty() {
+                        Some("No previous session is available.".to_string())
+                    } else {
+                        let previous = record.previous_sessions[0].clone();
+                        if self.inner.runner.require_session_file(&previous).is_err() {
+                            Some("The previous session is unavailable.".to_string())
+                        } else {
+                            let _ = record.swap_previous_session();
+                            Some("Resumed the previous Danso session.".to_string())
+                        }
+                    }
+                }
+                CommandKind::History => {
+                    if command.invalid_shape {
+                        Some(HISTORY_USAGE.to_string())
+                    } else {
+                        Some(self.history_reply(&state, &record))
+                    }
+                }
+                CommandKind::Unknown => Some(
+                    "Unknown command. Use /start, /new, /stop, /model, /effort, /usage, /task, \
+                     /task_pause, /task_resume, /distill, /memory_promote, /resume, or /history."
+                        .to_string(),
+                ),
+            };
+            if let Err(error) = self.save_record(&record) {
+                if prepared.is_some() {
+                    *state.active.lock().expect("Telegram active-turn lock") = None;
+                }
+                return Err(error);
             }
-            self.save_record(&record)?;
-        }
+            (reply, prepared)
+        };
         if let Some(reply) = reply {
             self.reply(chat_id, &reply).await?;
+        }
+        if let Some(prepared) = prepared {
+            self.launch_turn(chat_id, state, prepared, None).await?;
         }
         Ok(())
     }
@@ -1200,6 +1693,12 @@ impl TelegramService {
                 }
                 self.save_record(&record)?;
                 prepared = None;
+            } else if record.active_task.is_some() {
+                queue_reply = Some(
+                    "A paused long task must be resumed or replaced with /new first.".to_string(),
+                );
+                self.save_record(&record)?;
+                prepared = None;
             } else {
                 let next = self.prepare_turn(&state, &mut record, prompt)?;
                 if let Err(error) = self.save_record(&record) {
@@ -1229,6 +1728,73 @@ impl TelegramService {
         record: &mut ConversationRecord,
         prompt: String,
     ) -> Result<PreparedTurn> {
+        self.prepare_turn_with_task(state, record, prompt, None)
+    }
+
+    fn prepare_long_task_turn(
+        &self,
+        state: &Arc<ChatState>,
+        record: &mut ConversationRecord,
+        prompt: String,
+    ) -> Result<PreparedTurn> {
+        let task = crate::runtime::LongTaskRun {
+            limits: self.inner.settings.task_limits,
+            explicit_limits: 0,
+            resume: false,
+            follow_up: false,
+            pause_after_stage: None,
+        };
+        let prepared = self.prepare_turn_with_task(state, record, prompt, Some(task))?;
+        let started_at = crate::session::now();
+        record.mark_long_task_active(prepared.session_id.clone(), started_at);
+        Ok(prepared)
+    }
+
+    fn prepare_resume_turn(
+        &self,
+        state: &Arc<ChatState>,
+        record: &mut ConversationRecord,
+        task: super::store::ActiveTaskRecord,
+    ) -> Result<PreparedTurn> {
+        ensure!(
+            task.kind == "long_task",
+            "Telegram active task kind is invalid"
+        );
+        let long_task = crate::runtime::LongTaskRun {
+            limits: self.inner.settings.task_limits,
+            explicit_limits: 0,
+            resume: true,
+            follow_up: false,
+            pause_after_stage: None,
+        };
+        let model = record
+            .model
+            .clone()
+            .unwrap_or_else(|| self.inner.settings.default_model.clone());
+        let effort = record.effort.clone();
+        record.provider = Some(self.inner.settings.provider.clone());
+        record.model = Some(model.clone());
+        record.session_pointer = Some(task.session_pointer.clone());
+        record.mark_turn_active();
+        let active = ActiveTurn::new(task.session_pointer.clone(), true);
+        *state.active.lock().expect("Telegram active-turn lock") = Some(Arc::clone(&active));
+        Ok(PreparedTurn {
+            active,
+            session_id: task.session_pointer,
+            model,
+            effort,
+            prompt: String::new(),
+            long_task: Some(long_task),
+        })
+    }
+
+    fn prepare_turn_with_task(
+        &self,
+        state: &Arc<ChatState>,
+        record: &mut ConversationRecord,
+        prompt: String,
+        long_task: Option<crate::runtime::LongTaskRun>,
+    ) -> Result<PreparedTurn> {
         let session_id = match record.session_pointer.clone() {
             Some(session_id) => session_id,
             None => self.inner.runner.new_session()?,
@@ -1242,7 +1808,7 @@ impl TelegramService {
         record.model = Some(model.clone());
         record.session_pointer = Some(session_id.clone());
         record.mark_turn_active();
-        let active = ActiveTurn::new(session_id.clone());
+        let active = ActiveTurn::new(session_id.clone(), long_task.is_some());
         *state.active.lock().expect("Telegram active-turn lock") = Some(Arc::clone(&active));
         Ok(PreparedTurn {
             active,
@@ -1250,6 +1816,7 @@ impl TelegramService {
             model,
             effort,
             prompt,
+            long_task,
         })
     }
 
@@ -1321,6 +1888,7 @@ impl TelegramService {
             prepared.model,
             prepared.effort,
             prepared.prompt,
+            prepared.long_task,
         ) {
             Ok(handle) => handle,
             Err(error) => {
@@ -1367,6 +1935,14 @@ impl TelegramService {
         if is_current {
             *state.active.lock().expect("Telegram active-turn lock") = None;
             record.clear_turn_active();
+            if active.long_task
+                && record
+                    .active_task
+                    .as_ref()
+                    .is_some_and(|task| task.session_pointer == active.session_id.as_str())
+            {
+                record.clear_active_task();
+            }
             if let Some(prompt) = requeue
                 && !active.cancelled.load(Ordering::Acquire)
             {
@@ -1417,63 +1993,99 @@ impl TelegramService {
             }
         };
         let cancelled = active.cancelled.load(Ordering::Acquire);
-        let (reply, failed, usage_saved) = {
-            let _record_guard = state.record.lock().expect("Telegram record lock");
-            let mut usage_saved = true;
-            let mut reply = None;
-            let mut failed = false;
-            match result {
-                Ok(outcome) if !cancelled => {
-                    let TurnOutcome { text, usage } = outcome;
-                    match self.load_record(chat_id) {
-                        Ok(mut record) => {
-                            if record.session_pointer.as_deref() == Some(active.session_id.as_str())
-                            {
-                                if record.record_usage(usage).is_err() {
+        let mut paused = false;
+        let (reply, failed, usage_saved) =
+            {
+                let _record_guard = state.record.lock().expect("Telegram record lock");
+                let mut usage_saved = true;
+                let mut reply = None;
+                let mut failed = false;
+                match result {
+                    Ok(outcome) if !cancelled => {
+                        let TurnOutcome {
+                            text,
+                            usage,
+                            paused: task_paused,
+                        } = outcome;
+                        paused = task_paused;
+                        match self.load_record(chat_id) {
+                            Ok(mut record) => {
+                                let same_session = record.session_pointer.as_deref()
+                                    == Some(active.session_id.as_str());
+                                let same_task = record.active_task.as_ref().is_some_and(|task| {
+                                    task.session_pointer == active.session_id.as_str()
+                                });
+                                if task_paused {
+                                    // The long-task ledger already contains the
+                                    // durable `paused` marker. Keep the task
+                                    // metadata so `/task_resume` can find its
+                                    // own journal, but release this process-local
+                                    // active-turn slot.
+                                    record.clear_turn_active();
+                                    if self.save_record(&record).is_err() {
+                                        usage_saved = false;
+                                    }
+                                } else if same_session {
+                                    if record.record_usage(usage).is_err() {
+                                        usage_saved = false;
+                                    }
+                                    record.clear_turn_active();
+                                    if same_task {
+                                        record.clear_active_task();
+                                    }
+                                    if self.save_record(&record).is_err() {
+                                        usage_saved = false;
+                                    }
+                                } else {
                                     usage_saved = false;
-                                }
-                                record.clear_turn_active();
-                                if self.save_record(&record).is_err() {
-                                    usage_saved = false;
-                                }
-                            } else {
-                                usage_saved = false;
-                                record.clear_turn_active();
-                                if self.save_record(&record).is_err() {
-                                    usage_saved = false;
+                                    record.clear_turn_active();
+                                    if self.save_record(&record).is_err() {
+                                        usage_saved = false;
+                                    }
                                 }
                             }
+                            Err(_) => usage_saved = false,
                         }
-                        Err(_) => usage_saved = false,
+                        reply = text;
                     }
-                    reply = Some(text);
-                }
-                Ok(_) => {
-                    if let Ok(mut record) = self.load_record(chat_id) {
-                        record.clear_turn_active();
-                        if self.save_record(&record).is_err() {
+                    Ok(_) => {
+                        if let Ok(mut record) = self.load_record(chat_id) {
+                            record.clear_turn_active();
+                            if record.active_task.as_ref().is_some_and(|task| {
+                                task.session_pointer == active.session_id.as_str()
+                            }) {
+                                record.clear_active_task();
+                            }
+                            if self.save_record(&record).is_err() {
+                                usage_saved = false;
+                            }
+                        } else {
                             usage_saved = false;
                         }
-                    } else {
-                        usage_saved = false;
                     }
-                }
-                Err(_) => {
-                    failed = !cancelled;
-                    if let Ok(mut record) = self.load_record(chat_id) {
-                        record.clear_turn_active();
-                        if self.save_record(&record).is_err() {
+                    Err(_) => {
+                        failed = !cancelled;
+                        if let Ok(mut record) = self.load_record(chat_id) {
+                            record.clear_turn_active();
+                            if record.active_task.as_ref().is_some_and(|task| {
+                                task.session_pointer == active.session_id.as_str()
+                            }) {
+                                record.clear_active_task();
+                            }
+                            if self.save_record(&record).is_err() {
+                                usage_saved = false;
+                            }
+                        } else {
                             usage_saved = false;
                         }
-                    } else {
-                        usage_saved = false;
                     }
                 }
-            }
-            (reply, failed, usage_saved)
-        };
+                (reply, failed, usage_saved)
+            };
         let progress_status = if cancelled {
             "⏹ Turn stopped — journal preserved; no replay."
+        } else if paused {
+            "⏸ Long task paused."
         } else if reply.is_some() {
             "✅ Turn complete."
         } else {
@@ -1498,7 +2110,21 @@ impl TelegramService {
         {
             eprintln!("telegram failure notice delivery failed");
         }
-        self.advance_after_turn(chat_id, state, active).await;
+        if paused {
+            let current = state
+                .active
+                .lock()
+                .expect("Telegram active-turn lock")
+                .clone();
+            if current
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &active))
+            {
+                *state.active.lock().expect("Telegram active-turn lock") = None;
+            }
+        } else {
+            self.advance_after_turn(chat_id, state, active).await;
+        }
     }
 
     fn advance_after_turn(
@@ -1566,6 +2192,7 @@ impl TelegramService {
                             model: prepared.model.clone(),
                             effort: prepared.effort.clone(),
                             prompt: prepared.prompt.clone(),
+                            long_task: prepared.long_task,
                         },
                         Some(prepared.prompt),
                     )
@@ -1618,6 +2245,13 @@ enum CommandKind {
     Model,
     Effort,
     Usage,
+    Task,
+    TaskPause,
+    TaskResume,
+    Distill,
+    MemoryPromote,
+    Resume,
+    History,
     Unknown,
 }
 
@@ -1633,8 +2267,8 @@ fn parse_command(text: &str) -> Option<CommandInput> {
     if !trimmed.starts_with('/') {
         return None;
     }
-    let mut parts = trimmed.split_whitespace();
-    let command = parts.next()?.strip_prefix('/')?;
+    let command_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let command = trimmed.get(..command_end)?.strip_prefix('/')?;
     let command = command.split('@').next().unwrap_or(command);
     let kind = match command.to_ascii_lowercase().as_str() {
         "start" => CommandKind::Start,
@@ -1643,19 +2277,66 @@ fn parse_command(text: &str) -> Option<CommandInput> {
         "model" => CommandKind::Model,
         "effort" => CommandKind::Effort,
         "usage" => CommandKind::Usage,
+        "task" => CommandKind::Task,
+        "task_pause" => CommandKind::TaskPause,
+        "task_resume" => CommandKind::TaskResume,
+        "distill" => CommandKind::Distill,
+        "memory_promote" => CommandKind::MemoryPromote,
+        "resume" => CommandKind::Resume,
+        "history" => CommandKind::History,
         _ => CommandKind::Unknown,
     };
-    let argument = parts.next().map(str::to_string);
-    let invalid_shape = parts.next().is_some()
-        || (matches!(
-            kind,
-            CommandKind::Start | CommandKind::New | CommandKind::Stop | CommandKind::Usage
-        ) && argument.is_some());
+    let rest = trimmed.get(command_end..).unwrap_or_default();
+    let argument = if kind == CommandKind::Task {
+        let prompt = rest.trim();
+        (!prompt.is_empty()).then(|| prompt.to_string())
+    } else {
+        rest.split_whitespace().next().map(str::to_string)
+    };
+    let invalid_shape = if kind == CommandKind::Task {
+        false
+    } else {
+        let mut parts = rest.split_whitespace();
+        let _ = parts.next();
+        parts.next().is_some()
+            || (matches!(
+                kind,
+                CommandKind::Start
+                    | CommandKind::New
+                    | CommandKind::Stop
+                    | CommandKind::Usage
+                    | CommandKind::TaskPause
+                    | CommandKind::TaskResume
+                    | CommandKind::Distill
+                    | CommandKind::Resume
+                    | CommandKind::History
+            ) && argument.is_some())
+    };
     Some(CommandInput {
         kind,
         argument,
         invalid_shape,
     })
+}
+
+fn valid_distill_id(fact_id: &str) -> bool {
+    fact_id.len() == "distill-".len() + 12
+        && fact_id.starts_with("distill-")
+        && fact_id["distill-".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn short_session_id(session_id: &str) -> String {
+    let bytes = session_id.as_bytes();
+    if bytes.len() < 8
+        || !bytes[..8]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    {
+        return "unknown".to_string();
+    }
+    String::from_utf8(bytes[..8].to_vec()).unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn format_usage(record: &ConversationRecord) -> String {
@@ -1769,6 +2450,21 @@ mod tests {
     }
 
     #[test]
+    fn task_parser_keeps_the_whole_free_form_prompt() {
+        let task = parse_command("/task  inspect   src/telegram/service.rs  carefully ").unwrap();
+        assert_eq!(task.kind, CommandKind::Task);
+        assert_eq!(
+            task.argument.as_deref(),
+            Some("inspect   src/telegram/service.rs  carefully")
+        );
+        assert!(!task.invalid_shape);
+        assert_eq!(parse_command("/task").unwrap().argument, None);
+        assert!(valid_distill_id("distill-0123456789ab"));
+        assert!(!valid_distill_id("distill-0123456789aB"));
+        assert!(!valid_distill_id("distill-0123456789a"));
+    }
+
+    #[test]
     fn message_splitting_obeys_character_limit() {
         let parts = split_message(&"x".repeat(8193), 4096);
         assert_eq!(
@@ -1782,7 +2478,7 @@ mod tests {
 
     #[test]
     fn progress_labels_are_body_free() {
-        let active = ActiveTurn::new("session-id".to_string());
+        let active = ActiveTurn::new("session-id".to_string(), false);
         let tool = safe_tool_name("bash /private/user/file.txt");
         let text = format_progress(&active, Some(&(tool, 4)));
         assert!(text.contains("4s"));
