@@ -84,12 +84,7 @@ pub struct ConversationRecord {
     /// A durable marker for a turn that was admitted but has not reached its
     /// completion boundary. A restart clears this marker without replaying
     /// the associated journal.
-    #[serde(
-        default,
-        alias = "active_turn",
-        alias = "turnActive",
-        alias = "active"
-    )]
+    #[serde(default, alias = "active_turn", alias = "turnActive", alias = "active")]
     pub turn_active: bool,
     /// The one Telegram message used for all progress edits for the active
     /// turn. It is cleared when the turn reaches a terminal state.
@@ -388,7 +383,10 @@ fn validate_record(record: &ConversationRecord) -> Result<()> {
         ensure!(message_id > 0, "Telegram progress message id is invalid");
     }
     for prompt in &record.follow_up_queue {
-        ensure!(!prompt.is_empty(), "Telegram follow-up prompt must not be empty");
+        ensure!(
+            !prompt.is_empty(),
+            "Telegram follow-up prompt must not be empty"
+        );
         ensure!(
             prompt.len() <= 16 * 1024,
             "Telegram follow-up prompt is too long"

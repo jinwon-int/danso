@@ -317,7 +317,10 @@ fn configured_bool(names: &[&str], default: bool) -> Result<bool> {
 
 fn atomic_write_health(path: &std::path::Path, payload: &[u8]) -> Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
-        ensure!(metadata.is_file(), "Telegram health file must be a regular file");
+        ensure!(
+            metadata.is_file(),
+            "Telegram health file must be a regular file"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -446,10 +449,7 @@ struct TurnOutcome {
 }
 
 enum ProgressEvent {
-    ToolFinished {
-        name: String,
-        elapsed_seconds: u64,
-    },
+    ToolFinished { name: String, elapsed_seconds: u64 },
 }
 
 struct ActiveTurn {
@@ -486,7 +486,8 @@ impl ActiveTurn {
     }
 
     fn set_progress_message(&self, message_id: i64) {
-        self.progress_message_id.store(message_id, Ordering::Release);
+        self.progress_message_id
+            .store(message_id, Ordering::Release);
     }
 
     fn progress_message(&self) -> Option<i64> {
@@ -586,15 +587,13 @@ impl InProcessRunner {
         validate_model(&model)?;
         validate_effort(effort.as_deref(), &self.settings.provider)?;
         let journal = self.require_session_file(&session_id)?;
-        let config = self
-            .settings
-            .config(
-                prompt,
-                journal,
-                model,
-                effort,
-                Arc::clone(&active.cancellation_reason),
-            );
+        let config = self.settings.config(
+            prompt,
+            journal,
+            model,
+            effort,
+            Arc::clone(&active.cancellation_reason),
+        );
         let (sender, receiver) = oneshot::channel();
         let (progress_sender, progress_receiver) = mpsc::unbounded_channel();
         let cancel = Arc::clone(&active.cancel);
@@ -796,11 +795,9 @@ impl TelegramService {
     }
 
     fn refresh_health(&self, last_poll_at: Option<&str>) -> Result<()> {
-        self.inner.health.write(
-            &self.inner.conversations,
-            &self.inner.chats,
-            last_poll_at,
-        )
+        self.inner
+            .health
+            .write(&self.inner.conversations, &self.inner.chats, last_poll_at)
     }
 
     fn save_record(&self, record: &ConversationRecord) -> Result<()> {
@@ -891,8 +888,7 @@ impl TelegramService {
     }
 
     async fn recover_orphans(&self) -> Result<()> {
-        const RESTART_NOTICE: &str =
-            "Service restarted. The prior turn did not complete; its journal was preserved and will not be replayed.";
+        const RESTART_NOTICE: &str = "Service restarted. The prior turn did not complete; its journal was preserved and will not be replayed.";
         let records = self.inner.conversations.load_all()?;
         let mut queued_chats = Vec::new();
         for record in records {
@@ -1265,12 +1261,7 @@ impl TelegramService {
         requeue_on_failure: Option<String>,
     ) -> Result<()> {
         let progress_text = format_progress(&prepared.active, None);
-        let progress_message = match self
-            .inner
-            .api
-            .send_message(chat_id, &progress_text)
-            .await
-        {
+        let progress_message = match self.inner.api.send_message(chat_id, &progress_text).await {
             Ok(message) => message,
             Err(error) => {
                 self.abort_prepared_turn(
@@ -1333,12 +1324,7 @@ impl TelegramService {
         ) {
             Ok(handle) => handle,
             Err(error) => {
-                self.abort_prepared_turn(
-                    chat_id,
-                    &state,
-                    &prepared.active,
-                    requeue_on_failure,
-                )?;
+                self.abort_prepared_turn(chat_id, &state, &prepared.active, requeue_on_failure)?;
                 self.edit_progress(
                     chat_id,
                     &prepared.active,
@@ -1437,7 +1423,7 @@ impl TelegramService {
             let mut reply = None;
             let mut failed = false;
             match result {
-                Ok(Ok(outcome)) if !cancelled => {
+                Ok(outcome) if !cancelled => {
                     let TurnOutcome { text, usage } = outcome;
                     match self.load_record(chat_id) {
                         Ok(mut record) => {
@@ -1462,7 +1448,7 @@ impl TelegramService {
                     }
                     reply = Some(text);
                 }
-                Ok(Ok(_)) => {
+                Ok(_) => {
                     if let Ok(mut record) = self.load_record(chat_id) {
                         record.clear_turn_active();
                         if self.save_record(&record).is_err() {
@@ -1472,7 +1458,7 @@ impl TelegramService {
                         usage_saved = false;
                     }
                 }
-                Ok(Err(_)) | Err(_) => {
+                Err(_) => {
                     failed = !cancelled;
                     if let Ok(mut record) = self.load_record(chat_id) {
                         record.clear_turn_active();
@@ -1515,74 +1501,80 @@ impl TelegramService {
         self.advance_after_turn(chat_id, state, active).await;
     }
 
-    async fn advance_after_turn(
+    fn advance_after_turn(
         &self,
         chat_id: i64,
         state: Arc<ChatState>,
         active: Arc<ActiveTurn>,
-    ) {
-        let prepared = {
-            let _record = state.record.lock().expect("Telegram record lock");
-            let mut record = match self.load_record(chat_id) {
-                Ok(record) => record,
-                Err(_) => return,
-            };
-            let current = state
-                .active
-                .lock()
-                .expect("Telegram active-turn lock")
-                .clone();
-            if !current
-                .as_ref()
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &active))
-            {
-                return;
-            }
-            let Some(prompt) = record.follow_up_queue.first().cloned() else {
-                *state.active.lock().expect("Telegram active-turn lock") = None;
-                let _ = self.save_record(&record);
-                return;
-            };
-            record.follow_up_queue.remove(0);
-            match self.prepare_turn(&state, &mut record, prompt.clone()) {
-                Ok(prepared) => {
-                    if self.save_record(&record).is_ok() {
-                        Some(prepared)
-                    } else {
-                        record.clear_turn_active();
-                        record.follow_up_queue.insert(0, prepared.prompt);
-                        *state.active.lock().expect("Telegram active-turn lock") =
-                            Some(Arc::clone(&active));
+    ) -> std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        // Boxed so the finish_turn future (which awaits this via the
+        // follow-up advance path) does not embed this future's type, which
+        // itself spawns finish_turn — a mutually recursive async chain that
+        // rustc cannot prove Send without the type erasure.
+        Box::pin(async move {
+            let prepared = {
+                let _record = state.record.lock().expect("Telegram record lock");
+                let mut record = match self.load_record(chat_id) {
+                    Ok(record) => record,
+                    Err(_) => return,
+                };
+                let current = state
+                    .active
+                    .lock()
+                    .expect("Telegram active-turn lock")
+                    .clone();
+                if !current
+                    .as_ref()
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &active))
+                {
+                    return;
+                }
+                let Some(prompt) = record.follow_up_queue.first().cloned() else {
+                    *state.active.lock().expect("Telegram active-turn lock") = None;
+                    let _ = self.save_record(&record);
+                    return;
+                };
+                record.follow_up_queue.remove(0);
+                match self.prepare_turn(&state, &mut record, prompt.clone()) {
+                    Ok(prepared) => {
+                        if self.save_record(&record).is_ok() {
+                            Some(prepared)
+                        } else {
+                            record.clear_turn_active();
+                            record.follow_up_queue.insert(0, prepared.prompt);
+                            *state.active.lock().expect("Telegram active-turn lock") =
+                                Some(Arc::clone(&active));
+                            let _ = self.save_record(&record);
+                            None
+                        }
+                    }
+                    Err(_) => {
+                        record.follow_up_queue.insert(0, prompt);
                         let _ = self.save_record(&record);
                         None
                     }
                 }
-                Err(_) => {
-                    record.follow_up_queue.insert(0, prompt);
-                    let _ = self.save_record(&record);
-                    None
-                }
+            };
+            if let Some(prepared) = prepared
+                && self
+                    .launch_turn(
+                        chat_id,
+                        state,
+                        PreparedTurn {
+                            active: Arc::clone(&prepared.active),
+                            session_id: prepared.session_id.clone(),
+                            model: prepared.model.clone(),
+                            effort: prepared.effort.clone(),
+                            prompt: prepared.prompt.clone(),
+                        },
+                        Some(prepared.prompt),
+                    )
+                    .await
+                    .is_err()
+            {
+                eprintln!("telegram queued turn start failed");
             }
-        };
-        if let Some(prepared) = prepared
-            && self
-                .launch_turn(
-                    chat_id,
-                    state,
-                    PreparedTurn {
-                        active: Arc::clone(&prepared.active),
-                        session_id: prepared.session_id.clone(),
-                        model: prepared.model.clone(),
-                        effort: prepared.effort.clone(),
-                        prompt: prepared.prompt.clone(),
-                    },
-                    Some(prepared.prompt),
-                )
-                .await
-                .is_err()
-        {
-            eprintln!("telegram queued turn start failed");
-        }
+        })
     }
 
     async fn update_progress(
@@ -1727,9 +1719,9 @@ fn safe_tool_name(name: &str) -> String {
 fn format_progress(active: &ActiveTurn, last_tool: Option<&(String, u64)>) -> String {
     let elapsed_seconds = active.started_at.elapsed().as_secs();
     match last_tool {
-        Some((name, tool_seconds)) => format!(
-            "⏳ Turn in progress — {elapsed_seconds}s\nTool {name} — {tool_seconds}s"
-        ),
+        Some((name, tool_seconds)) => {
+            format!("⏳ Turn in progress — {elapsed_seconds}s\nTool {name} — {tool_seconds}s")
+        }
         None => format!("⏳ Turn in progress — {elapsed_seconds}s"),
     }
 }

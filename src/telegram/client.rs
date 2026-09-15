@@ -120,12 +120,7 @@ impl BotApi {
     /// Edit the existing progress message. Progress updates deliberately use
     /// a separate method so the service cannot accidentally create a stream of
     /// status messages while a turn is running.
-    pub async fn edit_message_text(
-        &self,
-        chat_id: i64,
-        message_id: i64,
-        text: &str,
-    ) -> Result<()> {
+    pub async fn edit_message_text(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
         ensure!(message_id > 0, "Telegram progress message id is invalid");
         ensure!(!text.is_empty(), "Telegram message text must not be empty");
         ensure!(

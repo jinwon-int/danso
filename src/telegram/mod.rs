@@ -390,9 +390,7 @@ mod tests {
             r#"{"ok":false,"error_code":429,"description":"retry"}"#,
         )
         .with_retry_after(0);
-        let sent = ok(
-            r#"{"ok":true,"result":{"message_id":2,"chat":{"id":-100},"text":"reply"}}"#,
-        );
+        let sent = ok(r#"{"ok":true,"result":{"message_id":2,"chat":{"id":-100},"text":"reply"}}"#);
         let server = FakeBotApi::new(vec![limited, sent]);
         let client = BotApi::with_base_url("TEST_TOKEN", &server.base_url)
             .unwrap()
@@ -401,19 +399,19 @@ mod tests {
         client.send_message(-100, "reply").await.unwrap();
         let requests = server.finish();
         assert_eq!(requests.len(), 2);
-        assert!(requests
-            .iter()
-            .all(|request| request.path.contains("/botTEST_TOKEN/sendMessage")));
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.path.contains("/botTEST_TOKEN/sendMessage"))
+        );
     }
 
     #[tokio::test]
     async fn progress_edits_use_the_same_message_id() {
-        let initial = ok(
-            r#"{"ok":true,"result":{"message_id":7,"chat":{"id":-100},"text":"working"}}"#,
-        );
-        let edited = ok(
-            r#"{"ok":true,"result":{"message_id":7,"chat":{"id":-100},"text":"done"}}"#,
-        );
+        let initial =
+            ok(r#"{"ok":true,"result":{"message_id":7,"chat":{"id":-100},"text":"working"}}"#);
+        let edited =
+            ok(r#"{"ok":true,"result":{"message_id":7,"chat":{"id":-100},"text":"done"}}"#);
         let server = FakeBotApi::new(vec![initial, edited]);
         let client = BotApi::with_base_url("TEST_TOKEN", &server.base_url).unwrap();
         let message = client.send_message(-100, "working").await.unwrap();

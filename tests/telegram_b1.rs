@@ -473,16 +473,16 @@ async fn poll_reconnect_keeps_offset_and_duplicate_update_is_consumed_once() {
         .expect("service task join")
         .expect("service loop");
 
-    let requests = bot
-        .requests
-        .lock()
-        .expect("fixture request lock")
-        .clone();
+    let requests = bot.requests.lock().expect("fixture request lock").clone();
     let polls = requests
         .iter()
         .filter(|request| request.path.contains("/getUpdates"))
         .collect::<Vec<_>>();
-    assert!(polls.iter().any(|request| request.path.contains("offset=2")));
+    assert!(
+        polls
+            .iter()
+            .any(|request| request.path.contains("offset=2"))
+    );
     assert_eq!(provider.request_count(), 1);
     assert_eq!(
         bot.sent_texts()
@@ -704,10 +704,11 @@ async fn progress_is_one_editable_message_and_long_replies_stay_in_order() {
         .cloned()
         .collect::<Vec<_>>();
     assert_eq!(answer_parts.concat(), "x".repeat(9000));
-    assert!(bot
-        .edited_texts()
-        .iter()
-        .any(|text| text == "✅ Turn complete."));
+    assert!(
+        bot.edited_texts()
+            .iter()
+            .any(|text| text == "✅ Turn complete.")
+    );
     let record = ConversationStore::new(root.path())
         .expect("conversation store")
         .load(42)
@@ -715,14 +716,16 @@ async fn progress_is_one_editable_message_and_long_replies_stay_in_order() {
         .expect("conversation record");
     assert!(!record.turn_active);
     assert_eq!(record.progress_message_id, None);
-    let health: Value = serde_json::from_slice(
-        &fs::read(root.path().join("health.json")).expect("health file"),
-    )
-    .expect("health JSON");
+    let health: Value =
+        serde_json::from_slice(&fs::read(root.path().join("health.json")).expect("health file"))
+            .expect("health JSON");
     assert_eq!(health["schema_version"], 1);
     assert_eq!(health["active_turn_count"], 0);
     assert_eq!(health["queued_counts"]["42"], 0);
-    assert_eq!(health["service_pid"].as_u64(), Some(std::process::id() as u64));
+    assert_eq!(
+        health["service_pid"].as_u64(),
+        Some(std::process::id() as u64)
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -826,23 +829,22 @@ async fn restart_edits_orphan_progress_and_recovers_persisted_queue_and_session(
     let shutdown = Arc::new(Notify::new());
     let task = tokio::spawn(restarted.clone().run_until(Arc::clone(&shutdown)));
     wait_for(Duration::from_secs(5), || {
-        after_restart_bot
-            .edited_texts()
-            .iter()
-            .any(|text| {
-                text.contains("Service restarted") && text.contains("journal was preserved")
-            })
+        after_restart_bot.edited_texts().iter().any(|text| {
+            text.contains("Service restarted") && text.contains("journal was preserved")
+        })
     })
     .await;
-    assert!(after_restart_bot
-        .requests
-        .lock()
-        .expect("fixture request lock")
-        .iter()
-        .any(|request| {
-            request.path.contains("/editMessageText")
-                && String::from_utf8_lossy(&request.body).contains("\"message_id\":777")
-        }));
+    assert!(
+        after_restart_bot
+            .requests
+            .lock()
+            .expect("fixture request lock")
+            .iter()
+            .any(|request| {
+                request.path.contains("/editMessageText")
+                    && String::from_utf8_lossy(&request.body).contains("\"message_id\":777")
+            })
+    );
     wait_for_message(&after_restart_bot, "fixture answer").await;
     shutdown.notify_one();
     task.await
