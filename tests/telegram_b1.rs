@@ -26,8 +26,14 @@ struct Request {
 }
 
 enum ServerMode {
-    Bot { update: Option<String> },
-    Anthropic { release: Option<Arc<AtomicBool>> },
+    Bot {
+        update: Option<String>,
+        reconnect_duplicate: bool,
+    },
+    Anthropic {
+        release: Option<Arc<AtomicBool>>,
+        answer: String,
+    },
 }
 
 struct LoopbackServer {
@@ -41,11 +47,29 @@ impl LoopbackServer {
     fn bot(update: Option<Update>) -> Self {
         Self::new(ServerMode::Bot {
             update: update.map(|update| serde_json::to_string(&update).expect("fixture update")),
+            reconnect_duplicate: false,
+        })
+    }
+
+    fn bot_with_reconnect_duplicate(update: Update) -> Self {
+        Self::new(ServerMode::Bot {
+            update: Some(serde_json::to_string(&update).expect("fixture update")),
+            reconnect_duplicate: true,
         })
     }
 
     fn anthropic(release: Option<Arc<AtomicBool>>) -> Self {
-        Self::new(ServerMode::Anthropic { release })
+        Self::new(ServerMode::Anthropic {
+            release,
+            answer: "fixture answer".to_string(),
+        })
+    }
+
+    fn anthropic_with_answer(answer: impl Into<String>) -> Self {
+        Self::new(ServerMode::Anthropic {
+            release: None,
+            answer: answer.into(),
+        })
     }
 
     fn new(mode: ServerMode) -> Self {
@@ -60,6 +84,8 @@ impl LoopbackServer {
         let stopping = Arc::clone(&stop);
         let join = thread::spawn(move || {
             let mut delivered_update = false;
+            let mut dropped_connection = false;
+            let mut delivered_duplicate = false;
             while !stopping.load(Ordering::Acquire) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(connection) => connection,
@@ -79,10 +105,23 @@ impl LoopbackServer {
                         path: path.clone(),
                         body: body.clone(),
                     });
+                let mut drop_connection = false;
                 let response = match &mode {
-                    ServerMode::Bot { update } if path.contains("/getUpdates") => {
+                    ServerMode::Bot {
+                        update,
+                        reconnect_duplicate,
+                    } if path.contains("/getUpdates") => {
                         let result = if !delivered_update {
                             delivered_update = true;
+                            update
+                                .as_deref()
+                                .map_or_else(|| "[]".to_string(), |update| format!("[{update}]"))
+                        } else if *reconnect_duplicate && !dropped_connection {
+                            dropped_connection = true;
+                            drop_connection = true;
+                            "[]".to_string()
+                        } else if *reconnect_duplicate && !delivered_duplicate {
+                            delivered_duplicate = true;
                             update
                                 .as_deref()
                                 .map_or_else(|| "[]".to_string(), |update| format!("[{update}]"))
@@ -95,7 +134,7 @@ impl LoopbackServer {
                         r#"{"ok":true,"result":{"message_id":999,"chat":{"id":42},"text":"sent"}}"#
                             .to_string()
                     }
-                    ServerMode::Anthropic { release } => {
+                    ServerMode::Anthropic { release, answer } => {
                         if let Some(release) = release {
                             while !release.load(Ordering::Acquire)
                                 && !stopping.load(Ordering::Acquire)
@@ -103,9 +142,15 @@ impl LoopbackServer {
                                 thread::sleep(Duration::from_millis(2));
                             }
                         }
-                        r#"{"model":"fixture-model","content":[{"type":"text","text":"fixture answer"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":2,"cache_creation_input_tokens":1}}"#.to_string()
+                        format!(
+                            r#"{{"model":"fixture-model","content":[{{"type":"text","text":{}}}],"stop_reason":"end_turn","usage":{{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":2,"cache_creation_input_tokens":1}}}}"#,
+                            serde_json::to_string(answer).expect("fixture answer JSON")
+                        )
                     }
                 };
+                if drop_connection {
+                    continue;
+                }
                 write_response(&mut stream, &response);
             }
         });
@@ -127,6 +172,17 @@ impl LoopbackServer {
             .expect("fixture request lock")
             .iter()
             .filter(|request| request.path.contains("/sendMessage"))
+            .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+            .filter_map(|request| request["text"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn edited_texts(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .expect("fixture request lock")
+            .iter()
+            .filter(|request| request.path.contains("/editMessageText"))
             .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
             .filter_map(|request| request["text"].as_str().map(str::to_owned))
             .collect()
@@ -216,6 +272,8 @@ impl Environment {
             "DANSO_TELEGRAM_PROVIDER_RETRIES",
             "DANSO_TELEGRAM_MAX_OUTPUT_TOKENS",
             "DANSO_TELEGRAM_COMPACT_AT_BYTES",
+            "DANSO_TELEGRAM_HEARTBEAT_SECONDS",
+            "DANSO_TELEGRAM_FOLLOWUP_CAP",
             "DANSO_PROVIDER",
             "DANSO_MODEL",
             "DANSO_REASONING_EFFORT",
@@ -387,6 +445,56 @@ async fn service_loop_answers_one_authorized_message_in_process() {
 }
 
 #[tokio::test]
+async fn poll_reconnect_keeps_offset_and_duplicate_update_is_consumed_once() {
+    let _lock = environment_lock().await;
+    let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
+    let bot = LoopbackServer::bot_with_reconnect_duplicate(update(1, 42, "once"));
+    let provider = LoopbackServer::anthropic(None);
+    let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
+    environment.set_provider_base("anthropic", &provider);
+    let service = TelegramService::from_env().expect("Telegram service config");
+    let shutdown = Arc::new(Notify::new());
+    let task = tokio::spawn(service.run_until(Arc::clone(&shutdown)));
+
+    wait_for_message(&bot, "fixture answer").await;
+    wait_for(Duration::from_secs(5), || {
+        bot.requests
+            .lock()
+            .expect("fixture request lock")
+            .iter()
+            .filter(|request| request.path.contains("/getUpdates"))
+            .count()
+            >= 3
+    })
+    .await;
+    shutdown.notify_one();
+    task.await
+        .expect("service task join")
+        .expect("service loop");
+
+    let requests = bot.requests.lock().expect("fixture request lock").clone();
+    let polls = requests
+        .iter()
+        .filter(|request| request.path.contains("/getUpdates"))
+        .collect::<Vec<_>>();
+    assert!(
+        polls
+            .iter()
+            .any(|request| request.path.contains("offset=2"))
+    );
+    assert_eq!(provider.request_count(), 1);
+    assert_eq!(
+        bot.sent_texts()
+            .iter()
+            .filter(|text| text.as_str() == "fixture answer")
+            .count(),
+        1
+    );
+    drop(environment);
+}
+
+#[tokio::test]
 async fn new_command_replaces_the_chat_session_pointer() {
     let _lock = environment_lock().await;
     let root = tempfile::tempdir().expect("test state");
@@ -552,6 +660,205 @@ async fn model_and_effort_overrides_survive_a_service_restart() {
         .expect("conversation record");
     assert_eq!(record.model.as_deref(), Some("per-chat-model"));
     assert_eq!(record.effort.as_deref(), Some("high"));
+    drop(environment);
+}
+
+#[tokio::test]
+async fn progress_is_one_editable_message_and_long_replies_stay_in_order() {
+    let _lock = environment_lock().await;
+    let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
+    let bot = LoopbackServer::bot(None);
+    let provider = LoopbackServer::anthropic_with_answer("x".repeat(9000));
+    let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
+    environment.set_provider_base("anthropic", &provider);
+    environment.set("DANSO_TELEGRAM_HEARTBEAT_SECONDS", "0");
+    let service = TelegramService::from_env().expect("Telegram service config");
+
+    service
+        .handle_update(update(1, 42, "long answer"))
+        .await
+        .expect("start long turn");
+    wait_for(Duration::from_secs(5), || {
+        bot.sent_texts()
+            .iter()
+            .filter(|text| text.chars().count() == 4096)
+            .count()
+            == 2
+    })
+    .await;
+    wait_for(Duration::from_secs(5), || {
+        bot.sent_texts()
+            .iter()
+            .filter(|text| text.chars().count() == 808)
+            .count()
+            == 1
+    })
+    .await;
+
+    let sent = bot.sent_texts();
+    assert_eq!(sent.iter().filter(|text| text.starts_with('⏳')).count(), 1);
+    let answer_parts = sent
+        .iter()
+        .filter(|text| text.chars().count() == 4096 || text.chars().count() == 808)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(answer_parts.concat(), "x".repeat(9000));
+    assert!(
+        bot.edited_texts()
+            .iter()
+            .any(|text| text == "✅ Turn complete.")
+    );
+    let record = ConversationStore::new(root.path())
+        .expect("conversation store")
+        .load(42)
+        .expect("load conversation")
+        .expect("conversation record");
+    assert!(!record.turn_active);
+    assert_eq!(record.progress_message_id, None);
+    let health: Value =
+        serde_json::from_slice(&fs::read(root.path().join("health.json")).expect("health file"))
+            .expect("health JSON");
+    assert_eq!(health["schema_version"], 1);
+    assert_eq!(health["active_turn_count"], 0);
+    assert_eq!(health["queued_counts"]["42"], 0);
+    assert_eq!(
+        health["service_pid"].as_u64(),
+        Some(std::process::id() as u64)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(root.path().join("health.json"))
+            .expect("health metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    drop(environment);
+}
+
+#[tokio::test]
+async fn followups_are_durable_and_run_sequentially_with_a_cap() {
+    let _lock = environment_lock().await;
+    let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
+    let bot = LoopbackServer::bot(None);
+    let release = Arc::new(AtomicBool::new(false));
+    let provider = LoopbackServer::anthropic(Some(Arc::clone(&release)));
+    let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
+    environment.set_provider_base("anthropic", &provider);
+    environment.set("DANSO_TELEGRAM_FOLLOWUP_CAP", "1");
+    let service = TelegramService::from_env().expect("Telegram service config");
+
+    service
+        .handle_update(update(1, 42, "first"))
+        .await
+        .expect("start first turn");
+    wait_for(Duration::from_secs(5), || provider.request_count() >= 1).await;
+    service
+        .handle_update(update(2, 42, "second"))
+        .await
+        .expect("queue second turn");
+    service
+        .handle_update(update(3, 42, "third"))
+        .await
+        .expect("reject over-cap follow-up");
+    wait_for_message(&bot, "Follow-up queued (1/1)").await;
+    wait_for_message(&bot, "Follow-up queue is full").await;
+    let queued = ConversationStore::new(root.path())
+        .expect("conversation store")
+        .load(42)
+        .expect("load conversation")
+        .expect("conversation record");
+    assert_eq!(queued.follow_up_queue, vec!["second"]);
+    assert!(queued.turn_active);
+
+    release.store(true, Ordering::Release);
+    wait_for(Duration::from_secs(5), || {
+        bot.sent_texts()
+            .iter()
+            .filter(|text| text.as_str() == "fixture answer")
+            .count()
+            >= 2
+    })
+    .await;
+    let completed = ConversationStore::new(root.path())
+        .expect("conversation store")
+        .load(42)
+        .expect("load conversation")
+        .expect("conversation record");
+    assert!(completed.follow_up_queue.is_empty());
+    assert!(!completed.turn_active);
+    assert_eq!(completed.last_update_id, 3);
+    drop(environment);
+}
+
+#[tokio::test]
+async fn restart_edits_orphan_progress_and_recovers_persisted_queue_and_session() {
+    let _lock = environment_lock().await;
+    let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
+    let bot = LoopbackServer::bot(None);
+    let provider = LoopbackServer::anthropic(None);
+    let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
+    environment.set_provider_base("anthropic", &provider);
+    let service = TelegramService::from_env().expect("first Telegram service config");
+    service
+        .handle_update(update(1, 42, "/new"))
+        .await
+        .expect("create session");
+    let store = ConversationStore::new(root.path()).expect("conversation store");
+    let mut record = store
+        .load(42)
+        .expect("load conversation")
+        .expect("conversation record");
+    let session = record.session_pointer.clone().expect("session pointer");
+    record.turn_active = true;
+    record.progress_message_id = Some(777);
+    record.follow_up_queue = vec!["after restart".to_string()];
+    store.save(&record).expect("save simulated restart state");
+    drop(service);
+
+    let after_restart_bot = LoopbackServer::bot(None);
+    let after_restart_provider = LoopbackServer::anthropic(None);
+    environment.set("DANSO_TELEGRAM_API_BASE_URL", &after_restart_bot.base_url);
+    environment.set_provider_base("anthropic", &after_restart_provider);
+    let restarted = TelegramService::from_env().expect("restarted Telegram service config");
+    let shutdown = Arc::new(Notify::new());
+    let task = tokio::spawn(restarted.clone().run_until(Arc::clone(&shutdown)));
+    wait_for(Duration::from_secs(5), || {
+        after_restart_bot.edited_texts().iter().any(|text| {
+            text.contains("Service restarted") && text.contains("journal was preserved")
+        })
+    })
+    .await;
+    assert!(
+        after_restart_bot
+            .requests
+            .lock()
+            .expect("fixture request lock")
+            .iter()
+            .any(|request| {
+                request.path.contains("/editMessageText")
+                    && String::from_utf8_lossy(&request.body).contains("\"message_id\":777")
+            })
+    );
+    wait_for_message(&after_restart_bot, "fixture answer").await;
+    shutdown.notify_one();
+    task.await
+        .expect("service task join")
+        .expect("service loop");
+
+    let recovered = ConversationStore::new(root.path())
+        .expect("conversation store")
+        .load(42)
+        .expect("load recovered conversation")
+        .expect("recovered conversation");
+    assert_eq!(recovered.session_pointer.as_deref(), Some(session.as_str()));
+    assert!(!recovered.turn_active);
+    assert!(recovered.follow_up_queue.is_empty());
     drop(environment);
 }
 

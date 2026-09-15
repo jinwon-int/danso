@@ -1,13 +1,22 @@
 use super::{ALLOWED_USER_IDS_ENV, client::Update};
 use anyhow::{Context, Result, ensure};
-use std::{collections::BTreeSet, env};
+use std::{collections::BTreeSet, env, fmt};
 
 /// Explicit Telegram numeric user-id allowlist. An empty allowlist is valid
 /// and denies every update, which is the safe default when the env var is
 /// absent.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Allowlist {
     ids: BTreeSet<i64>,
+}
+
+impl fmt::Debug for Allowlist {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Allowlist")
+            .field("configured", &(!self.ids.is_empty()))
+            .finish()
+    }
 }
 
 impl Allowlist {
@@ -88,12 +97,7 @@ impl AccessControl {
         if self.is_allowed(update) {
             return true;
         }
-        let reason = if update.user_id().is_none() {
-            "missing Telegram message sender"
-        } else {
-            "sender is not on the Telegram allowlist"
-        };
-        eprintln!("telegram update {} rejected: {reason}", update.update_id);
+        eprintln!("telegram update rejected");
         false
     }
 
