@@ -1,19 +1,22 @@
-//! Telegram B1 foundation: Bot API transport, process-wide token ownership,
-//! allowlist admission, and durable per-chat conversation pointers.
-//!
-//! This module is intentionally not connected to the agent runtime yet. The
-//! later Telegram lane will own command handling and session/model wiring.
+//! Telegram B1 service: Bot API transport, process-wide token ownership,
+//! allowlist admission, durable per-chat conversation pointers, and the
+//! single-turn command/update loop.
 #![allow(dead_code)]
 
 mod access;
 mod client;
 mod lock;
+mod service;
 mod store;
 
 pub use access::{AccessControl, Allowlist};
-pub use client::BotApi;
+pub use client::{
+    API_BASE_URL_ENV, BotApi, Chat, DEFAULT_API_BASE_URL, DEFAULT_POLL_TIMEOUT_SECONDS, Message,
+    Update, User,
+};
 pub use lock::TokenLock;
-pub use store::ConversationStore;
+pub use service::{TelegramArgs, TelegramService, run};
+pub use store::{ConversationRecord, ConversationStore, UsageRecord};
 
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -25,6 +28,10 @@ pub const BOT_TOKEN_ENV: &str = "DANSO_TELEGRAM_BOT_TOKEN";
 pub const ALLOWED_USER_IDS_ENV: &str = "DANSO_TELEGRAM_ALLOWED_USER_IDS";
 pub const DATA_DIR_ENV: &str = "DANSO_TELEGRAM_DATA_DIR";
 pub const DEFAULT_DATA_DIR_SUFFIX: &str = ".danso/telegram";
+pub const WORKSPACE_ENV: &str = "DANSO_TELEGRAM_WORKSPACE";
+pub const PROVIDER_ENV: &str = "DANSO_TELEGRAM_PROVIDER";
+pub const MODEL_ENV: &str = "DANSO_TELEGRAM_MODEL";
+pub const EFFORT_ENV: &str = "DANSO_TELEGRAM_EFFORT";
 
 /// Resolve the Telegram state root from process configuration.
 pub fn data_dir_from_env() -> Result<PathBuf> {
@@ -86,13 +93,17 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Environment-only configuration for the B1 foundation. There is no config
-/// file or runtime/model selection here until the later RunTemplate lane.
+/// Environment-only configuration for the Telegram service. Provider settings
+/// remain in the normal Danso environment; Telegram-specific values only
+/// select the service endpoint, workspace, and per-process defaults.
 #[derive(Clone)]
 pub struct TelegramConfig {
     pub bot_token: String,
     pub allowed_user_ids: Allowlist,
     pub data_dir: PathBuf,
+    pub api_base_url: String,
+    pub poll_timeout_seconds: u64,
+    pub retries: u32,
 }
 
 impl fmt::Debug for TelegramConfig {
@@ -102,6 +113,9 @@ impl fmt::Debug for TelegramConfig {
             .field("bot_token", &"[redacted]")
             .field("allowed_user_ids", &self.allowed_user_ids)
             .field("data_dir", &self.data_dir)
+            .field("api_base_url", &self.api_base_url)
+            .field("poll_timeout_seconds", &self.poll_timeout_seconds)
+            .field("retries", &self.retries)
             .finish()
     }
 }
@@ -114,29 +128,73 @@ impl TelegramConfig {
             !bot_token.trim().is_empty(),
             "DANSO_TELEGRAM_BOT_TOKEN must not be empty"
         );
+        let api_base_url = std::env::var(client::API_BASE_URL_ENV)
+            .unwrap_or_else(|_| client::DEFAULT_API_BASE_URL.to_string());
+        let poll_timeout_seconds = parse_u64_env(
+            client::POLL_TIMEOUT_ENV,
+            client::DEFAULT_POLL_TIMEOUT_SECONDS,
+            300,
+        )?;
+        let retries = parse_u32_env(client::RETRIES_ENV, client::RETRIES_DEFAULT, 5)?;
         Ok(Self {
             bot_token,
             allowed_user_ids: Allowlist::from_env()?,
             data_dir: data_dir_from_env()?,
+            api_base_url,
+            poll_timeout_seconds,
+            retries,
         })
     }
 }
 
-/// The four B1 pieces assembled for a future Telegram process entry point.
-/// Holding the token lock in this value keeps the lock for the process
-/// lifetime of the consumer.
+fn parse_u64_env(name: &str, default: u64, max: u64) -> Result<u64> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let raw = raw.to_string_lossy();
+    ensure!(!raw.trim().is_empty(), "{name} must not be empty");
+    let value = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("{name} must be an integer"))?;
+    ensure!(value <= max, "{name} must be 0..={max}");
+    Ok(value)
+}
+
+fn parse_u32_env(name: &str, default: u32, max: u32) -> Result<u32> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let raw = raw.to_string_lossy();
+    ensure!(!raw.trim().is_empty(), "{name} must not be empty");
+    let value = raw
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("{name} must be an integer"))?;
+    ensure!(value <= max, "{name} must be 0..={max}");
+    Ok(value)
+}
+
+/// The transport, admission, store, and process-lifetime lock assembled for
+/// the Telegram service. Holding the token lock in this value keeps ownership
+/// for the lifetime of the consumer.
 pub struct TelegramFoundation {
     pub api: BotApi,
     pub access: AccessControl,
     pub conversations: ConversationStore,
     pub token_lock: TokenLock,
+    pub poll_timeout_seconds: u64,
 }
 
 impl TelegramFoundation {
     pub fn from_env() -> Result<Self> {
-        let config = TelegramConfig::from_env()?;
+        Self::from_config(TelegramConfig::from_env()?)
+    }
+
+    pub fn from_config(config: TelegramConfig) -> Result<Self> {
         let token_lock = TokenLock::acquire(&config.data_dir)?;
-        let api = BotApi::new(&config.bot_token)?;
+        let api = BotApi::with_base_url(&config.bot_token, &config.api_base_url)?
+            .with_retries(config.retries)?;
         let access = AccessControl::new(config.allowed_user_ids);
         let conversations = ConversationStore::new(&config.data_dir)?;
         Ok(Self {
@@ -144,13 +202,14 @@ impl TelegramFoundation {
             access,
             conversations,
             token_lock,
+            poll_timeout_seconds: config.poll_timeout_seconds,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::store::ConversationRecord;
+    use super::store::{ConversationRecord, UsageRecord};
     use super::*;
     use std::{
         io::{BufRead, BufReader, Read, Write},
@@ -373,5 +432,53 @@ mod tests {
 
         let restarted = ConversationStore::new(dir.path()).unwrap();
         assert_eq!(restarted.load(55).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn old_conversation_records_read_with_new_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        force_private_mode(dir.path());
+        let store = ConversationStore::new(dir.path()).unwrap();
+        let path = store.record_path(55);
+        std::fs::write(
+            &path,
+            br#"{"chat_id":55,"last_update_id":19,"session_pointer":"old-session"}"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let record = store.load(55).unwrap().unwrap();
+        assert_eq!(record.provider, None);
+        assert_eq!(record.model, None);
+        assert_eq!(record.effort, None);
+        assert_eq!(record.last_turn_usage, None);
+        assert!(record.usage.is_zero());
+    }
+
+    #[test]
+    fn completed_usage_is_aggregated_and_serialized_without_provider_text() {
+        let mut record = ConversationRecord::new(55, 19, None);
+        let usage = UsageRecord {
+            requests: 1,
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        };
+        record
+            .record_turn("anthropic", "fixture-model", None, usage.clone())
+            .unwrap();
+        record
+            .record_turn("anthropic", "fixture-model", None, usage)
+            .unwrap();
+        assert_eq!(record.usage.requests, 2);
+        assert_eq!(record.usage.total_tokens, 30);
+        assert_eq!(record.last_turn_usage.as_ref().unwrap().total_tokens, 15);
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert!(encoded.contains("\"model\":\"fixture-model\""));
+        assert!(encoded.contains("\"totalTokens\":30"));
     }
 }

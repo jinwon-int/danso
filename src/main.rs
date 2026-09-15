@@ -1,6 +1,5 @@
 mod cli;
 mod memory_cli;
-mod telegram;
 use clap::Parser;
 use cli::Args;
 use danso::{
@@ -36,6 +35,22 @@ fn main() {
     // Body-free timing receipt (issue #98 e): startup is measured from
     // process start until the run begins.
     let process_started = std::time::Instant::now();
+    // Telegram is a service entry point, not a normal prompt positional. It
+    // owns one process-wide token lock and keeps all turns in this process.
+    if std::env::args().nth(1).as_deref() == Some("telegram") {
+        if let Err(error) =
+            danso::telegram::TelegramArgs::try_parse_from(std::env::args_os().skip(1))
+        {
+            let code = error.exit_code();
+            error.print().ok();
+            std::process::exit(code);
+        }
+        if let Err(error) = danso::telegram::run() {
+            eprintln!("telegram service failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // The memory subcommand is synchronous and provider-free; it short-circuits
     // before the async runtime is touched (issue #52 M1).
     if std::env::args().nth(1).as_deref() == Some("memory") {

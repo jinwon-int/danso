@@ -6,7 +6,10 @@ use serde_json::Value;
 use std::{future::Future, time::Duration};
 
 pub const DEFAULT_API_BASE_URL: &str = "https://api.telegram.org";
+pub const API_BASE_URL_ENV: &str = "DANSO_TELEGRAM_API_BASE_URL";
 pub const DEFAULT_POLL_TIMEOUT_SECONDS: u64 = 25;
+pub const POLL_TIMEOUT_ENV: &str = "DANSO_TELEGRAM_POLL_TIMEOUT_SECONDS";
+pub const RETRIES_ENV: &str = "DANSO_TELEGRAM_RETRIES";
 pub const RETRIES_DEFAULT: u32 = 3;
 pub const RETRIES_MAX: u32 = 5;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -28,7 +31,17 @@ impl BotApi {
 
     pub fn from_env() -> Result<Self> {
         let token = std::env::var(BOT_TOKEN_ENV).context("DANSO_TELEGRAM_BOT_TOKEN is required")?;
-        Self::new(token)
+        let base =
+            std::env::var(API_BASE_URL_ENV).unwrap_or_else(|_| DEFAULT_API_BASE_URL.to_string());
+        let retries = match std::env::var(RETRIES_ENV) {
+            Ok(raw) if !raw.trim().is_empty() => raw
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("{RETRIES_ENV} must be an integer"))?,
+            Ok(_) | Err(std::env::VarError::NotPresent) => RETRIES_DEFAULT,
+            Err(error) => return Err(error).context(RETRIES_ENV),
+        };
+        Self::with_settings(token, &base, retries)
     }
 
     /// Use a custom base only for a controlled test server or a future

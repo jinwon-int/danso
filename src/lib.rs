@@ -10,6 +10,6 @@ pub mod output;
 pub mod provider;
 pub mod runtime;
 pub mod session;
-mod telegram;
+pub mod telegram;
 pub mod tools;
 pub mod usage;
