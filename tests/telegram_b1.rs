@@ -798,7 +798,13 @@ async fn long_task_pause_and_resume_preserve_the_journal_without_a_new_prompt() 
     assert!(!history.contains(root_text.as_str()));
     assert!(history.contains(&task.session_pointer[..8]));
 
-    let mut persisted = paused.clone();
+    // Reload the live record instead of saving the stale `paused` snapshot:
+    // the /history update above already advanced `last_update_id`, and the
+    // store refuses monotonicity violations by design.
+    let mut persisted = store
+        .load(42)
+        .expect("load restart record")
+        .expect("restart record");
     persisted.follow_up_queue = vec!["queued after restart".to_string()];
     store.save(&persisted).expect("persist paused queue");
     drop(service);
