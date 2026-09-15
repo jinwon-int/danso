@@ -1,9 +1,20 @@
+[workspace]
+members = [".", "crates/danso-runtime"]
+
 [package]
 name = "danso"
 version = "0.1.0"
 edition = "2024"
 description = "A headless worker harness with Pi portable contracts"
 license = "MIT"
+
+# Optional modules from docs/unified-design.md §3.1. Both are declared now
+# so a CLI-only build (`--no-default-features`) is a supported configuration
+# from the start; the module crates land behind them in later stages.
+[features]
+default = ["ops"]
+ops = []
+telegram = []
 
 [dependencies]
 anyhow = "1"
@@ -17,6 +28,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 serde_norway = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "time", "io-util"] }
 uuid = { version = "1", features = ["v4"] }
