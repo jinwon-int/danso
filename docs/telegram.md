@@ -1,4 +1,4 @@
-# Telegram B2 service
+# Telegram B3 service
 
 `danso telegram` runs the Telegram Bot API long-poll service in the same
 process as every agent turn. It never starts a Danso CLI subprocess per
@@ -23,6 +23,17 @@ Configuration is environment-only:
   (default `5`).
 - `DANSO_TELEGRAM_WORKSPACE` selects the absolute workspace. If omitted, the
   current directory is used.
+- `DANSO_TELEGRAM_MEMORY_SCOPE` selects the memory route used by turns and
+  explicit memory commands (`global` by default; `shared` or
+  `private-<32 lowercase hex>` are also valid). `DANSO_MEMORY_DIR` selects
+  the absolute memory root.
+- Long-task limits use the same bounded values as the CLI. The task-specific
+  environment names are `DANSO_TASK_WALL_SECONDS` (or
+  `DANSO_TASK_TIMEOUT_SECONDS`), `DANSO_TASK_STAGE_REQUESTS`,
+  `DANSO_TASK_MAX_REQUESTS`, `DANSO_TASK_MAX_TOKENS`, and
+  `DANSO_TASK_REPEAT_LIMIT` (the wall-time default is six hours). Telegram-
+  prefixed task aliases are accepted; the normal timeout environment is a
+  wall-time fallback.
 
 Provider and turn defaults use the normal Danso environment, with a
 Telegram-specific value taking precedence where available:
@@ -69,11 +80,12 @@ replays the turn or sends a partial answer.
 
 Per-chat records live in
 `data-dir/conversations/chat-id.json`. They retain the last consumed update,
-session pointer, provider, model and effort, the last completed turn's usage,
-aggregate usage, active-turn state, progress-message id, and queued follow-up
-text. New fields have tolerant defaults, so records written by the foundation
-version remain readable. The next polling offset is also persisted in
-`data-dir/poll-offset.json`.
+session pointer, up to five displaced session pointers, provider, model and
+effort, the last completed turn's usage, aggregate usage, active-turn state,
+progress-message id, queued follow-up text, and body-free metadata for one
+resumable long task. New fields have tolerant defaults, so records written by
+the foundation version remain readable. The next polling offset is also
+persisted in `data-dir/poll-offset.json`.
 
 While a turn runs, the service sends one progress message and edits that same
 message for heartbeat and body-free tool completion updates. A restart edits
@@ -99,6 +111,17 @@ The service supports:
 - `/effort` — show the current effort; `/effort <value>` persists an override,
   and `/effort default` returns to the service default.
 - `/usage` — show last-turn and aggregate local usage; it never calls a model.
+- `/task <prompt>` — start a bounded long task. Everything after the command
+  word is the prompt.
+- `/task_pause` — request a cooperative pause at the next safe checkpoint.
+- `/task_resume` — resume the paused task without appending another prompt.
+- `/distill` — enqueue the current session journal for memory distillation.
+- `/memory_promote <fact-id>` — explicitly promote one private distill fact;
+  replies contain only destination and promotion identifiers.
+- `/resume` — swap the current session with the newest previous session;
+  repeated calls toggle between them.
+- `/history` — show a bounded, body-free session timeline with short ids,
+  state categories, and timestamps.
 
 Every command is authorized before it reads or writes chat state. Unauthorized
 users are logged and never receive a Bot API reply.
