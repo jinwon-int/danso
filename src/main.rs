@@ -1,5 +1,6 @@
 mod cli;
 mod memory_cli;
+mod telegram;
 use clap::Parser;
 use cli::Args;
 use danso::{
