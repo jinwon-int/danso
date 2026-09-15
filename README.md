@@ -44,6 +44,9 @@ Choose GPT or GLM with `--provider openai` / `--provider glm`; see
 [provider configuration and examples](docs/providers.md). For the Z.AI coding
 endpoint, `scripts/danso-glm` applies the documented glm-5.3-flash profile
 (`--glm-endpoint`, `--glm-thinking` are also available as plain flags).
+Run the environment-configured Telegram service with `danso telegram`; see
+[Telegram B1 service](docs/telegram.md) for its allowlist, persistence, and
+command contract.
 
 ## Supervised first use
 
