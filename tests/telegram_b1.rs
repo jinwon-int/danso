@@ -311,6 +311,13 @@ async fn environment_lock() -> tokio::sync::MutexGuard<'static, ()> {
     LOCK.lock().await
 }
 
+/// tempdir honors the process umask (CI runners use 0002); the telegram
+/// data-dir invariant is exactly 0700, so the fixture pins it.
+fn pin_private_mode(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+}
+
 async fn wait_for<F>(timeout: Duration, mut condition: F)
 where
     F: FnMut() -> bool,
@@ -339,6 +346,7 @@ async fn wait_for_message(server: &LoopbackServer, expected: &str) {
 async fn service_loop_answers_one_authorized_message_in_process() {
     let _lock = environment_lock().await;
     let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
     let message = update(1, 42, "hello from Telegram");
     let bot = LoopbackServer::bot(Some(message));
     let provider = LoopbackServer::anthropic(None);
@@ -382,6 +390,7 @@ async fn service_loop_answers_one_authorized_message_in_process() {
 async fn new_command_replaces_the_chat_session_pointer() {
     let _lock = environment_lock().await;
     let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
     let bot = LoopbackServer::bot(None);
     let provider = LoopbackServer::anthropic(None);
     let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
@@ -420,6 +429,7 @@ async fn new_command_replaces_the_chat_session_pointer() {
 async fn stop_cancels_an_in_flight_turn_without_a_replay_or_final_answer() {
     let _lock = environment_lock().await;
     let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
     let bot = LoopbackServer::bot(None);
     let release = Arc::new(AtomicBool::new(false));
     let provider = LoopbackServer::anthropic(Some(Arc::clone(&release)));
@@ -484,6 +494,7 @@ async fn stop_cancels_an_in_flight_turn_without_a_replay_or_final_answer() {
 async fn unauthorized_users_are_not_answered() {
     let _lock = environment_lock().await;
     let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
     let bot = LoopbackServer::bot(None);
     let provider = LoopbackServer::anthropic(None);
     let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
@@ -504,6 +515,7 @@ async fn unauthorized_users_are_not_answered() {
 async fn model_and_effort_overrides_survive_a_service_restart() {
     let _lock = environment_lock().await;
     let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
     let bot = LoopbackServer::bot(None);
     let provider = LoopbackServer::anthropic(None);
     let environment = Environment::new("glm", &bot, "fixture-model", root.path());
