@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    fmt,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -10,6 +11,7 @@ use std::{
 };
 
 const CONVERSATIONS_DIR: &str = "conversations";
+const POLL_OFFSET_FILE: &str = "poll-offset.json";
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
 /// The bounded, provider-neutral counters retained for Telegram's local
@@ -62,7 +64,7 @@ impl UsageRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationRecord {
     pub chat_id: i64,
     /// -1 means that the record has no consumed update yet.
@@ -79,6 +81,24 @@ pub struct ConversationRecord {
     /// Per-chat reasoning-effort override. `None` means the service default.
     #[serde(default)]
     pub effort: Option<String>,
+    /// A durable marker for a turn that was admitted but has not reached its
+    /// completion boundary. A restart clears this marker without replaying
+    /// the associated journal.
+    #[serde(
+        default,
+        alias = "active_turn",
+        alias = "turnActive",
+        alias = "active"
+    )]
+    pub turn_active: bool,
+    /// The one Telegram message used for all progress edits for the active
+    /// turn. It is cleared when the turn reaches a terminal state.
+    #[serde(default, alias = "progressMessageId")]
+    pub progress_message_id: Option<i64>,
+    /// Text-only follow-up prompts waiting for the active turn. These are
+    /// durable so a process restart cannot silently discard user work.
+    #[serde(default, alias = "followUpQueue", alias = "queued_prompts")]
+    pub follow_up_queue: Vec<String>,
     /// Usage from the most recent completed turn, if one exists.
     #[serde(
         rename = "lastTurnUsage",
@@ -101,6 +121,25 @@ pub struct ConversationRecord {
     pub usage: UsageRecord,
 }
 
+impl fmt::Debug for ConversationRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConversationRecord")
+            .field("chat_id", &self.chat_id)
+            .field("last_update_id", &self.last_update_id)
+            .field("session_pointer", &self.session_pointer)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("effort", &self.effort)
+            .field("turn_active", &self.turn_active)
+            .field("progress_message_id", &self.progress_message_id)
+            .field("follow_up_queue_len", &self.follow_up_queue.len())
+            .field("last_turn_usage", &self.last_turn_usage)
+            .field("usage", &self.usage)
+            .finish()
+    }
+}
+
 impl ConversationRecord {
     pub fn new(chat_id: i64, last_update_id: i64, session_pointer: Option<String>) -> Self {
         Self {
@@ -110,6 +149,9 @@ impl ConversationRecord {
             provider: None,
             model: None,
             effort: None,
+            turn_active: false,
+            progress_message_id: None,
+            follow_up_queue: Vec::new(),
             last_turn_usage: None,
             usage: UsageRecord::default(),
         }
@@ -147,6 +189,23 @@ impl ConversationRecord {
         self.usage.add(&usage)?;
         self.last_turn_usage = Some(usage);
         validate_record(self)
+    }
+
+    pub fn mark_turn_active(&mut self) {
+        self.turn_active = true;
+        self.progress_message_id = None;
+    }
+
+    pub fn set_progress_message(&mut self, message_id: i64) -> Result<()> {
+        ensure!(message_id > 0, "Telegram progress message id is invalid");
+        self.turn_active = true;
+        self.progress_message_id = Some(message_id);
+        Ok(())
+    }
+
+    pub fn clear_turn_active(&mut self) {
+        self.turn_active = false;
+        self.progress_message_id = None;
     }
 }
 
@@ -205,11 +264,68 @@ impl ConversationStore {
             );
         }
         let payload = serde_json::to_vec(record)?;
+        ensure!(
+            payload.len() as u64 <= MAX_RECORD_BYTES,
+            "Telegram conversation record exceeds its size limit"
+        );
         atomic_write(&self.record_path(record.chat_id), &payload)
     }
 
     pub fn save_record(&self, record: &ConversationRecord) -> Result<()> {
         self.save(record)
+    }
+
+    /// Load every persisted chat record for service-start recovery and health
+    /// reporting. Only numeric JSON record names are part of this store.
+    pub fn load_all(&self) -> Result<Vec<ConversationRecord>> {
+        let mut records = Vec::new();
+        for entry in fs::read_dir(&self.records_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(chat_id) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if let Some(record) = self.load(chat_id)? {
+                records.push(record);
+            }
+        }
+        records.sort_by_key(|record| record.chat_id);
+        Ok(records)
+    }
+
+    /// Persist the next Telegram update offset separately from per-chat
+    /// records. This lets a reconnect resume the same poll position without
+    /// relying on an in-memory poller.
+    pub fn load_poll_offset(&self) -> Result<Option<i64>> {
+        let path = self.data_dir.join(POLL_OFFSET_FILE);
+        let Some(file) = open_record(&path)? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        file.take(64).read_to_end(&mut bytes)?;
+        let offset: i64 =
+            serde_json::from_slice(&bytes).context("decode Telegram polling offset")?;
+        ensure!(offset >= 0, "Telegram polling offset is invalid");
+        Ok(Some(offset))
+    }
+
+    pub fn save_poll_offset(&self, offset: i64) -> Result<()> {
+        ensure!(offset >= 0, "Telegram polling offset is invalid");
+        if let Some(previous) = self.load_poll_offset()? {
+            ensure!(
+                offset >= previous,
+                "Telegram polling offset cannot move backwards"
+            );
+        }
+        let payload = serde_json::to_vec(&offset)?;
+        atomic_write(&self.data_dir.join(POLL_OFFSET_FILE), &payload)
     }
 
     /// Advance a chat record monotonically after the caller has handled an
@@ -266,6 +382,16 @@ fn validate_record(record: &ConversationRecord) -> Result<()> {
         ensure!(
             !pointer.is_empty() && pointer.len() <= 4096,
             "Telegram session pointer must be 1..=4096 bytes"
+        );
+    }
+    if let Some(message_id) = record.progress_message_id {
+        ensure!(message_id > 0, "Telegram progress message id is invalid");
+    }
+    for prompt in &record.follow_up_queue {
+        ensure!(!prompt.is_empty(), "Telegram follow-up prompt must not be empty");
+        ensure!(
+            prompt.len() <= 16 * 1024,
+            "Telegram follow-up prompt is too long"
         );
     }
     for (name, value) in [

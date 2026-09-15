@@ -1,6 +1,6 @@
-//! Telegram B1 service: Bot API transport, process-wide token ownership,
-//! allowlist admission, durable per-chat conversation pointers, and the
-//! single-turn command/update loop.
+//! Telegram B2 service: Bot API transport, process-wide token ownership,
+//! allowlist admission, durable per-chat conversation state, progress edits,
+//! follow-up queueing, and the command/update loop.
 #![allow(dead_code)]
 
 mod access;
@@ -112,8 +112,8 @@ impl fmt::Debug for TelegramConfig {
             .debug_struct("TelegramConfig")
             .field("bot_token", &"[redacted]")
             .field("allowed_user_ids", &self.allowed_user_ids)
-            .field("data_dir", &self.data_dir)
-            .field("api_base_url", &self.api_base_url)
+            .field("data_dir", &"[redacted]")
+            .field("api_base_url", &"[redacted]")
             .field("poll_timeout_seconds", &self.poll_timeout_seconds)
             .field("retries", &self.retries)
             .finish()
@@ -384,6 +384,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limit_during_a_reply_recovers_without_duplicate_body_parts() {
+        let limited = Response::new(
+            429,
+            r#"{"ok":false,"error_code":429,"description":"retry"}"#,
+        )
+        .with_retry_after(0);
+        let sent = ok(
+            r#"{"ok":true,"result":{"message_id":2,"chat":{"id":-100},"text":"reply"}}"#,
+        );
+        let server = FakeBotApi::new(vec![limited, sent]);
+        let client = BotApi::with_base_url("TEST_TOKEN", &server.base_url)
+            .unwrap()
+            .with_retries(1)
+            .unwrap();
+        client.send_message(-100, "reply").await.unwrap();
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.path.contains("/botTEST_TOKEN/sendMessage")));
+    }
+
+    #[tokio::test]
+    async fn progress_edits_use_the_same_message_id() {
+        let initial = ok(
+            r#"{"ok":true,"result":{"message_id":7,"chat":{"id":-100},"text":"working"}}"#,
+        );
+        let edited = ok(
+            r#"{"ok":true,"result":{"message_id":7,"chat":{"id":-100},"text":"done"}}"#,
+        );
+        let server = FakeBotApi::new(vec![initial, edited]);
+        let client = BotApi::with_base_url("TEST_TOKEN", &server.base_url).unwrap();
+        let message = client.send_message(-100, "working").await.unwrap();
+        client
+            .edit_message_text(-100, message.message_id, "done")
+            .await
+            .unwrap();
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].path.contains("/sendMessage"));
+        assert!(requests[1].path.contains("/editMessageText"));
+        assert!(String::from_utf8_lossy(&requests[1].body).contains("\"message_id\":7"));
+    }
+
+    #[tokio::test]
     async fn unauthorized_update_is_rejected_without_an_api_reply() {
         let update = ok(
             r#"{"ok":true,"result":[{"update_id":3,"message":{"message_id":1,"from":{"id":999},"chat":{"id":55},"text":"private"}}]}"#,
@@ -432,6 +477,21 @@ mod tests {
 
         let restarted = ConversationStore::new(dir.path()).unwrap();
         assert_eq!(restarted.load(55).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn poll_offset_round_trips_monotonically_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        force_private_mode(dir.path());
+        let store = ConversationStore::new(dir.path()).unwrap();
+        assert_eq!(store.load_poll_offset().unwrap(), None);
+        store.save_poll_offset(12).unwrap();
+        assert_eq!(store.load_poll_offset().unwrap(), Some(12));
+        store.save_poll_offset(13).unwrap();
+        assert!(store.save_poll_offset(11).is_err());
+        drop(store);
+        let restarted = ConversationStore::new(dir.path()).unwrap();
+        assert_eq!(restarted.load_poll_offset().unwrap(), Some(13));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Telegram B1 service
+# Telegram B2 service
 
 `danso telegram` runs the Telegram Bot API long-poll service in the same
 process as every agent turn. It never starts a Danso CLI subprocess per
@@ -17,6 +17,10 @@ Configuration is environment-only:
 - `DANSO_TELEGRAM_POLL_TIMEOUT_SECONDS` selects the long-poll timeout
   (`0..=300`, default `25`), and `DANSO_TELEGRAM_RETRIES` selects bounded Bot
   API retries (`0..=5`, default `3`).
+- `DANSO_TELEGRAM_HEARTBEAT_SECONDS` controls edits to the single progress
+  message (default `60`; `0` disables heartbeat edits), and
+  `DANSO_TELEGRAM_FOLLOWUP_CAP` bounds the durable per-chat follow-up queue
+  (default `5`).
 - `DANSO_TELEGRAM_WORKSPACE` selects the absolute workspace. If omitted, the
   current directory is used.
 
@@ -66,8 +70,23 @@ replays the turn or sends a partial answer.
 Per-chat records live in
 `data-dir/conversations/chat-id.json`. They retain the last consumed update,
 session pointer, provider, model and effort, the last completed turn's usage,
-and aggregate usage. New fields have tolerant defaults, so records written by
-the foundation version remain readable.
+aggregate usage, active-turn state, progress-message id, and queued follow-up
+text. New fields have tolerant defaults, so records written by the foundation
+version remain readable. The next polling offset is also persisted in
+`data-dir/poll-offset.json`.
+
+While a turn runs, the service sends one progress message and edits that same
+message for heartbeat and body-free tool completion updates. A restart edits
+the saved progress message (or sends a notice if it cannot be edited), states
+that the prior turn did not complete, preserves its journal without replay,
+and clears the stale active marker. Queued follow-ups remain durable and run
+sequentially after the active turn reaches its terminal boundary. `/stop`
+cancels the active turn and clears the queue; `/new` is refused while the
+queue is non-empty.
+
+`data-dir/health.json` is atomically replaced each poll cycle and on state
+changes. It is mode `0600` and contains only schema/timing, active-turn and
+queue counts, and the service PID; it never contains message content.
 
 The service supports:
 

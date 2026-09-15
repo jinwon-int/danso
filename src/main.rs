@@ -45,8 +45,8 @@ fn main() {
             error.print().ok();
             std::process::exit(code);
         }
-        if let Err(error) = danso::telegram::run() {
-            eprintln!("telegram service failed: {error:#}");
+        if let Err(_error) = danso::telegram::run() {
+            eprintln!("telegram service failed");
             std::process::exit(1);
         }
         return;

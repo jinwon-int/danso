@@ -14,7 +14,7 @@ pub const RETRIES_DEFAULT: u32 = 3;
 pub const RETRIES_MAX: u32 = 5;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-/// Minimal Telegram Bot API adapter for B1. The token is retained only for
+/// Minimal Telegram Bot API adapter for the Telegram service. The token is retained only for
 /// constructing the Bot API path and is never included in returned errors.
 #[derive(Clone)]
 pub struct BotApi {
@@ -117,6 +117,36 @@ impl BotApi {
         decode_result(&body)
     }
 
+    /// Edit the existing progress message. Progress updates deliberately use
+    /// a separate method so the service cannot accidentally create a stream of
+    /// status messages while a turn is running.
+    pub async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+    ) -> Result<()> {
+        ensure!(message_id > 0, "Telegram progress message id is invalid");
+        ensure!(!text.is_empty(), "Telegram message text must not be empty");
+        ensure!(
+            text.chars().count() <= 4096,
+            "Telegram message text exceeds the Bot API limit of 4096 characters"
+        );
+        let url = self.endpoint("editMessageText")?;
+        let payload = EditMessageTextRequest {
+            chat_id,
+            message_id,
+            text: text.to_string(),
+        };
+        let body = self
+            .request_bytes_with_policy(|| self.client.post(url.clone()).json(&payload), true)
+            .await?;
+        if is_not_modified(&body) {
+            return Ok(());
+        }
+        decode_result::<Message>(&body).map(|_| ())
+    }
+
     pub fn poller(&self, offset: Option<i64>, timeout_seconds: u64) -> Result<Poller<'_>> {
         ensure!(
             timeout_seconds <= 300,
@@ -192,7 +222,7 @@ impl BotApi {
 
     fn endpoint(&self, method: &str) -> Result<Url> {
         ensure!(
-            matches!(method, "getUpdates" | "sendMessage"),
+            matches!(method, "getUpdates" | "sendMessage" | "editMessageText"),
             "unsupported Telegram Bot API method"
         );
         let mut url = self.base_url.clone();
@@ -203,6 +233,17 @@ impl BotApi {
     }
 
     async fn request_bytes<F>(&self, build: F) -> Result<Vec<u8>>
+    where
+        F: Fn() -> RequestBuilder,
+    {
+        self.request_bytes_with_policy(build, false).await
+    }
+
+    async fn request_bytes_with_policy<F>(
+        &self,
+        build: F,
+        allow_not_modified: bool,
+    ) -> Result<Vec<u8>>
     where
         F: Fn() -> RequestBuilder,
     {
@@ -223,6 +264,9 @@ impl BotApi {
                 let delay = retry_after.or_else(|| retry_after_body(&body));
                 tokio::time::sleep(retry_delay(attempt, delay)).await;
                 continue;
+            }
+            if allow_not_modified && status == StatusCode::BAD_REQUEST && is_not_modified(&body) {
+                return Ok(body);
             }
             if !status.is_success() {
                 bail!(
@@ -245,6 +289,10 @@ pub struct Poller<'a> {
 impl<'a> Poller<'a> {
     pub fn offset(&self) -> Option<i64> {
         self.next_offset
+    }
+
+    pub fn set_offset(&mut self, offset: Option<i64>) {
+        self.next_offset = offset;
     }
 
     pub async fn next(&mut self) -> Result<Vec<Update>> {
@@ -339,6 +387,13 @@ struct SendMessageRequest {
     text: String,
 }
 
+#[derive(Debug, Serialize)]
+struct EditMessageTextRequest {
+    chat_id: i64,
+    message_id: i64,
+    text: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(bound = "T: serde::de::DeserializeOwned")]
 struct ApiResponse<T> {
@@ -411,6 +466,17 @@ fn retryable_body(body: &[u8]) -> bool {
     value["error_code"]
         .as_i64()
         .is_some_and(|code| code == 429 || (500..=599).contains(&code))
+}
+
+fn is_not_modified(body: &[u8]) -> bool {
+    let value: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    value["ok"].as_bool() == Some(false)
+        && value["description"].as_str().is_some_and(|description| {
+            description.eq_ignore_ascii_case("bad request: message is not modified")
+        })
 }
 
 /// Match the provider wire schedule: bounded exponential delays with small
