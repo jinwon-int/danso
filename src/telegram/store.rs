@@ -478,7 +478,10 @@ fn validate_record(record: &ConversationRecord) -> Result<()> {
         "Telegram session history contains duplicate adjacent pointers"
     );
     if let Some(task) = &record.active_task {
-        ensure!(task.kind == "long_task", "Telegram active task kind is invalid");
+        ensure!(
+            task.kind == "long_task",
+            "Telegram active task kind is invalid"
+        );
         ensure!(
             !task.session_pointer.is_empty() && task.session_pointer.len() <= 4096,
             "Telegram active task session pointer is invalid"

@@ -54,10 +54,7 @@ const TASK_REQUESTS_ENV: [&str; 2] = [
     "DANSO_TASK_MAX_REQUESTS",
     "DANSO_TELEGRAM_TASK_MAX_REQUESTS",
 ];
-const TASK_TOKENS_ENV: [&str; 2] = [
-    "DANSO_TASK_MAX_TOKENS",
-    "DANSO_TELEGRAM_TASK_MAX_TOKENS",
-];
+const TASK_TOKENS_ENV: [&str; 2] = ["DANSO_TASK_MAX_TOKENS", "DANSO_TELEGRAM_TASK_MAX_TOKENS"];
 const TASK_REPEAT_ENV: [&str; 2] = [
     "DANSO_TASK_REPEAT_LIMIT",
     "DANSO_TELEGRAM_TASK_REPEAT_LIMIT",
@@ -202,8 +199,8 @@ impl RunSettings {
             0,
             MAX_FOLLOWUP_CAP,
         )? as usize;
-        let memory_scope = first_env(&["DANSO_TELEGRAM_MEMORY_SCOPE"])?
-            .unwrap_or_else(|| "global".to_string());
+        let memory_scope =
+            first_env(&["DANSO_TELEGRAM_MEMORY_SCOPE"])?.unwrap_or_else(|| "global".to_string());
         ensure!(
             crate::memory::valid_scope(&memory_scope),
             "DANSO_TELEGRAM_MEMORY_SCOPE must be global, shared, or private-<32 hex>"
@@ -242,6 +239,7 @@ impl RunSettings {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn config(
         &self,
         prompt: String,
@@ -539,10 +537,8 @@ impl crate::contracts::EventSink for TelegramSink {
                     });
                 }
             }
-            crate::contracts::Event::Task(progress) => {
-                if progress["state"] == "paused" {
-                    self.paused = true;
-                }
+            crate::contracts::Event::Task(progress) if progress["state"] == "paused" => {
+                self.paused = true;
             }
             _ => {}
         }
@@ -663,8 +659,8 @@ impl InProcessRunner {
     }
 
     fn require_session_file(&self, session_id: &str) -> Result<PathBuf> {
-        let parsed = uuid::Uuid::parse_str(session_id)
-            .context("invalid Telegram session pointer")?;
+        let parsed =
+            uuid::Uuid::parse_str(session_id).context("invalid Telegram session pointer")?;
         ensure!(
             parsed.hyphenated().to_string() == session_id,
             "invalid Telegram session pointer"
@@ -1112,9 +1108,10 @@ impl TelegramService {
         let mut queued_chats = Vec::new();
         for record in records {
             let state = self.chat(record.chat_id);
-            let task_status = record.active_task.as_ref().and_then(|task| {
-                self.inner.runner.session_status(&task.session_pointer).ok()
-            });
+            let task_status = record
+                .active_task
+                .as_ref()
+                .and_then(|task| self.inner.runner.session_status(&task.session_pointer).ok());
             let task_terminal = task_status.as_ref().is_some_and(|status| {
                 matches!(
                     status["state"].as_str(),
@@ -1150,8 +1147,7 @@ impl TelegramService {
             // not consume a queued prompt behind a paused or unresolved task
             // during restart recovery; `/task_resume` deliberately refuses
             // until the queue is empty.
-            if !record.follow_up_queue.is_empty()
-                && (record.active_task.is_none() || task_terminal)
+            if !record.follow_up_queue.is_empty() && (record.active_task.is_none() || task_terminal)
             {
                 queued_chats.push(record.chat_id);
             }
@@ -1496,7 +1492,9 @@ impl TelegramService {
                 CommandKind::Task => {
                     let prompt = command.argument;
                     if command.invalid_shape
-                        || prompt.as_deref().is_none_or(|prompt| prompt.trim().is_empty())
+                        || prompt
+                            .as_deref()
+                            .is_none_or(|prompt| prompt.trim().is_empty())
                     {
                         Some(TASK_USAGE.to_string())
                     } else if state
@@ -1566,8 +1564,7 @@ impl TelegramService {
                                 .session_status(&task.session_pointer)
                                 .ok()
                                 .is_some_and(|status| {
-                                    status["state"] == "paused"
-                                        && status["resume_allowed"] == true
+                                    status["state"] == "paused" && status["resume_allowed"] == true
                                 })
                         });
                         if !resumable {
@@ -1759,7 +1756,10 @@ impl TelegramService {
         record: &mut ConversationRecord,
         task: super::store::ActiveTaskRecord,
     ) -> Result<PreparedTurn> {
-        ensure!(task.kind == "long_task", "Telegram active task kind is invalid");
+        ensure!(
+            task.kind == "long_task",
+            "Telegram active task kind is invalid"
+        );
         let long_task = crate::runtime::LongTaskRun {
             limits: self.inner.settings.task_limits,
             explicit_limits: 0,
@@ -1936,9 +1936,10 @@ impl TelegramService {
             *state.active.lock().expect("Telegram active-turn lock") = None;
             record.clear_turn_active();
             if active.long_task
-                && record.active_task.as_ref().is_some_and(|task| {
-                    task.session_pointer == active.session_id.as_str()
-                })
+                && record
+                    .active_task
+                    .as_ref()
+                    .is_some_and(|task| task.session_pointer == active.session_id.as_str())
             {
                 record.clear_active_task();
             }
@@ -1993,93 +1994,94 @@ impl TelegramService {
         };
         let cancelled = active.cancelled.load(Ordering::Acquire);
         let mut paused = false;
-        let (reply, failed, usage_saved) = {
-            let _record_guard = state.record.lock().expect("Telegram record lock");
-            let mut usage_saved = true;
-            let mut reply = None;
-            let mut failed = false;
-            match result {
-                Ok(outcome) if !cancelled => {
-                    let TurnOutcome {
-                        text,
-                        usage,
-                        paused: task_paused,
-                    } = outcome;
-                    paused = task_paused;
-                    match self.load_record(chat_id) {
-                        Ok(mut record) => {
-                            let same_session = record.session_pointer.as_deref()
-                                == Some(active.session_id.as_str());
-                            let same_task = record.active_task.as_ref().is_some_and(|task| {
-                                task.session_pointer == active.session_id.as_str()
-                            });
-                            if task_paused {
-                                // The long-task ledger already contains the
-                                // durable `paused` marker. Keep the task
-                                // metadata so `/task_resume` can find its
-                                // own journal, but release this process-local
-                                // active-turn slot.
-                                record.clear_turn_active();
-                                if self.save_record(&record).is_err() {
+        let (reply, failed, usage_saved) =
+            {
+                let _record_guard = state.record.lock().expect("Telegram record lock");
+                let mut usage_saved = true;
+                let mut reply = None;
+                let mut failed = false;
+                match result {
+                    Ok(outcome) if !cancelled => {
+                        let TurnOutcome {
+                            text,
+                            usage,
+                            paused: task_paused,
+                        } = outcome;
+                        paused = task_paused;
+                        match self.load_record(chat_id) {
+                            Ok(mut record) => {
+                                let same_session = record.session_pointer.as_deref()
+                                    == Some(active.session_id.as_str());
+                                let same_task = record.active_task.as_ref().is_some_and(|task| {
+                                    task.session_pointer == active.session_id.as_str()
+                                });
+                                if task_paused {
+                                    // The long-task ledger already contains the
+                                    // durable `paused` marker. Keep the task
+                                    // metadata so `/task_resume` can find its
+                                    // own journal, but release this process-local
+                                    // active-turn slot.
+                                    record.clear_turn_active();
+                                    if self.save_record(&record).is_err() {
+                                        usage_saved = false;
+                                    }
+                                } else if same_session {
+                                    if record.record_usage(usage).is_err() {
+                                        usage_saved = false;
+                                    }
+                                    record.clear_turn_active();
+                                    if same_task {
+                                        record.clear_active_task();
+                                    }
+                                    if self.save_record(&record).is_err() {
+                                        usage_saved = false;
+                                    }
+                                } else {
                                     usage_saved = false;
-                                }
-                            } else if same_session {
-                                if record.record_usage(usage).is_err() {
-                                    usage_saved = false;
-                                }
-                                record.clear_turn_active();
-                                if same_task {
-                                    record.clear_active_task();
-                                }
-                                if self.save_record(&record).is_err() {
-                                    usage_saved = false;
-                                }
-                            } else {
-                                usage_saved = false;
-                                record.clear_turn_active();
-                                if self.save_record(&record).is_err() {
-                                    usage_saved = false;
+                                    record.clear_turn_active();
+                                    if self.save_record(&record).is_err() {
+                                        usage_saved = false;
+                                    }
                                 }
                             }
+                            Err(_) => usage_saved = false,
                         }
-                        Err(_) => usage_saved = false,
+                        reply = text;
                     }
-                    reply = text;
-                }
-                Ok(_) => {
-                    if let Ok(mut record) = self.load_record(chat_id) {
-                        record.clear_turn_active();
-                        if record.active_task.as_ref().is_some_and(|task| {
-                            task.session_pointer == active.session_id.as_str()
-                        }) {
-                            record.clear_active_task();
-                        }
-                        if self.save_record(&record).is_err() {
+                    Ok(_) => {
+                        if let Ok(mut record) = self.load_record(chat_id) {
+                            record.clear_turn_active();
+                            if record.active_task.as_ref().is_some_and(|task| {
+                                task.session_pointer == active.session_id.as_str()
+                            }) {
+                                record.clear_active_task();
+                            }
+                            if self.save_record(&record).is_err() {
+                                usage_saved = false;
+                            }
+                        } else {
                             usage_saved = false;
                         }
-                    } else {
-                        usage_saved = false;
                     }
-                }
-                Err(_) => {
-                    failed = !cancelled;
-                    if let Ok(mut record) = self.load_record(chat_id) {
-                        record.clear_turn_active();
-                        if record.active_task.as_ref().is_some_and(|task| {
-                            task.session_pointer == active.session_id.as_str()
-                        }) {
-                            record.clear_active_task();
-                        }
-                        if self.save_record(&record).is_err() {
+                    Err(_) => {
+                        failed = !cancelled;
+                        if let Ok(mut record) = self.load_record(chat_id) {
+                            record.clear_turn_active();
+                            if record.active_task.as_ref().is_some_and(|task| {
+                                task.session_pointer == active.session_id.as_str()
+                            }) {
+                                record.clear_active_task();
+                            }
+                            if self.save_record(&record).is_err() {
+                                usage_saved = false;
+                            }
+                        } else {
                             usage_saved = false;
                         }
-                    } else {
-                        usage_saved = false;
                     }
                 }
-            }
-            (reply, failed, usage_saved)
-        };
+                (reply, failed, usage_saved)
+            };
         let progress_status = if cancelled {
             "⏹ Turn stopped — journal preserved; no replay."
         } else if paused {
@@ -2265,9 +2267,7 @@ fn parse_command(text: &str) -> Option<CommandInput> {
     if !trimmed.starts_with('/') {
         return None;
     }
-    let command_end = trimmed
-        .find(char::is_whitespace)
-        .unwrap_or(trimmed.len());
+    let command_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
     let command = trimmed.get(..command_end)?.strip_prefix('/')?;
     let command = command.split('@').next().unwrap_or(command);
     let kind = match command.to_ascii_lowercase().as_str() {

@@ -461,8 +461,7 @@ async fn wait_for_history(server: &LoopbackServer) -> String {
     server
         .sent_texts()
         .into_iter()
-        .filter(|text| text.starts_with("Session history:"))
-        .last()
+        .rfind(|text| text.starts_with("Session history:"))
         .expect("history reply")
 }
 
@@ -752,7 +751,11 @@ async fn long_task_pause_and_resume_preserve_the_journal_without_a_new_prompt() 
         .handle_update(update(2, 42, "/task_pause"))
         .await
         .expect("request task pause");
-    wait_for_message(&bot, "pause requested; takes effect at the next safe checkpoint").await;
+    wait_for_message(
+        &bot,
+        "pause requested; takes effect at the next safe checkpoint",
+    )
+    .await;
     release.store(true, Ordering::Release);
     wait_for_edit(&bot, "⏸ Long task paused.").await;
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -764,7 +767,10 @@ async fn long_task_pause_and_resume_preserve_the_journal_without_a_new_prompt() 
         .expect("paused conversation");
     let task = paused.active_task.clone().expect("paused task metadata");
     assert_eq!(task.kind, "long_task");
-    assert_eq!(task.session_pointer, paused.session_pointer.clone().unwrap());
+    assert_eq!(
+        task.session_pointer,
+        paused.session_pointer.clone().unwrap()
+    );
     assert!(!paused.turn_active);
     let journal_path = root
         .path()
@@ -799,10 +805,7 @@ async fn long_task_pause_and_resume_preserve_the_journal_without_a_new_prompt() 
 
     let after_restart_bot = LoopbackServer::bot(None);
     let after_restart_provider = LoopbackServer::anthropic(None);
-    environment.set(
-        "DANSO_TELEGRAM_API_BASE_URL",
-        &after_restart_bot.base_url,
-    );
+    environment.set("DANSO_TELEGRAM_API_BASE_URL", &after_restart_bot.base_url);
     environment.set_provider_base("anthropic", &after_restart_provider);
     let restarted = TelegramService::from_env().expect("restarted Telegram service config");
     restarted
@@ -961,11 +964,17 @@ async fn distill_reports_enqueue_and_already_pending_without_transcript_content(
         .filter(|text| text.starts_with("Distill "))
         .collect::<Vec<_>>();
     assert_eq!(outcomes.len(), 2);
-    assert!(!outcomes.iter().any(|text| text.contains("private exchange")));
+    assert!(
+        !outcomes
+            .iter()
+            .any(|text| text.contains("private exchange"))
+    );
     let memory_root_text = memory_root.to_string_lossy().into_owned();
-    assert!(!outcomes
-        .iter()
-        .any(|text| text.contains(memory_root_text.as_str())));
+    assert!(
+        !outcomes
+            .iter()
+            .any(|text| text.contains(memory_root_text.as_str()))
+    );
     drop(environment);
 }
 
@@ -1023,10 +1032,7 @@ async fn memory_promote_refuses_non_private_scope() {
     let provider = LoopbackServer::anthropic(None);
     let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
     environment.set_provider_base("anthropic", &provider);
-    environment.set(
-        "DANSO_MEMORY_DIR",
-        root.path().join("memory").as_os_str(),
-    );
+    environment.set("DANSO_MEMORY_DIR", root.path().join("memory").as_os_str());
     let service = TelegramService::from_env().expect("Telegram service config");
     service
         .handle_update(update(1, 42, "/memory_promote distill-0123456789ab"))
