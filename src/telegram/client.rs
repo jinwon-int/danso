@@ -27,8 +27,7 @@ impl BotApi {
     }
 
     pub fn from_env() -> Result<Self> {
-        let token =
-            std::env::var(BOT_TOKEN_ENV).context("DANSO_TELEGRAM_BOT_TOKEN is required")?;
+        let token = std::env::var(BOT_TOKEN_ENV).context("DANSO_TELEGRAM_BOT_TOKEN is required")?;
         Self::new(token)
     }
 
@@ -117,11 +116,7 @@ impl BotApi {
         })
     }
 
-    pub async fn poll_once(
-        &self,
-        offset: Option<i64>,
-        timeout_seconds: u64,
-    ) -> Result<PollResult> {
+    pub async fn poll_once(&self, offset: Option<i64>, timeout_seconds: u64) -> Result<PollResult> {
         let mut poller = self.poller(offset, timeout_seconds)?;
         let updates = poller.next().await?;
         Ok(PollResult {
@@ -141,17 +136,17 @@ impl BotApi {
             "Telegram bot token must not contain surrounding whitespace"
         );
         ensure!(
-            token.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-')
-            }),
+            token
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-') }),
             "Telegram bot token contains invalid characters"
         );
         ensure!(
             retries <= RETRIES_MAX,
             "Telegram retries must be 0..={RETRIES_MAX}"
         );
-        let base_url =
-            Url::parse(base_url).map_err(|_| anyhow::anyhow!("invalid Telegram Bot API base URL"))?;
+        let base_url = Url::parse(base_url)
+            .map_err(|_| anyhow::anyhow!("invalid Telegram Bot API base URL"))?;
         ensure!(
             base_url.host_str().is_some()
                 && (base_url.scheme() == "https"
@@ -245,10 +240,7 @@ impl<'a> Poller<'a> {
             .get_updates(self.next_offset, self.timeout_seconds)
             .await?;
         if let Some(last) = updates.iter().map(|update| update.update_id).max() {
-            self.next_offset = Some(
-                last.checked_add(1)
-                    .context("Telegram update id overflow")?,
-            );
+            self.next_offset = Some(last.checked_add(1).context("Telegram update id overflow")?);
         }
         Ok(updates)
     }

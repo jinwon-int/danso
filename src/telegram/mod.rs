@@ -11,7 +11,7 @@ mod lock;
 mod store;
 
 pub use access::{AccessControl, Allowlist};
-pub use client::{BotApi, Chat, Message, Poller, PollResult, Update, User};
+pub use client::{BotApi, Chat, Message, PollResult, Poller, Update, User};
 pub use lock::TokenLock;
 pub use store::{ConversationRecord, ConversationStore};
 
@@ -31,7 +31,10 @@ pub fn data_dir_from_env() -> Result<PathBuf> {
     if let Some(raw) = std::env::var_os(DATA_DIR_ENV) {
         ensure!(!raw.is_empty(), "{DATA_DIR_ENV} must not be empty");
         let path = PathBuf::from(raw);
-        ensure!(path.is_absolute(), "{DATA_DIR_ENV} must be an absolute path");
+        ensure!(
+            path.is_absolute(),
+            "{DATA_DIR_ENV} must be an absolute path"
+        );
         return Ok(path);
     }
 
@@ -224,11 +227,7 @@ mod tests {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut request_line = String::new();
         reader.read_line(&mut request_line).unwrap();
-        let path = request_line
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .to_string();
+        let path = request_line.split_whitespace().nth(1).unwrap().to_string();
         let mut content_length = 0usize;
         loop {
             let mut line = String::new();
@@ -276,9 +275,7 @@ mod tests {
         let first = ok(
             r#"{"ok":true,"result":[{"update_id":10,"message":{"message_id":1,"from":{"id":42},"chat":{"id":-100},"text":"hello"}}]}"#,
         );
-        let sent = ok(
-            r#"{"ok":true,"result":{"message_id":2,"chat":{"id":-100},"text":"reply"}}"#,
-        );
+        let sent = ok(r#"{"ok":true,"result":{"message_id":2,"chat":{"id":-100},"text":"reply"}}"#);
         let empty = ok(r#"{"ok":true,"result":[]}"#);
         let server = FakeBotApi::new(vec![first, sent, empty]);
         let client = BotApi::with_base_url("TEST_TOKEN", &server.base_url)
@@ -300,10 +297,12 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert!(requests[0].path.contains("/botTEST_TOKEN/getUpdates"));
         assert!(requests[1].path.contains("/botTEST_TOKEN/sendMessage"));
-        assert!(requests[1]
-            .body
-            .windows(b"chat_id".len())
-            .any(|window| window == b"chat_id"));
+        assert!(
+            requests[1]
+                .body
+                .windows(b"chat_id".len())
+                .any(|window| window == b"chat_id")
+        );
         assert!(requests[2].path.contains("offset=11"));
     }
 

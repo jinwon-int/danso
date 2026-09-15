@@ -53,7 +53,10 @@ impl TokenLock {
 
 fn validate_lock_file(file: &File) -> Result<()> {
     let metadata = file.metadata()?;
-    ensure!(metadata.is_file(), "Telegram token lock must be a regular file");
+    ensure!(
+        metadata.is_file(),
+        "Telegram token lock must be a regular file"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
