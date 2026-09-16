@@ -186,14 +186,25 @@ class Fixture(unittest.TestCase):
         self.retry_after = None
         self.error_body_delay = 0
         self.stream_delay = 0
-        self.first_stream_chunk = threading.Event()
+        # Which requests have begun streaming, by their index in `requests`.
+        # A bare shared Event cannot say WHOSE stream started: every handler
+        # sets the same object on every chunk, so a test waiting for "my
+        # request started" also accepts "some other request started" — which
+        # for a cancelled request means a handler that is still winding down.
+        self.stream_started = set()
+        self.fixture_lock = threading.Lock()
         owner = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
-                owner.requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
-                owner.headers.append(dict(self.headers))
-                owner.paths.append(self.path)
+                payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                # Appending and reading the index must be one step: two handlers
+                # racing here would both claim the same index.
+                with owner.fixture_lock:
+                    owner.requests.append(payload)
+                    index = len(owner.requests) - 1
+                    owner.headers.append(dict(self.headers))
+                    owner.paths.append(self.path)
                 status, body = owner.responses.pop(0) if owner.responses else (500, {})
                 if callable(body):
                     body = body(owner.requests[-1])
@@ -221,13 +232,13 @@ class Fixture(unittest.TestCase):
                                 continue
                             self.wfile.write(part + b'\n\n')
                             self.wfile.flush()
-                            owner.first_stream_chunk.set()
+                            owner.stream_started.add(index)
                             time.sleep(owner.stream_delay)
                     else:
                         self.wfile.write(data)
                         self.wfile.flush()
                         if stream:
-                            owner.first_stream_chunk.set()
+                            owner.stream_started.add(index)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
@@ -237,6 +248,20 @@ class Fixture(unittest.TestCase):
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
+
+    def wait_for_stream(self, index, timeout):
+        """Wait until the request at `index` has begun streaming.
+
+        Polling a per-request fact rather than waiting on one shared Event:
+        the caller needs to know its OWN request reached the wire, and a signal
+        that any request did is not the same claim.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if index in self.stream_started:
+                return True
+            time.sleep(0.01)
+        return index in self.stream_started
 
     def tearDown(self):
         self.server.shutdown()
@@ -315,6 +340,23 @@ class Providers(Fixture):
                 self.assertNotIn('"role":"assistant"', self.session.read_text())
                 self.assertEqual(len(self.requests), before_requests + 1)
 
+    def test_stream_wait_is_bound_to_one_request(self):
+        """A signal for another request must not satisfy this one's wait.
+
+        The cancellation test terminates the process as soon as its wait
+        returns, and both of its assertions assume that run reached the wire.
+        A wait that a *different* request can satisfy therefore cancels a run
+        that may not have sent anything yet — leaving no request to count, and
+        possibly arriving before the signal handler is installed. This pins the
+        property rather than the timing, which is what a shared Event lost.
+        """
+        self.stream_started.clear()
+        threading.Timer(0.02, lambda: self.stream_started.add(6)).start()
+        self.assertFalse(self.wait_for_stream(7, 0.3),
+                         'request 6 starting must not satisfy a wait for request 7')
+        self.stream_started.add(7)
+        self.assertTrue(self.wait_for_stream(7, 0.3))
+
     def test_mid_stream_cancellation_does_not_retry_or_journal_partial_response(self):
         self.stream_delay = 0.1
         for provider in ('anthropic', 'openai', 'glm'):
@@ -322,13 +364,18 @@ class Providers(Fixture):
                 self.session = self.root / f'cancel-{provider}.jsonl'
                 before_requests = len(self.requests)
                 self.responses.append((200, response(provider, text='cancel-after-first-delta')))
-                self.first_stream_chunk.clear()
                 command = [str(BIN), *self.execution_args, '--cwd', str(self.repo), '--session', str(self.session),
                            '--provider', provider, '--model', 'fixture', '--provider-retries', '3', '--no-tools',
                            '-p', 'do task']
                 process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                            text=True, env=self.streaming_env(provider))
-                self.assertTrue(self.first_stream_chunk.wait(5), 'fixture did not start the SSE response')
+                # Wait for THIS request's stream, not for any stream. The two
+                # assertions below both depend on this run having got as far as
+                # sending its request and receiving a delta; cancelling before
+                # that leaves no request to count and can arrive before the
+                # signal handler is installed.
+                self.assertTrue(self.wait_for_stream(before_requests, 5),
+                                'fixture did not start the SSE response for this request')
                 process.terminate()
                 stdout, stderr = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 143, stderr)
