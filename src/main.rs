@@ -111,6 +111,72 @@ fn main() {
                 }
                 return;
             }
+            ServiceCommand::Install {
+                data_dir,
+                user,
+                dry_run,
+            } => {
+                let spec = match danso::service::unit_spec(data_dir, user) {
+                    Ok(spec) => spec,
+                    Err(error) => {
+                        eprintln!("service install failed: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                if !danso::service::has_systemd() && !dry_run {
+                    // Not an error: Termux is a supported target that has no
+                    // systemd. Say what to do instead, install nothing.
+                    println!("{}", danso::service::termux_guidance(&spec));
+                    return;
+                }
+                match danso::service::install(&spec, dry_run) {
+                    Ok(danso::service::InstallOutcome::DryRun { path, unit }) => {
+                        // The unit goes to stdout by itself, byte for byte, so
+                        // `--dry-run > danso.service` produces a usable file.
+                        // The commentary belongs on stderr.
+                        eprintln!("would write {}", path.display());
+                        print!("{unit}");
+                        return;
+                    }
+                    Ok(danso::service::InstallOutcome::Installed { path }) => {
+                        println!("Unit: installed {}", path.display());
+                        println!("Unit: enabled (not started — use `systemctl start`)");
+                        return;
+                    }
+                    Err(error) => {
+                        eprintln!("service install failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            ServiceCommand::Reconcile { data_dir, user } => {
+                match danso::service::unit_spec(data_dir, user)
+                    .and_then(|spec| danso::service::reconcile(&spec))
+                {
+                    Ok(drift) => {
+                        println!("{}", drift.summary());
+                        std::process::exit(drift.exit_code());
+                    }
+                    Err(error) => {
+                        eprintln!("service reconcile failed: {error}");
+                        std::process::exit(3);
+                    }
+                }
+            }
+            ServiceCommand::Uninstall { data_dir, user } => {
+                match danso::service::unit_spec(data_dir, user)
+                    .and_then(|spec| danso::service::uninstall(&spec))
+                {
+                    Ok(text) => {
+                        println!("{text}");
+                        return;
+                    }
+                    Err(error) => {
+                        eprintln!("service uninstall failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             ServiceCommand::Stop {
                 data_dir,
                 grace_secs,

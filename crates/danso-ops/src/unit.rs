@@ -1,0 +1,382 @@
+//! systemd unit rendering for `danso service install|reconcile|uninstall`
+//! (`docs/unified-design.md` §6.4).
+//!
+//! Rendering is a pure function of the spec so the whole contract is testable
+//! without systemd — which matters because the hosts that most need this
+//! checked (Termux) are exactly the ones that cannot run it.
+//!
+//! The fields come from ccc-node's `bridge/service-systemd.sh`, which is the
+//! behaviour being preserved rather than reinvented:
+//!
+//! * `KillMode=mixed` + `SendSIGKILL=yes` — SIGTERM reaches only the main
+//!   process while it closes admission and drains; at the timeout systemd
+//!   SIGKILLs the whole cgroup so descendants cannot survive as orphans.
+//! * `Restart=always` with `RestartSec=3` — recover when the service treats a
+//!   direct SIGTERM as a clean exit. An explicit `systemctl stop` still
+//!   suppresses restart, so operator stop semantics are unchanged.
+//! * `TimeoutStopSec` — the **outer** stop budget, the same quantity as
+//!   `danso service stop --grace-secs`. See `stop.rs` for why it is not the
+//!   turn drain.
+
+use crate::stop::DEFAULT_GRACE_SECS;
+use std::path::{Path, PathBuf};
+
+/// `Restart=always` recovery delay, as in ccc-node.
+pub const RESTART_SEC: u64 = 3;
+
+/// `UMask` for the service (`docs/unified-design.md` §6.4). State files are
+/// created 0600 by their writers; this makes the default restrictive too, so a
+/// file added later cannot be world-readable by omission.
+pub const UMASK: &str = "0077";
+
+pub const UNIT_NAME: &str = "danso.service";
+
+/// Where a unit is installed and what it is wanted by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// `/etc/systemd/system`, started at `multi-user.target`.
+    System,
+    /// `~/.config/systemd/user`, started at `default.target`.
+    User,
+}
+
+impl Scope {
+    pub fn wanted_by(self) -> &'static str {
+        match self {
+            Self::System => "multi-user.target",
+            Self::User => "default.target",
+        }
+    }
+
+    /// The directory the unit belongs in. `home` is only consulted for
+    /// [`Scope::User`], so a system install does not depend on a home at all.
+    pub fn unit_dir(self, home: &Path) -> PathBuf {
+        match self {
+            Self::System => PathBuf::from("/etc/systemd/system"),
+            Self::User => home.join(".config/systemd/user"),
+        }
+    }
+
+    pub fn unit_path(self, home: &Path) -> PathBuf {
+        self.unit_dir(home).join(UNIT_NAME)
+    }
+
+    /// The `systemctl` argument selecting this scope.
+    pub fn systemctl_flag(self) -> Option<&'static str> {
+        match self {
+            Self::System => None,
+            Self::User => Some("--user"),
+        }
+    }
+}
+
+/// Everything the rendered unit depends on.
+///
+/// It is a value rather than something read from the environment inside
+/// `render` so a test can render any host's unit, including one this machine
+/// could not otherwise produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitSpec {
+    pub scope: Scope,
+    /// Absolute path to the `danso` binary.
+    pub exe: PathBuf,
+    /// State root passed to `service run`.
+    pub data_dir: PathBuf,
+    pub working_directory: PathBuf,
+    pub home: PathBuf,
+    pub path_env: String,
+}
+
+impl UnitSpec {
+    /// Render the unit file.
+    ///
+    /// Deterministic: the same spec always produces byte-identical output. That
+    /// is what makes `reconcile` able to detect drift by comparison rather than
+    /// by parsing.
+    pub fn render(&self) -> String {
+        format!(
+            "[Unit]\n\
+             Description=Danso resident service\n\
+             After=network-online.target\n\
+             Wants=network-online.target\n\
+             [Service]\n\
+             Type=simple\n\
+             WorkingDirectory={working_directory}\n\
+             Environment=HOME={home}\n\
+             Environment=PATH={path_env}\n\
+             ExecStart={exe} service run --data-dir {data_dir}\n\
+             UMask={umask}\n\
+             Restart=always\n\
+             RestartSec={restart_sec}\n\
+             KillMode=mixed\n\
+             SendSIGKILL=yes\n\
+             TimeoutStopSec={timeout_stop_sec}\n\
+             [Install]\n\
+             WantedBy={wanted_by}\n",
+            working_directory = self.working_directory.display(),
+            home = self.home.display(),
+            path_env = self.path_env,
+            exe = self.exe.display(),
+            data_dir = self.data_dir.display(),
+            umask = UMASK,
+            restart_sec = RESTART_SEC,
+            // The unit's stop allowance and the CLI's default are the same
+            // quantity. Writing the constant rather than a literal is what keeps
+            // them from drifting apart in opposite directions.
+            timeout_stop_sec = DEFAULT_GRACE_SECS,
+            wanted_by = self.scope.wanted_by(),
+        )
+    }
+}
+
+/// What `reconcile` found on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Drift {
+    /// No unit is installed.
+    Absent,
+    /// The installed unit matches what this binary would render.
+    InSync,
+    /// The installed unit differs. Carries the on-disk text so the caller can
+    /// show a diff; `reconcile` reports, it does not overwrite.
+    Differs { installed: String },
+}
+
+impl Drift {
+    /// `0` in sync, `1` drifted, `2` absent.
+    ///
+    /// Absent is worse than drifted: a drifted unit is still supervising
+    /// something, while an absent one means nothing is.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::InSync => 0,
+            Self::Differs { .. } => 1,
+            Self::Absent => 2,
+        }
+    }
+
+    pub fn summary(&self) -> &'static str {
+        match self {
+            Self::InSync => "Unit: in sync",
+            Self::Differs { .. } => "Unit: drifted",
+            Self::Absent => "Unit: not installed",
+        }
+    }
+}
+
+/// Compare the installed unit against what `spec` renders.
+///
+/// An unreadable-but-present unit is reported as drifted rather than absent:
+/// claiming nothing is installed would invite an install on top of it.
+pub fn drift(spec: &UnitSpec, unit_path: &Path) -> Drift {
+    match std::fs::read_to_string(unit_path) {
+        Ok(installed) if installed == spec.render() => Drift::InSync,
+        Ok(installed) => Drift::Differs { installed },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Drift::Absent,
+        Err(error) => Drift::Differs {
+            installed: format!("<unreadable: {error}>"),
+        },
+    }
+}
+
+/// The Termux:Boot script that stands in for a unit where systemd is absent.
+///
+/// `install` prints this path and does **not** create it: writing into
+/// `~/.termux/boot` changes what happens at device boot, which is a host
+/// change an operator should make deliberately.
+pub fn termux_boot_path(home: &Path) -> PathBuf {
+    home.join(".termux/boot/danso-service")
+}
+
+/// The body an operator would put at [`termux_boot_path`].
+pub fn termux_boot_script(exe: &Path, data_dir: &Path) -> String {
+    format!(
+        "#!/data/data/com.termux/files/usr/bin/sh\n\
+         # Danso resident service (no systemd on Termux).\n\
+         # `--supervise` provides the crash policy that `Restart=always` would.\n\
+         termux-wake-lock\n\
+         exec {exe} service run --supervise --data-dir {data_dir}\n",
+        exe = exe.display(),
+        data_dir = data_dir.display(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(scope: Scope) -> UnitSpec {
+        UnitSpec {
+            scope,
+            exe: PathBuf::from("/usr/local/bin/danso"),
+            data_dir: PathBuf::from("/root/.danso/telegram"),
+            working_directory: PathBuf::from("/root/.danso"),
+            home: PathBuf::from("/root"),
+            path_env: "/usr/local/bin:/usr/bin:/bin".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_unit_stop_allowance_is_the_outer_budget_constant() {
+        // The single most important line in this file: the unit's allowance and
+        // `service stop --grace-secs` must be the same quantity. A literal here
+        // would let them drift in opposite directions and silently reintroduce
+        // the collapsed-budget bug this row exists to avoid.
+        assert!(
+            spec(Scope::System)
+                .render()
+                .contains(&format!("TimeoutStopSec={DEFAULT_GRACE_SECS}")),
+            "the unit must render the outer budget constant"
+        );
+        assert!(spec(Scope::System).render().contains("TimeoutStopSec=70"));
+    }
+
+    #[test]
+    fn the_rendered_unit_carries_the_ccc_node_lifecycle_fields() {
+        let unit = spec(Scope::System).render();
+        for required in [
+            "[Unit]",
+            "After=network-online.target",
+            "Wants=network-online.target",
+            "[Service]",
+            "Type=simple",
+            "Restart=always",
+            "RestartSec=3",
+            // SIGTERM reaches the main process only; the cgroup is killed at
+            // the timeout so descendants cannot survive as orphans.
+            "KillMode=mixed",
+            "SendSIGKILL=yes",
+            "UMask=0077",
+            "[Install]",
+        ] {
+            assert!(unit.contains(required), "missing {required} in:\n{unit}");
+        }
+    }
+
+    #[test]
+    fn exec_start_runs_the_service_not_a_second_runtime() {
+        let unit = spec(Scope::System).render();
+        assert!(unit.contains("ExecStart=/usr/local/bin/danso service run --data-dir "));
+        assert!(
+            !unit.contains("--supervise"),
+            "under systemd, Restart=always is the supervisor; a second one would fight it"
+        );
+    }
+
+    #[test]
+    fn scope_selects_the_target_and_the_install_directory() {
+        assert_eq!(Scope::System.wanted_by(), "multi-user.target");
+        assert_eq!(Scope::User.wanted_by(), "default.target");
+        assert!(
+            spec(Scope::System)
+                .render()
+                .contains("WantedBy=multi-user.target")
+        );
+        assert!(
+            spec(Scope::User)
+                .render()
+                .contains("WantedBy=default.target")
+        );
+
+        let home = Path::new("/home/agent");
+        assert_eq!(
+            Scope::System.unit_path(home),
+            PathBuf::from("/etc/systemd/system/danso.service")
+        );
+        assert_eq!(
+            Scope::User.unit_path(home),
+            PathBuf::from("/home/agent/.config/systemd/user/danso.service")
+        );
+        assert_eq!(Scope::System.systemctl_flag(), None);
+        assert_eq!(Scope::User.systemctl_flag(), Some("--user"));
+    }
+
+    #[test]
+    fn rendering_is_deterministic() {
+        // Drift detection compares text, so an unstable renderer would report
+        // drift on every reconcile of an untouched unit.
+        assert_eq!(spec(Scope::System).render(), spec(Scope::System).render());
+        assert_ne!(spec(Scope::System).render(), spec(Scope::User).render());
+    }
+
+    #[test]
+    fn drift_distinguishes_absent_from_in_sync_from_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(UNIT_NAME);
+        let spec = spec(Scope::System);
+
+        assert_eq!(drift(&spec, &path), Drift::Absent);
+        assert_eq!(drift(&spec, &path).exit_code(), 2);
+
+        std::fs::write(&path, spec.render()).unwrap();
+        assert_eq!(drift(&spec, &path), Drift::InSync);
+        assert_eq!(drift(&spec, &path).exit_code(), 0);
+
+        std::fs::write(
+            &path,
+            spec.render()
+                .replace("TimeoutStopSec=70", "TimeoutStopSec=10"),
+        )
+        .unwrap();
+        match drift(&spec, &path) {
+            Drift::Differs { installed } => assert!(installed.contains("TimeoutStopSec=10")),
+            other => panic!("expected drift, got {other:?}"),
+        }
+        assert_eq!(drift(&spec, &path).exit_code(), 1);
+    }
+
+    #[test]
+    fn a_present_but_unreadable_unit_is_drift_not_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(UNIT_NAME);
+        // A directory where the unit belongs: present, unreadable as text.
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            matches!(drift(&spec(Scope::System), &path), Drift::Differs { .. }),
+            "reporting this as absent would invite installing on top of it"
+        );
+    }
+
+    #[test]
+    fn the_termux_fallback_supervises_because_nothing_else_will() {
+        let script = termux_boot_script(
+            Path::new("/data/data/com.termux/files/usr/bin/danso"),
+            Path::new("/data/data/com.termux/files/home/.danso/telegram"),
+        );
+        assert!(
+            script.contains("--supervise"),
+            "without systemd, --supervise is the only restart policy there is"
+        );
+        assert!(script.contains("termux-wake-lock"));
+        assert_eq!(
+            termux_boot_path(Path::new("/data/data/com.termux/files/home")),
+            PathBuf::from("/data/data/com.termux/files/home/.termux/boot/danso-service")
+        );
+    }
+
+    #[test]
+    fn the_unit_snapshot_is_stable() {
+        // A full snapshot so any field change has to be an intentional edit
+        // here, not an unnoticed side effect.
+        assert_eq!(
+            spec(Scope::System).render(),
+            "[Unit]\n\
+             Description=Danso resident service\n\
+             After=network-online.target\n\
+             Wants=network-online.target\n\
+             [Service]\n\
+             Type=simple\n\
+             WorkingDirectory=/root/.danso\n\
+             Environment=HOME=/root\n\
+             Environment=PATH=/usr/local/bin:/usr/bin:/bin\n\
+             ExecStart=/usr/local/bin/danso service run --data-dir /root/.danso/telegram\n\
+             UMask=0077\n\
+             Restart=always\n\
+             RestartSec=3\n\
+             KillMode=mixed\n\
+             SendSIGKILL=yes\n\
+             TimeoutStopSec=70\n\
+             [Install]\n\
+             WantedBy=multi-user.target\n"
+        );
+    }
+}

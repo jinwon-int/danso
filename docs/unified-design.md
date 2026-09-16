@@ -422,10 +422,35 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
 
 ### 6.4 서비스 모드
 
-- `danso service install|status|reconcile|uninstall [--user]`: systemd 유닛을
-  렌더러에서 생성(`Restart=always`, `KillMode=mixed`, `TimeoutStopSec=70`,
-  `UMask=0077`). `reconcile`은 드리프트 비교 + `daemon-reload`만, 재시작·enable
-  변경 없음.
+- `danso service install|reconcile|uninstall [--user]`: systemd 유닛을
+  렌더러에서 생성(`Type=simple`, `Restart=always`, `RestartSec=3`,
+  `KillMode=mixed`, `SendSIGKILL=yes`, `TimeoutStopSec=70`, `UMask=0077`).
+  필드는 ccc `bridge/service-systemd.sh`에서 가져온다 — `KillMode=mixed` +
+  `SendSIGKILL=yes`는 SIGTERM을 메인 프로세스에만 보내 drain하게 하고, 타임아웃에
+  cgroup 전체를 SIGKILL해 자손이 고아로 남지 못하게 한다.
+  `TimeoutStopSec`은 `service stop --grace-secs`의 기본과 **같은 상수**를
+  렌더한다 — 리터럴로 적으면 두 값이 반대 방향으로 갈라진다.
+  - `install`은 유닛을 쓰고 `daemon-reload` + `enable`까지 한다. **시작하지는
+    않는다** — 설치와 기동을 합치면 설정 변경이 조용히 재시작이 된다.
+    `--dry-run`은 **stdout에 유닛 본문만** 내보내고(부연은 stderr) 아무것도
+    쓰지 않으므로 `--dry-run > danso.service`가 그대로 쓸 수 있는 파일이 된다.
+    `ExecStart`는 `PATH` 조회가 아니라 **설치를 수행한 바로 그 바이너리**를 가리킨다.
+  - `reconcile`은 드리프트 비교 + `daemon-reload`만. 재시작·enable 변경이 없고
+    **드리프트를 수리하지도 않는다** — 운영자가 일부러 고친 유닛을 덮어쓰는 건
+    reconcile이 아니다. exit **0** 일치 · **1** 드리프트 · **2** 미설치(미설치가
+    더 나쁘다: 드리프트된 유닛은 그래도 무언가를 감시하고 있다).
+    `daemon-reload` 실패는 보고를 가리지 않도록 경고로만 남긴다 — 사용자 세션
+    버스가 없는 호스트(헤드리스 root·CI)에서 `systemctl --user`는 그냥 실패하며,
+    그것 때문에 드리프트 판정을 잃으면 안 된다.
+    읽을 수 없는 유닛은 **미설치가 아니라 드리프트**로 본다(미설치로 보고하면
+    그 위에 덮어 설치하게 된다).
+  - `uninstall`은 서빙 중이면 **거부**한다. 살아 있는 프로세스 아래에서 유닛을
+    지우면 아무도 감시하지 않고 어떤 유닛도 설명하지 않는 상태가 남는다.
+  - systemd가 없으면(Termux) `install`은 **아무것도 설치하지 않고**
+    Termux:Boot 스크립트 경로와 본문만 출력한다. `~/.termux/boot`에 쓰는 것은
+    부팅 동작을 바꾸는 일이라 운영자가 직접 해야 한다. 그 스크립트는
+    `service run --supervise`를 쓴다 — systemd가 없으면 `--supervise`가 유일한
+    재시작 정책이다.
 - `danso service run [--data-dir D]`: 포그라운드 실행. 기존 `danso telegram`
   루프를 **그대로 호출**하고 pid·health 부기만 더한다(런타임 이중화 금지).
   `danso telegram`은 같은 경로의 별칭으로 남는다.
