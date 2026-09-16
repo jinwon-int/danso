@@ -352,8 +352,7 @@ pub fn create_at(
 
     fs::create_dir(&temp_path).map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))?;
     let mut guard = TempGuard::new(temp_path.clone());
-    set_mode(&temp_path, 0o700)
-        .map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))?;
+    set_mode(&temp_path, 0o700).map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))?;
 
     let config_component = build_config_component(
         &config_path,
@@ -379,7 +378,10 @@ pub fn create_at(
         created_at,
         source_home: home.to_string_lossy().into_owned(),
         components,
-        exclusions: EXCLUSIONS.iter().map(|value| (*value).to_string()).collect(),
+        exclusions: EXCLUSIONS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
     };
     write_private_bytes(
         &temp_path.join(MANIFEST_FILE_NAME),
@@ -427,7 +429,7 @@ fn build_config_component(
     token_path: Option<&Path>,
 ) -> Result<ManifestComponent, CommandError> {
     let mut builder = ComponentBuilder::default();
-    let mut mode = None;
+    let mode;
     match regular_metadata(source) {
         Ok(metadata) => {
             if is_credential_path(source, token_path) || is_credential_name(source.file_name()) {
@@ -672,8 +674,7 @@ fn is_credential_name(name: Option<&OsStr>) -> bool {
     }
     let tokenish = lower.contains("token");
     let secretish = lower.ends_with(".secret")
-        || (lower.contains("secret")
-            && (lower.contains("telegram") || lower.starts_with("bot-")));
+        || (lower.contains("secret") && (lower.contains("telegram") || lower.starts_with("bot-")));
     tokenish || secretish
 }
 
@@ -741,7 +742,9 @@ fn copy_regular_file(source: &Path, destination: &Path) -> Result<u64, CopyFailu
         use std::os::unix::fs::OpenOptionsExt;
         input_options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut input = input_options.open(source).map_err(|_| CopyFailure::Source)?;
+    let mut input = input_options
+        .open(source)
+        .map_err(|_| CopyFailure::Source)?;
 
     let mut output_options = OpenOptions::new();
     output_options.write(true).create_new(true);
@@ -922,7 +925,9 @@ fn preflight_backup(backup_dir: &Path) -> Result<RestorePreflight, CommandError>
         {
             return Err(CommandError::failed(CATEGORY_INVALID_BACKUP));
         }
-        component.files.sort_by(|left, right| left.relative.cmp(&right.relative));
+        component
+            .files
+            .sort_by(|left, right| left.relative.cmp(&right.relative));
         component.dirs.sort();
         components.push(component);
     }
@@ -937,8 +942,8 @@ fn reject_credential_material(
     if depth > MAX_SCAN_DEPTH {
         return Err(CommandError::failed(CATEGORY_INVALID_BACKUP));
     }
-    let entries = fs::read_dir(directory)
-        .map_err(|_| CommandError::failed(CATEGORY_BACKUP_UNREADABLE))?;
+    let entries =
+        fs::read_dir(directory).map_err(|_| CommandError::failed(CATEGORY_BACKUP_UNREADABLE))?;
     for (index, entry) in entries.enumerate() {
         if index >= MAX_SCAN_ENTRIES {
             return Err(CommandError::failed(CATEGORY_INVALID_BACKUP));
@@ -988,10 +993,10 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), CommandError> {
         {
             return Err(CommandError::failed(CATEGORY_INVALID_BACKUP));
         }
-        if let Some(mode) = &component.mode {
-            if mode.len() != 4 || !mode.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) {
-                return Err(CommandError::failed(CATEGORY_INVALID_BACKUP));
-            }
+        if let Some(mode) = &component.mode
+            && (mode.len() != 4 || !mode.bytes().all(|byte| (b'0'..=b'7').contains(&byte)))
+        {
+            return Err(CommandError::failed(CATEGORY_INVALID_BACKUP));
         }
     }
     if !names.contains(CONFIG_COMPONENT) || !names.contains(MEMORY_COMPONENT) {
@@ -1010,8 +1015,8 @@ fn validate_backup_root_entries(
         .iter()
         .map(|component| component.name.clone())
         .collect::<BTreeSet<_>>();
-    let entries = fs::read_dir(backup_dir)
-        .map_err(|_| CommandError::failed(CATEGORY_BACKUP_UNREADABLE))?;
+    let entries =
+        fs::read_dir(backup_dir).map_err(|_| CommandError::failed(CATEGORY_BACKUP_UNREADABLE))?;
     for (index, entry) in entries.enumerate() {
         if index >= MAX_SCAN_ENTRIES {
             return Err(CommandError::failed(CATEGORY_INVALID_BACKUP));
@@ -1057,8 +1062,8 @@ fn scan_restore_file(
     {
         return Err(CommandError::failed(CATEGORY_CREDENTIAL_MATERIAL));
     }
-    let metadata = regular_metadata(source)
-        .map_err(|_| CommandError::failed(CATEGORY_BACKUP_UNREADABLE))?;
+    let metadata =
+        regular_metadata(source).map_err(|_| CommandError::failed(CATEGORY_BACKUP_UNREADABLE))?;
     let bytes = consume_regular_file(source)
         .map_err(|_| CommandError::failed(CATEGORY_BACKUP_UNREADABLE))?;
     if bytes != metadata.len() {
@@ -1095,8 +1100,8 @@ fn scan_restore_directory(
     if depth > MAX_SCAN_DEPTH {
         return Err(CommandError::failed(CATEGORY_INVALID_BACKUP));
     }
-    let entries = fs::read_dir(source)
-        .map_err(|_| CommandError::failed(CATEGORY_BACKUP_UNREADABLE))?;
+    let entries =
+        fs::read_dir(source).map_err(|_| CommandError::failed(CATEGORY_BACKUP_UNREADABLE))?;
     for (index, entry) in entries.enumerate() {
         if index >= MAX_SCAN_ENTRIES {
             return Err(CommandError::failed(CATEGORY_INVALID_BACKUP));
@@ -1262,8 +1267,7 @@ fn write_restore(
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => return Err(CommandError::failed(CATEGORY_TARGET_UNSAFE)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(target)
-                .map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))?;
+            fs::create_dir_all(target).map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))?;
         }
         Err(_) => return Err(CommandError::failed(CATEGORY_WRITE_FAILED)),
     }
@@ -1283,8 +1287,7 @@ fn write_restore(
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => return Err(CommandError::failed(CATEGORY_WRITE_FAILED)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&path)
-                    .map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))?;
+                fs::create_dir(&path).map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))?;
             }
             Err(_) => return Err(CommandError::failed(CATEGORY_WRITE_FAILED)),
         }
@@ -1299,11 +1302,7 @@ fn write_restore(
     Ok(())
 }
 
-fn write_restore_file(
-    target: &Path,
-    file: &RestoreFile,
-    force: bool,
-) -> Result<(), CommandError> {
+fn write_restore_file(target: &Path, file: &RestoreFile, force: bool) -> Result<(), CommandError> {
     let destination = target.join(&file.relative);
     let parent = destination
         .parent()
@@ -1349,13 +1348,11 @@ fn write_restore_file(
     let mut output = output_options
         .open(&destination)
         .map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))?;
-    io::copy(&mut input, &mut output)
-        .map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))?;
+    io::copy(&mut input, &mut output).map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))?;
     output
         .sync_all()
         .map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))?;
-    set_mode(&destination, 0o600)
-        .map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))
+    set_mode(&destination, 0o600).map_err(|_| CommandError::failed(CATEGORY_WRITE_FAILED))
 }
 
 fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
@@ -1428,7 +1425,10 @@ mod tests {
         private_dir(&telegram.join(CONVERSATIONS_DIR_NAME));
         private_file(&memory.join("global/state/facts.jsonl"), b"fact body\n");
         private_file(&memory.join("global/memories/MEMORY.md"), b"memory body\n");
-        private_file(&telegram.join(CONVERSATIONS_DIR_NAME).join("1.json"), b"message body\n");
+        private_file(
+            &telegram.join(CONVERSATIONS_DIR_NAME).join("1.json"),
+            b"message body\n",
+        );
         let token = root.path().join("telegram.token");
         private_file(&token, b"TEST_TOKEN_SECRET_MARKER");
         let config = format!(
@@ -1466,16 +1466,18 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(TEMP_PREFIX)
         }));
-        assert!(
-            !String::from_utf8_lossy(&all_bytes(&backup)).contains("TEST_TOKEN_SECRET_MARKER")
-        );
+        assert!(!String::from_utf8_lossy(&all_bytes(&backup)).contains("TEST_TOKEN_SECRET_MARKER"));
         assert_eq!(
             fs::read(home.join(config::FILE_NAME)).expect("source config"),
             fs::read(backup.join(config::FILE_NAME)).expect("backup config")
         );
         assert_eq!(
-            fs::read(home.parent().expect("root").join("memory/global/state/facts.jsonl"))
-                .expect("source facts"),
+            fs::read(
+                home.parent()
+                    .expect("root")
+                    .join("memory/global/state/facts.jsonl")
+            )
+            .expect("source facts"),
             fs::read(backup.join("memory/global/state/facts.jsonl")).expect("backup facts")
         );
         assert_eq!(
@@ -1484,10 +1486,9 @@ mod tests {
             fs::read(backup.join(CONVERSATIONS_DIR_NAME).join("1.json"))
                 .expect("backup conversation")
         );
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(backup.join(MANIFEST_FILE_NAME)).expect("manifest"),
-        )
-        .expect("manifest json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(backup.join(MANIFEST_FILE_NAME)).expect("manifest"))
+                .expect("manifest json");
         assert_eq!(manifest["version"], 1);
         assert_eq!(manifest["components"][0]["mode"], "0600");
     }
@@ -1501,21 +1502,22 @@ mod tests {
         std::os::unix::fs::symlink(memory.join("global/memories"), memory.join("global/state"))
             .expect("symlink");
         let backup = create_at(&home, &backups, Some(&telegram)).expect("backup");
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(backup.join(MANIFEST_FILE_NAME)).expect("manifest"),
-        )
-        .expect("manifest json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(backup.join(MANIFEST_FILE_NAME)).expect("manifest"))
+                .expect("manifest json");
         let memory_component = manifest["components"]
             .as_array()
             .expect("components")
             .iter()
             .find(|component| component["name"] == MEMORY_COMPONENT)
             .expect("memory component");
-        assert!(memory_component["warnings"]
-            .as_array()
-            .expect("warnings")
-            .iter()
-            .any(|warning| warning == WARNING_UNREADABLE));
+        assert!(
+            memory_component["warnings"]
+                .as_array()
+                .expect("warnings")
+                .iter()
+                .any(|warning| warning == WARNING_UNREADABLE)
+        );
     }
 
     #[test]
@@ -1531,10 +1533,13 @@ mod tests {
             fs::read(target.join(config::FILE_NAME)).expect("restored config")
         );
         assert_eq!(
-            fs::read(home.parent().expect("root").join("memory/global/state/facts.jsonl"))
-                .expect("source facts"),
-            fs::read(target.join("memory/global/state/facts.jsonl"))
-                .expect("restored facts")
+            fs::read(
+                home.parent()
+                    .expect("root")
+                    .join("memory/global/state/facts.jsonl")
+            )
+            .expect("source facts"),
+            fs::read(target.join("memory/global/state/facts.jsonl")).expect("restored facts")
         );
         let mode = fs::metadata(target.join(config::FILE_NAME))
             .expect("config")
@@ -1579,7 +1584,9 @@ mod tests {
         let (_root, home, telegram, backups) = fixture();
         let backup = create_at(&home, &backups, Some(&telegram)).expect("backup");
         private_file(
-            &backup.join(MEMORY_DIR_NAME).join("global/state/telegram.token"),
+            &backup
+                .join(MEMORY_DIR_NAME)
+                .join("global/state/telegram.token"),
             b"TEST_TOKEN_SECRET_MARKER",
         );
         let target = backups.join("credential-target");
