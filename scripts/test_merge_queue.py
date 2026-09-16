@@ -17,7 +17,10 @@ def validate(text):
     # conditions (including folded YAML); skipped steps can otherwise be green.
     assert not re.search(r"^\s*if:|continue-on-error", job, re.M)
     assert "run: python3 scripts/test_merge_queue.py" in job
-    assert "cargo +1.98.1 test --locked" in job
+    # Without --workspace these resolve to the root package only, and every
+    # unit test in crates/* is skipped while CI still reports green.
+    assert "cargo +1.98.1 test --locked --workspace" in job
+    assert "cargo +1.98.1 clippy --locked --workspace --all-targets" in job
     assert "DANSO_BIN=target/release/danso python3 scripts/test_e2e.py" in job
 
 
@@ -46,6 +49,16 @@ class MergeQueue(unittest.TestCase):
                 "      - name: Format, lint and test\n",
                 "      - name: Format, lint and test\n        if: >-\n          github.event_name == 'pull_request'\n",
             ))
+
+    def test_root_package_only_test_command_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate(self.text.replace(
+                "cargo +1.98.1 test --locked --workspace", "cargo +1.98.1 test --locked"))
+
+    def test_root_package_only_clippy_command_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate(self.text.replace(
+                "clippy --locked --workspace --all-targets", "clippy --locked --all-targets"))
 
     def test_commands_moved_to_another_job_rejected(self):
         with self.assertRaises(AssertionError):

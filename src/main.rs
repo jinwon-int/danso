@@ -209,21 +209,55 @@ fn main() {
                 std::process::exit(code);
             }
         };
-        let UpdateCommand::Status { json } = args.command;
-        match danso::update::status() {
-            Ok(report) => {
-                if json {
-                    println!("{}", serde_json::to_string(&report).expect("serializable"));
-                } else {
-                    println!("{}", report.summary());
+        match args.command {
+            UpdateCommand::Status { json } => match danso::update::status() {
+                Ok(report) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&report).expect("serializable"));
+                    } else {
+                        println!("{}", report.summary());
+                    }
+                    std::process::exit(report.exit_code());
                 }
-                std::process::exit(report.exit_code());
-            }
-            Err(_) => {
-                // Body-free: never echo HOME/DANSO_HOME or filesystem text.
-                eprintln!("update status failed: state home unavailable");
-                std::process::exit(2);
-            }
+                Err(_) => {
+                    // Body-free: never echo HOME/DANSO_HOME or filesystem text.
+                    eprintln!("update status failed: state home unavailable");
+                    std::process::exit(2);
+                }
+            },
+            UpdateCommand::Apply {
+                artifact_dir,
+                artifact,
+                services,
+                json,
+            } => match danso::update::apply(&artifact_dir, &artifact, services) {
+                Ok(report) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&report).expect("serializable"));
+                    } else if report.replaced {
+                        println!("installed {} ({})", report.version, report.target_sha256);
+                    } else {
+                        println!("already installed {}", report.version);
+                    }
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    // The reason is a fixed token, never the error text: a
+                    // verification failure must not echo manifest or path
+                    // content back into a log.
+                    if json {
+                        // A `--json` consumer gets a document on every path.
+                        // Printing nothing here would make "failed" and
+                        // "produced no output" indistinguishable to a wrapper.
+                        println!(
+                            "{}",
+                            serde_json::json!({"error": error.reason(), "exit_code": error.exit_code()})
+                        );
+                    }
+                    eprintln!("update apply failed: {}", error.reason());
+                    std::process::exit(error.exit_code());
+                }
+            },
         }
     }
     // Telegram is a service entry point, not a normal prompt positional. It

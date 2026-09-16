@@ -21,4 +21,8 @@ serde_json = "1"
 sha2 = "0.11"
 
 [dev-dependencies]
+# Release fixtures are real gzip archives and real minisign signatures, so the
+# tests carry them as base64 blobs rather than rebuilding them at test time
+# (and rebuilding would need a signing key the repository must not hold).
+base64 = "0.23"
 tempfile = "3"

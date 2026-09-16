@@ -5,10 +5,11 @@
 it is handled. It contains **no key material and no secret values** — only
 locations and rules.
 
-**Status.** The key exists and `crates/danso-ops/src/release.rs` verifies a
-signed manifest, but nothing calls it yet: `danso update` still implements only
-`status`, there is no `release.yml`, and no release has been published. Until
-`apply` lands, this page describes custody, not an enforced install path.
+**Status.** `danso update apply --artifact-dir <dir> --artifact <name>`
+verifies and installs a signed release that is already on disk, exiting 13 with
+no bypass if it does not verify. What is still missing is the other end:
+there is no `release.yml`, so nothing **produces** a signed release yet, and
+`apply` has no fetch step — it is pointed at a directory, not a URL.
 
 ## The key
 
@@ -64,6 +65,23 @@ copy was already gone.
 ```
 gh workflow run "Release signing self-test" --repo jinwon-int/danso
 ```
+
+## Archive layout
+
+`release.yml` must produce, for each target, a gzip tar containing the binary
+**exactly once, stored as `danso`** — not `./danso`, not `bin/danso`, and not
+twice:
+
+```
+tar -czf danso-<ver>-<target>.tar.gz -C <staging-dir> danso
+```
+
+`danso update apply` lists the archive before unpacking it and refuses anything
+else. This is not pedantry: `tar -xzO -- danso` does not match a stored
+`./danso` (the ordinary `tar -czf x.tar.gz ./danso` idiom), and GNU tar
+*concatenates* duplicate members onto stdout, which would install two binaries
+glued together. Both are silent at build time, so the check is on the install
+side where it can still refuse.
 
 ## Rotation
 

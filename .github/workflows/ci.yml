@@ -28,8 +28,13 @@ jobs:
       - name: Format, lint and test
         run: |
           cargo +1.98.1 fmt --check
-          cargo +1.98.1 clippy --locked --all-targets -- -D warnings
-          cargo +1.98.1 test --locked
+          # --workspace, not the root package: the root manifest is itself a
+          # package, so an unqualified `clippy`/`test` silently skips every
+          # `#[cfg(test)]` module in crates/*. That is how 114 unit tests --
+          # including the self-update ordering invariant -- were never once run
+          # by CI.
+          cargo +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
+          cargo +1.98.1 test --locked --workspace
           cargo +1.98.1 build --locked
           cargo +1.98.1 build --release --locked
           python3 scripts/test_e2e.py

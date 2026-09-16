@@ -26,11 +26,17 @@ pub const INSTALLED_GENERATION_FILE: &str = "installed-generation.json";
 pub const PENDING_ACTIVATION_FILE: &str = "pending-activation.json";
 pub const UPDATE_LOG_FILE: &str = "self-update.log";
 pub const UPDATE_LOCK_FILE: &str = "update.lock";
+pub const INSTALLED_BINARY_FILE: &str = "danso";
 pub const PREVIOUS_BINARY_FILE: &str = "danso.prev";
 
 /// `$DANSO_HOME/state`.
 pub fn state_dir(danso_home: &Path) -> PathBuf {
     danso_home.join("state")
+}
+
+/// `$DANSO_HOME/bin/danso` — the binary an install replaces.
+pub fn installed_binary(danso_home: &Path) -> PathBuf {
+    danso_home.join("bin").join(INSTALLED_BINARY_FILE)
 }
 
 /// `$DANSO_HOME/bin/danso.prev` — the rollback target.
