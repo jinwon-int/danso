@@ -48,6 +48,7 @@ Run the environment-configured Telegram service with `danso telegram`; see
 [Telegram B1 service](docs/telegram.md) for its allowlist, persistence, and
 command contract.
 Inspect an installation without writes or network access with `danso doctor`; see [the doctor report](docs/doctor.md).
+Capture or restore durable state with `danso backup` and `danso restore`; see [backup and restore](docs/backup.md).
 
 ## Supervised first use
 

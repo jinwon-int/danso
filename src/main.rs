@@ -108,6 +108,44 @@ fn main() {
         }
         return;
     }
+    // Backup and restore are synchronous, provider-free state operations. They
+    // must stay ahead of Tokio, service setup, and the normal agent route.
+    if std::env::args().nth(1).as_deref() == Some("backup") {
+        if let Err(error) = danso::backup::BackupArgs::try_parse_from(std::env::args_os().skip(1)) {
+            let code = error.exit_code();
+            error.print().ok();
+            std::process::exit(code);
+        }
+        match danso::backup::run_backup() {
+            Ok(path) => println!("{}", path.display()),
+            Err(error) => {
+                eprintln!("backup failed: {}", error.category());
+                std::process::exit(error.exit_code());
+            }
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("restore") {
+        let args = match danso::backup::RestoreArgs::try_parse_from(std::env::args_os().skip(1)) {
+            Ok(args) => args,
+            Err(error) => {
+                let code = error.exit_code();
+                error.print().ok();
+                std::process::exit(code);
+            }
+        };
+        match danso::backup::run_restore(&args) {
+            Ok(report) => println!(
+                "{}",
+                serde_json::to_string(&report).expect("restore report is serializable")
+            ),
+            Err(error) => {
+                eprintln!("restore failed: {}", error.category());
+                std::process::exit(error.exit_code());
+            }
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("config") {
         #[derive(clap::Parser)]
         #[command(

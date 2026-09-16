@@ -1,4 +1,5 @@
 pub mod app;
+pub mod backup;
 pub mod compaction;
 pub mod config;
 pub mod context;
