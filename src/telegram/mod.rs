@@ -14,7 +14,7 @@ pub use client::{
     API_BASE_URL_ENV, BotApi, Chat, DEFAULT_API_BASE_URL, DEFAULT_POLL_TIMEOUT_SECONDS, Message,
     Update, User,
 };
-pub use lock::TokenLock;
+pub use lock::{TOKEN_LOCK_FILE_NAME, TokenLock};
 pub use service::{TelegramArgs, TelegramService, run};
 pub use store::{
     ActiveTaskRecord, ConversationRecord, ConversationStore, MAX_PREVIOUS_SESSIONS, UsageRecord,
@@ -57,7 +57,7 @@ pub fn data_dir_from_env() -> Result<PathBuf> {
 /// Make a private, owner-only directory and fail closed on an unsafe existing
 /// directory. This is kept here so the lock and store share one filesystem
 /// boundary without coupling Telegram to the memory module.
-pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
+pub fn ensure_private_dir(path: &Path) -> Result<()> {
     ensure!(path.is_absolute(), "Telegram data paths must be absolute");
     let missing = match std::fs::symlink_metadata(path) {
         Ok(metadata) => {

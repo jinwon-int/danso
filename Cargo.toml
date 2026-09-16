@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/danso-runtime"]
+members = [".", "crates/danso-ops", "crates/danso-runtime"]
 
 [package]
 name = "danso"
@@ -13,6 +13,11 @@ license = "MIT"
 # from the start; the module crates land behind them in later stages.
 [features]
 default = ["ops"]
+# `ops` gates the `danso service` CLI surface only. The `danso-ops` crate
+# itself is an unconditional dependency: it owns the `health.json` schema, and
+# the Telegram loop that writes that file is compiled in every configuration.
+# Making the dependency optional would fork the schema between builds, which is
+# worse than carrying a small, dependency-light crate in a CLI-only build.
 ops = []
 telegram = []
 
@@ -20,6 +25,7 @@ telegram = []
 anyhow = "1"
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+danso-ops = { path = "crates/danso-ops" }
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 libc = "0.2"

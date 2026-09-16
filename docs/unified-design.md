@@ -354,9 +354,18 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
 - `$DANSO_HOME/telegram/spool/*.json` → 소유자 채팅으로 전달, `sent/`로 이동.
   분당 상한, 허용 채팅 목록. cron·doctor·update가 토큰 없이 알림을 남기는 유일한
   경로. 파일 형식은 ccc `push_notifier`와 호환(전환기 훅이 쓸 수 있게).
-- `$DANSO_HOME/telegram/health.json`: `service.state`, `telegram.state`,
-  `turn_occupancy`, 마지막 오류 시각(본문 없음). `danso bridge --status`와
-  self-update 유휴 게이트가 읽는다.
+- `$DANSO_HOME/telegram/health.json`: ccc `schema_version 1`의 **부분집합**이며
+  기존 키(`schema_version`, `started_at`, `last_poll_at`, `active_turn_count`,
+  `queued_counts`, `service_pid`)를 이름 그대로 유지한 채 다음을 추가한다 —
+  `process{pid,started_at,mode}`, `service{state,reason}`,
+  `telegram{state,last_ok_at,last_error_at,consecutive_failures}`,
+  `workload{active_requests,waiting_for_turn,turn_occupancy,oldest_request_age_seconds}`,
+  `runtime_generation{schema,binary_sha256,version,exe_path,observed_at}`,
+  `updated_at`. 본문은 싣지 않는다(오류는 시각과 횟수만).
+  갱신은 폴링마다이며 **150초** 이상 미갱신이면 stale로 본다.
+  `last_poll_at`은 실패한 폴에서도 전진하므로 그것만으로는 서빙 여부를 알 수
+  없다 — `telegram.consecutive_failures`가 그 구분을 담당한다.
+  `danso service status`와 self-update 유휴 게이트가 읽는다.
 
 ## 6. 운영 모듈 (`danso-ops`, #33 4행)
 
@@ -417,6 +426,19 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
   렌더러에서 생성(`Restart=always`, `KillMode=mixed`, `TimeoutStopSec=70`,
   `UMask=0077`). `reconcile`은 드리프트 비교 + `daemon-reload`만, 재시작·enable
   변경 없음.
+- `danso service run [--data-dir D]`: 포그라운드 실행. 기존 `danso telegram`
+  루프를 **그대로 호출**하고 pid·health 부기만 더한다(런타임 이중화 금지).
+  `danso telegram`은 같은 경로의 별칭으로 남는다.
+- `danso service status [--json]`: 3상태 판정. exit **0** available ·
+  **1** degraded · **2** unavailable · **3** 판정불가. 텍스트 첫 줄은
+  `Bot status: <상태>`로 고정한다(플릿 워치가 grep).
+  판정 순서는 ① 살아 있는 `service.pid` + fresh `health.json` → available,
+  ② pid 부기가 없거나 못 쓰는데 `.telegram-token.lock`을 **커널 잠금으로**
+  보유한 danso 프로세스가 있음 → degraded(서빙 중이나 stop/restart 추적 불가),
+  ③ 둘 다 없음 → unavailable. 증거 파일을 읽지 못하면 상태가 아니라
+  `unverified`(exit 3)를 낸다 — **오탐 DOWN을 내지 않는다**(ccc `AVAIL=unverified`).
+  잠금 파일의 **존재**는 소유 신호가 아니다. 정지 후에도 파일은 남기 때문이다.
+  `status`는 잠금을 잡지 않고 상태를 만들지도 않는다.
 - `danso bridge` 프로세스는 **자기 유닛을 직접 재시작하지 않는다**.
   `/restart`·update는 `systemd-run --on-active=<delay>`로 별도 cgroup의 일회성
   유닛을 만들어 그 유닛이 `systemctl restart`를 수행하고 본문 없는 영수증을
@@ -425,8 +447,15 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
   감시 루프를 제공한다. crash policy는 60초 내 5회 급속 크래시면 중단.
   `termux-wake-lock`이 있으면 호출. 부팅 자동 기동은 Termux:Boot 스크립트를
   문서화만 한다.
-- 종료: SIGTERM 수신 시 새 턴 admission 중단 → 활성 턴 45초 drain → 상태 메시지
-  정리 → 토큰 잠금 해제. 불확정 도구 작업은 저널에 남기고 재생하지 않는다.
+- 종료: 예산은 **2단**이며 두 값은 같은 계층이 아니다(ccc `bridge/start.sh`
+  L603-604: "the Python bridge drains for 45s, then tears down. Match systemd's
+  70s allowance"). **내부** 턴 drain은 45초 — SIGTERM 수신 시 새 턴 admission
+  중단 → 활성 턴 45초 drain → 상태 메시지 정리 → 토큰 잠금 해제 → pid 파일 제거.
+  **외부** 정지 예산은 70초(`danso service stop --grace-secs`, ccc
+  `CCC_BRIDGE_STOP_GRACE_SECONDS` 기본과 동일, 위 유닛 `TimeoutStopSec=70`과
+  일치). 차액 약 25초가 teardown 몫이며, 내부 drain을 외부 예산과 같은 값으로
+  올리면 teardown에 남는 시간이 0이 되어 SIGKILL로 pid·lock 파일이 잔존한다.
+  불확정 도구 작업은 저널에 남기고 재생하지 않는다. (운영자 결정 2026-09-16, #118)
 
 ### 6.5 cron (예약 실행)
 
@@ -474,7 +503,8 @@ $DANSO_HOME (0700)
   journals/<scope>/<uuid>.jsonl         작성자: 해당 런(flock)
   telegram/{audience.key, conversations.json(+.bak), followup-queue.json,
             heartbeats.json, health.json, approval-audit.jsonl,
-            <token-hash>.lock, spool/, spool/sent/}   작성자: bridge 프로세스
+            service.pid, supervisor.pid,
+            .telegram-token.lock, spool/, spool/sent/}  작성자: 서비스 프로세스
   cron/{tasks.json(+.bak), locks/, history/}          작성자: cron tick (잠금)
   ops/{usage-meter.json, lifecycle-audit.jsonl}       작성자: 해당 기록기 (flock)
   state/{self-update.log, install-receipts/}          작성자: update

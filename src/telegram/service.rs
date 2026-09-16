@@ -12,6 +12,13 @@ use super::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
+use danso_ops::{
+    health::{
+        HEALTH_SCHEMA_VERSION, HealthDocument, ProcessHealth, ServiceHealth, TelegramHealth,
+        TurnOccupancy, WorkloadHealth,
+    },
+    status::ServiceState,
+};
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
@@ -889,10 +896,24 @@ impl ChatState {
     }
 }
 
+/// The outcome of the most recent poll, so the health document can report
+/// *serving* rather than merely *running*.
+///
+/// A process that is up but has failed every poll for ten minutes is not
+/// available, and a consumer that only sees `last_poll_at` advancing cannot
+/// tell the difference — the timestamp moves on failures too.
+#[derive(Default)]
+struct PollOutcome {
+    last_ok_at: Option<String>,
+    last_error_at: Option<String>,
+    consecutive_failures: u64,
+}
+
 struct HealthFile {
     path: PathBuf,
     started_at: String,
     last_poll_at: Mutex<String>,
+    poll: Mutex<PollOutcome>,
 }
 
 impl HealthFile {
@@ -901,6 +922,20 @@ impl HealthFile {
             path: data_dir.join(HEALTH_FILE_NAME),
             started_at: chrono::Utc::now().to_rfc3339(),
             last_poll_at: Mutex::new(String::new()),
+            poll: Mutex::new(PollOutcome::default()),
+        }
+    }
+
+    /// Record whether a poll returned updates or failed, before the document is
+    /// written for that wakeup.
+    fn record_poll(&self, at: &str, ok: bool) {
+        let mut poll = self.poll.lock().expect("Telegram health poll lock");
+        if ok {
+            poll.last_ok_at = Some(at.to_string());
+            poll.consecutive_failures = 0;
+        } else {
+            poll.last_error_at = Some(at.to_string());
+            poll.consecutive_failures = poll.consecutive_failures.saturating_add(1);
         }
     }
 
@@ -923,28 +958,79 @@ impl HealthFile {
         let records = conversations.load_all()?;
         let states = chats.lock().expect("Telegram chat map lock");
         let mut active_turn_count = 0_u64;
+        let mut waiting_for_turn = 0_u64;
+        let mut oldest_active = None::<std::time::Duration>;
         let mut queued_counts = BTreeMap::new();
         for record in records {
             let active = states
                 .get(&record.chat_id)
                 .and_then(|state| state.active.lock().ok())
                 .and_then(|active| active.as_ref().cloned())
-                .is_some_and(|active| !active.completed.load(Ordering::Acquire));
-            if active || record.turn_active {
+                .filter(|active| !active.completed.load(Ordering::Acquire));
+            if let Some(active) = &active {
+                let age = active.started_at.elapsed();
+                oldest_active =
+                    Some(oldest_active.map_or(age, |oldest: std::time::Duration| oldest.max(age)));
+            }
+            if active.is_some() || record.turn_active {
                 active_turn_count = active_turn_count.saturating_add(1);
             }
-            queued_counts.insert(record.chat_id.to_string(), record.follow_up_queue.len());
+            let queued = record.follow_up_queue.len();
+            waiting_for_turn = waiting_for_turn.saturating_add(queued as u64);
+            queued_counts.insert(record.chat_id.to_string(), queued);
         }
         drop(states);
-        let payload = serde_json::json!({
-            "schema_version": 1,
-            "started_at": &self.started_at,
-            "last_poll_at": last_poll_at,
-            "active_turn_count": active_turn_count,
-            "queued_counts": queued_counts,
-            "service_pid": std::process::id(),
-        });
-        atomic_write_health(&self.path, &serde_json::to_vec(&payload)?)
+        let (last_ok_at, last_error_at, consecutive_failures) = {
+            let poll = self.poll.lock().expect("Telegram health poll lock");
+            (
+                poll.last_ok_at.clone(),
+                poll.last_error_at.clone(),
+                poll.consecutive_failures,
+            )
+        };
+        // Up is not the same as serving: a process whose every poll fails is
+        // degraded even though it is running and refreshing this document.
+        let state = if consecutive_failures == 0 {
+            ServiceState::Available
+        } else {
+            ServiceState::Degraded
+        };
+        let reason = (consecutive_failures > 0)
+            .then(|| format!("{consecutive_failures} consecutive polling failures"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let document = HealthDocument {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            started_at: self.started_at.clone(),
+            last_poll_at,
+            active_turn_count,
+            queued_counts,
+            service_pid: std::process::id(),
+            process: ProcessHealth {
+                pid: std::process::id(),
+                started_at: self.started_at.clone(),
+                mode: danso_ops::health::run_mode(),
+            },
+            service: ServiceHealth { state, reason },
+            telegram: TelegramHealth {
+                state,
+                last_ok_at,
+                last_error_at,
+                consecutive_failures,
+            },
+            workload: WorkloadHealth {
+                active_requests: active_turn_count,
+                waiting_for_turn,
+                turn_occupancy: if active_turn_count == 0 {
+                    TurnOccupancy::Idle
+                } else {
+                    TurnOccupancy::Occupied
+                },
+                oldest_request_age_seconds: oldest_active.map(|age| age.as_secs()),
+            },
+            runtime_generation: danso_ops::generation::current().clone(),
+            updated_at: now,
+        };
+        atomic_write_health(&self.path, &serde_json::to_vec(&document)?)
     }
 }
 
@@ -1064,6 +1150,10 @@ impl TelegramService {
                 None => poller.next().await,
             };
             let poll_time = chrono::Utc::now().to_rfc3339();
+            // Record the outcome before publishing: `last_poll_at` advances on
+            // failures too, so on its own it cannot distinguish a serving
+            // service from one that has been failing every poll.
+            self.inner.health.record_poll(&poll_time, polled.is_ok());
             self.refresh_health(Some(&poll_time))?;
             let updates = match polled {
                 Ok(updates) => {

@@ -282,6 +282,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
+ "danso-ops",
  "fs2",
  "image",
  "libc",
@@ -295,6 +296,19 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+]
+
+[[package]]
+name = "danso-ops"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

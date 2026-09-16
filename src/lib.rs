@@ -10,6 +10,10 @@ pub mod memory;
 pub mod output;
 pub mod provider;
 pub mod runtime;
+/// The resident-service CLI. Gated on `ops`: a CLI-only build has no service
+/// surface, but the `health.json` schema it shares stays identical either way.
+#[cfg(feature = "ops")]
+pub mod service;
 pub mod session;
 pub mod telegram;
 pub mod tools;

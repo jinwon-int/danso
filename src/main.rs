@@ -60,6 +60,46 @@ fn main() {
             }
         }
     }
+    // `service` is the resident-service surface. `status` in particular must
+    // stay ahead of config and async runtime setup for the same reason doctor
+    // does: inspecting a service must not acquire its lock or create its state.
+    #[cfg(feature = "ops")]
+    if std::env::args().nth(1).as_deref() == Some("service") {
+        use danso::service::{ServiceArgs, ServiceCommand};
+        let args = match ServiceArgs::try_parse_from(std::env::args_os().skip(1)) {
+            Ok(args) => args,
+            Err(error) => {
+                let code = error.exit_code();
+                error.print().ok();
+                std::process::exit(code);
+            }
+        };
+        match args.command {
+            ServiceCommand::Status { data_dir, json } => match danso::service::status(data_dir) {
+                Ok(report) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&report).expect("serializable"));
+                    } else {
+                        print!("{}", report.to_text());
+                    }
+                    std::process::exit(report.exit_code());
+                }
+                Err(_) => {
+                    // Body-free: never echo HOME/DANSO_HOME or filesystem text.
+                    // Exit 3 is "could not determine", never a false DOWN.
+                    eprintln!("service status failed: state home unavailable");
+                    std::process::exit(3);
+                }
+            },
+            ServiceCommand::Run { data_dir } => {
+                if let Err(error) = danso::service::run(data_dir) {
+                    eprintln!("service run failed: {error}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+        }
+    }
     // Telegram is a service entry point, not a normal prompt positional. It
     // owns one process-wide token lock and keeps all turns in this process.
     if std::env::args().nth(1).as_deref() == Some("telegram") {
