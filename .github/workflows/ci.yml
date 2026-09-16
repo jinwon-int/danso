@@ -18,6 +18,8 @@ jobs:
           python-version: "3.11"
       - name: Check merge queue workflow contract
         run: python3 scripts/test_merge_queue.py
+      - name: Check release signing key and self-test workflow contract
+        run: python3 scripts/test_release_signing.py
       - name: Install toolchain and sandbox
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy

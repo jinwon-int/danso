@@ -1,0 +1,73 @@
+name: Release signing self-test
+# Proves that `secrets.MINISIGN_SECRET_KEY` is the private half of the public
+# key checked in at `keys/danso-release.pub`, before any release depends on it.
+#
+# A GitHub secret cannot be read back. Without this job the only way to learn
+# that the stored key is wrong or truncated is a failed release, by which point
+# the local copy is long gone. So the check runs on its own, on every push to
+# `main`, and on demand.
+#
+# Why not `pull_request`: a workflow that receives the signing secret can be
+# edited in the same pull request that runs it, which would hand signing to
+# anyone who can open a branch. On `main` the branch protection rules (review
+# required, stale reviews dismissed, admins included) have already applied.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  signing-selftest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install minisign
+        # `minisign` is first packaged in Ubuntu 24.04 (noble); on 22.04 this
+        # step fails with "Unable to locate package", so the runner image is
+        # part of the contract, not an incidental choice.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y minisign
+          minisign -v
+      - name: Sign a fixture and verify it against the committed public key
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          # Command tracing stays off here: the key must not reach the log.
+          # scripts/test_release_signing.py fails the build if it is turned on.
+          if [ -z "${MINISIGN_SECRET_KEY}" ]; then
+            echo "MINISIGN_SECRET_KEY is not set for this repository"
+            exit 1
+          fi
+          umask 077
+          key="${RUNNER_TEMP}/danso.key"
+          fixture="${RUNNER_TEMP}/SHA256SUMS"
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > "${key}"
+          trap 'shred -u -z "${key}" 2>/dev/null || rm -f "${key}"' EXIT
+
+          printf '%s  danso-selftest\n' "$(printf 'selftest' | sha256sum | cut -d" " -f1)" > "${fixture}"
+          minisign -S -s "${key}" -m "${fixture}" -t "danso signing self-test ${GITHUB_SHA}"
+
+          echo "GREEN: the signature must verify under the committed public key"
+          minisign -V -H -p keys/danso-release.pub -m "${fixture}"
+
+          echo "RED: a tampered manifest must be refused"
+          printf '0000000000000000000000000000000000000000000000000000000000000000  evil\n' >> "${fixture}"
+          if minisign -V -H -p keys/danso-release.pub -m "${fixture}"; then
+            echo "self-test failed: a tampered manifest verified"
+            exit 1
+          fi
+          echo "signing self-test passed"
+      - name: Confirm the key file did not leak into the workspace
+        run: |
+          set -euo pipefail
+          # `git status` catches a key written next to the checkout by mistake;
+          # the signing step keeps its material under RUNNER_TEMP.
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            echo "self-test failed: the signing step left files in the checkout"
+            exit 1
+          fi

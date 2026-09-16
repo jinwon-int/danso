@@ -137,7 +137,9 @@ pub struct Service {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Update {
-    /// Base64 ed25519 public key that signs release manifests.
+    /// Minisign public key line that signs release manifests.
+    /// Overrides the key embedded in the binary, which is how a key is
+    /// rotated without shipping a new binary first.
     pub public_key: Option<String>,
     pub channel: Option<String>,
     pub enforce_signature: Option<bool>,
@@ -348,10 +350,11 @@ impl Config {
             &["system", "user"],
         )?;
         if let Some(key) = &self.update.public_key {
-            ensure!(
-                key.len() == 44 && key.ends_with('=') && key.bytes().all(|b| b.is_ascii()),
-                "update.public_key must be a base64 ed25519 public key"
-            );
+            // Parsed by the same code that verifies releases, not re-checked by
+            // shape here. A key that passes `config check` and then fails at
+            // update time is worse than one rejected at startup.
+            danso_ops::release::check_public_key(key)
+                .context("update.public_key must be a minisign public key line")?;
         }
         if let Some(channel) = &self.update.channel {
             ensure!(!channel.is_empty(), "update.channel must not be empty");
@@ -486,7 +489,10 @@ store = "/var/lib/danso/cron/tasks.json"
 unit = "danso-bridge.service"
 scope = "system"
 [update]
-public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+# A throwaway fixture key, deliberately NOT the release key in
+# keys/danso-release.pub: a copy of the real key here would silently
+# survive a rotation and still pass, since any valid key parses.
+public_key = "RWQbf5jrBubDWDWgYNOyi1nYm+uTycGKIGfh+oOVB09ocmmx8o4mAj8w"
 "#;
 
     #[test]
@@ -538,6 +544,13 @@ public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
             ),
             ("[service]\nunit = \"../evil\"\n", "unit name"),
             ("[update]\npublic_key = \"short\"\n", "public key shape"),
+            // The pre-signing shape check accepted a bare 32-byte
+            // ed25519 key. It carries no key id, so a signature from
+            // any other key could not be told apart by id.
+            (
+                "[update]\npublic_key = \"uhnlFLDCRGn9SMAfkZQRDrHU0C7iYZm8P42pccxVwyo=\"\n",
+                "bare ed25519 public key",
+            ),
         ] {
             assert!(Config::parse(bad).is_err(), "{reason} must be rejected");
         }

@@ -1,0 +1,245 @@
+"""Offline guard for the release signing key and its self-test workflow.
+
+Two things are checked here that Rust tests cannot see:
+
+* the checked-in public key is the specific minisign key this repository
+  trusts, not merely a well-formed one;
+* the workflow that proves the stored secret matches it cannot be made green
+  by skipping, by neutering its failure case, or by printing the key.
+
+The workflow assertions match **whole lines**, not substrings. A substring
+guard passes for ``minisign -V ... || true`` and for ``if false; then echo
+"self-test failed..."``, both of which leave the job green while proving
+nothing; every mutation below was observed passing a substring-based version
+of this file before it was rewritten.
+
+Every ``validate_*`` helper is exercised against a mutated copy of the live
+file as well as the live file itself. A guard nobody has watched fail is a
+guard nobody knows works.
+"""
+import base64
+import pathlib
+import re
+import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+PUBLIC_KEY = ROOT / "keys/danso-release.pub"
+WORKFLOW = ROOT / ".github/workflows/signing-selftest.yml"
+SECRET_NAME = "MINISIGN_SECRET_KEY"
+
+# The trust root, pinned. Rotating the release key is supposed to be a visible
+# edit here: without this, swapping the file for any other valid minisign key
+# passes every structural check.
+KEY_ID = "3F1414BCF1F7514C"
+
+# `minisign -V` accepts legacy (non-prehashed) signatures unless `-H` is given,
+# while danso-ops rejects them. Without `-H` the job can be green for a
+# signature the shipped verifier refuses.
+VERIFY = 'minisign -V -H -p keys/danso-release.pub -m "${fixture}"'
+
+# Exact lines, with their indentation, that carry the job's meaning.
+REQUIRED_LINES = (
+    "          set -euo pipefail",
+    f"          {VERIFY}",
+    f"          if {VERIFY}; then",
+    '            echo "self-test failed: a tampered manifest verified"',
+    "            exit 1",
+    '          minisign -S -s "${key}" -m "${fixture}" -t "danso signing self-test ${GITHUB_SHA}"',
+)
+
+# The only lines allowed to *expand* the secret: the env binding, a presence
+# check and the write to a file. Any other expansion is a potential echo into
+# the log. A bare mention of the name in a message is harmless and ignored.
+SECRET_LINES = (
+    f"          MINISIGN_SECRET_KEY: ${{{{ secrets.{SECRET_NAME} }}}}",
+    f'          if [ -z "${{{SECRET_NAME}}}" ]; then',
+    f'          printf \'%s\\n\' "${{{SECRET_NAME}}}" > "${{key}}"',
+)
+SECRET_EXPANSION = re.compile(rf"\$\{{{SECRET_NAME}\}}|\$\{{\{{\s*secrets\.{SECRET_NAME}")
+
+FORBIDDEN = (
+    (r"\|\|\s*true", "|| true masks a failure"),
+    (r"set\s+-[a-z]*x[a-z]*(\s|$)", "set -x traces commands"),
+    (r"set\s+-o\s+xtrace", "set -o xtrace traces commands"),
+    (r"^\s*shell:", "a shell: override can re-enable tracing"),
+    (r"^\s*if:|continue-on-error", "a conditional step can be green while skipped"),
+    (r"if\s+(false|true)\s*;", "a constant condition disables the branch"),
+    (r"^\s*cat\s+\"\$\{key\}\"", "printing the key file"),
+)
+
+
+def validate_public_key(text):
+    lines = [line for line in text.splitlines() if line.strip()]
+    assert len(lines) == 2, "a minisign public key file is a comment and a key"
+    assert lines[0].startswith("untrusted comment:")
+    key = lines[1].strip()
+    raw = base64.b64decode(key, validate=True)
+    # 2-byte algorithm id, 8-byte key id, 32-byte ed25519 key.
+    assert len(raw) == 42, "public key must decode to 42 bytes"
+    assert raw[:2] == b"Ed", "signature algorithm must be ed25519"
+    # minisign prints the key id in reverse byte order.
+    key_id = raw[2:10][::-1].hex().upper()
+    assert key_id == KEY_ID, f"public key is {key_id}, expected the pinned {KEY_ID}"
+    # The comment is what a human reads; a mismatch means the file was swapped
+    # without updating what it claims to be.
+    assert KEY_ID in lines[0], "comment line must name the key id"
+
+
+def validate_workflow(text):
+    events = text.split("\non:\n", 1)[1].split("\npermissions:\n", 1)[0]
+    # The secret is readable by anything this workflow runs. A pull_request
+    # trigger would let an unreviewed branch edit the job that holds it.
+    assert not re.search(r"^  pull_request", events, re.M), "must not run on pull_request"
+    assert re.search(r"^  push:\n    branches: \[main\]$", events, re.M)
+    job = text.split("\n  signing-selftest:\n", 1)[1]
+    # minisign is not packaged before Ubuntu 24.04; an older image can never
+    # install it, so the job would fail for a reason unrelated to the key.
+    assert re.search(r"^    runs-on: ubuntu-24\.04$", job, re.M), "needs a noble-or-newer runner"
+    for pattern, reason in FORBIDDEN:
+        assert not re.search(pattern, job, re.M), reason
+    for line in REQUIRED_LINES:
+        assert line in job.splitlines(), f"missing exact line: {line.strip()}"
+    for line in job.splitlines():
+        if SECRET_EXPANSION.search(line):
+            assert line in SECRET_LINES, f"unexpected use of the secret: {line.strip()}"
+    assert re.search(r"shred -u", job), "must destroy the key file it wrote"
+
+    # Scope the shell-safety checks to the one step that holds the secret.
+    # Asserting them against the whole job lets an identical line in some other
+    # step satisfy a requirement this step has dropped.
+    steps = re.split(r"^      - (?:name|uses):", job, flags=re.M)
+    signing = [step for step in steps if SECRET_EXPANSION.search(step)]
+    assert len(signing) == 1, "exactly one step may read the signing secret"
+    body = signing[0].split("        run: |\n", 1)[1]
+    first = next(
+        line.strip()
+        for line in body.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+    assert first == "set -euo pipefail", f"signing step must start with set -euo pipefail, got: {first}"
+
+
+class PublicKeyFile(unittest.TestCase):
+    def setUp(self):
+        self.text = PUBLIC_KEY.read_text()
+
+    def test_live_key(self):
+        validate_public_key(self.text)
+
+    def test_placeholder_key_rejected(self):
+        placeholder = base64.b64encode(b"Ed" + bytes(40)).decode()
+        with self.assertRaises(AssertionError):
+            validate_public_key(f"untrusted comment: x\n{placeholder}\n")
+
+    def test_different_valid_key_rejected(self):
+        # A real, well-formed minisign key that is simply not ours. This is the
+        # case a structure-only check cannot see.
+        other = "RWST0HTBrC+WCOk/vrCjfFlPdAlZW4wvbZSOGyEKhSXIl+oY0jX4mrCz"
+        with self.assertRaises(AssertionError):
+            validate_public_key(f"untrusted comment: minisign public key {KEY_ID}\n{other}\n")
+
+    def test_comment_naming_another_key_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_public_key(
+                self.text.replace(KEY_ID, "0000000000000000", 1)
+            )
+
+    def test_wrong_algorithm_rejected(self):
+        raw = base64.b64decode(self.text.splitlines()[1], validate=True)
+        swapped = base64.b64encode(b"ED" + raw[2:]).decode()
+        with self.assertRaises(AssertionError):
+            validate_public_key(f"untrusted comment: {KEY_ID}\n{swapped}\n")
+
+    def test_truncated_key_rejected(self):
+        raw = base64.b64decode(self.text.splitlines()[1], validate=True)
+        short = base64.b64encode(raw[:-1]).decode()
+        with self.assertRaises(AssertionError):
+            validate_public_key(f"untrusted comment: {KEY_ID}\n{short}\n")
+
+    def test_comment_only_file_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_public_key("untrusted comment: minisign public key ABC\n")
+
+
+class SelfTestWorkflow(unittest.TestCase):
+    def setUp(self):
+        self.text = WORKFLOW.read_text()
+
+    def test_live_workflow(self):
+        validate_workflow(self.text)
+
+    def test_pull_request_trigger_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(self.text.replace("  push:\n", "  pull_request:\n  push:\n"))
+
+    def test_conditional_job_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(
+                self.text.replace(
+                    "  signing-selftest:\n",
+                    "  signing-selftest:\n    if: github.event_name == 'workflow_dispatch'\n",
+                )
+            )
+
+    def test_runner_without_minisign_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(self.text.replace("ubuntu-24.04", "ubuntu-22.04"))
+
+    def test_verification_without_prehash_flag_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(self.text.replace("minisign -V -H -p", "minisign -V -p"))
+
+    def test_ignored_verification_failure_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(self.text.replace(f"          {VERIFY}\n", f"          {VERIFY} || true\n", 1))
+
+    def test_disabled_negative_case_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(self.text.replace(f"if {VERIFY}; then", "if false; then"))
+
+    def test_dropped_verification_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(self.text.replace(VERIFY, "true"))
+
+    def test_dropped_signing_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(self.text.replace('minisign -S -s "${key}"', "true #"))
+
+    def test_missing_errexit_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(self.text.replace("          set -euo pipefail\n", "", 1))
+
+    def test_command_tracing_rejected(self):
+        for mutation in ("set -euxo pipefail", "set -euo pipefail\n          set -o xtrace"):
+            with self.assertRaises(AssertionError):
+                validate_workflow(self.text.replace("          set -euo pipefail", f"          {mutation}", 1))
+
+    def test_shell_override_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(
+                self.text.replace(
+                    "        env:\n", "        shell: bash -x {0}\n        env:\n", 1
+                )
+            )
+
+    def test_echoing_the_secret_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(
+                self.text.replace(
+                    "          umask 077\n",
+                    '          umask 077\n          echo "${MINISIGN_SECRET_KEY}"\n',
+                    1,
+                )
+            )
+
+    def test_printing_the_key_file_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate_workflow(
+                self.text.replace(
+                    "          umask 077\n", '          umask 077\n          cat "${key}"\n', 1
+                )
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
