@@ -142,6 +142,8 @@ pub struct Update {
     /// rotated without shipping a new binary first.
     pub public_key: Option<String>,
     pub channel: Option<String>,
+    /// Accepted only as `true`. Kept so a config that states the
+    /// expectation stays valid; there is no way to turn verification off.
     pub enforce_signature: Option<bool>,
 }
 
@@ -349,6 +351,13 @@ impl Config {
             self.service.scope.as_deref(),
             &["system", "user"],
         )?;
+        if self.update.enforce_signature == Some(false) {
+            // There is no bypass to turn off: `danso update apply` verifies
+            // unconditionally. Accepting `false` would leave an operator
+            // believing they had disabled a check that was never optional,
+            // and an auditor reading `config check` believing a bypass exists.
+            bail!("update.enforce_signature cannot be disabled; signatures are always enforced");
+        }
         if let Some(key) = &self.update.public_key {
             // Parsed by the same code that verifies releases, not re-checked by
             // shape here. A key that passes `config check` and then fails at
@@ -544,6 +553,10 @@ public_key = "RWQbf5jrBubDWDWgYNOyi1nYm+uTycGKIGfh+oOVB09ocmmx8o4mAj8w"
             ),
             ("[service]\nunit = \"../evil\"\n", "unit name"),
             ("[update]\npublic_key = \"short\"\n", "public key shape"),
+            (
+                "[update]\nenforce_signature = false\n",
+                "signature enforcement cannot be switched off",
+            ),
             // The pre-signing shape check accepted a bare 32-byte
             // ed25519 key. It carries no key id, so a signature from
             // any other key could not be told apart by id.

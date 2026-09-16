@@ -14,6 +14,7 @@
 
 pub mod generation;
 pub mod health;
+pub mod install;
 pub mod pidfile;
 pub mod probe;
 pub mod release;
@@ -23,6 +24,7 @@ pub mod supervise;
 pub mod unit;
 pub mod update;
 
+pub use install::{ApplyError, ApplyPlan, ApplyReport};
 pub use release::{Manifest, verify_artifact, verify_manifest};
 pub use status::{ServiceState, StatusOutcome, StatusReport};
 pub use stop::{StopOutcome, TURN_DRAIN_SECS};

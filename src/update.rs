@@ -1,16 +1,20 @@
 //! `danso update` — the self-update surface (`docs/unified-design.md` §6.3).
 //!
-//! This slice is state and reporting only: `status` reads what is on disk and
-//! what is running, and says whether an activation is outstanding. Downloading,
-//! verifying and replacing the binary land in later slices (#119 PR2/PR3).
+//! `status` reads what is on disk and what is running and says whether an
+//! activation is outstanding. `apply` installs a signed release that is already
+//! on disk. Fetching one over the network is a later slice, which is why
+//! `apply` names a directory instead of a URL.
 //!
 //! `status` is a read. It takes no lock, performs no network access and writes
 //! nothing — the same discipline `doctor` and `service status` follow, for the
-//! same reason: inspecting an installation must not change it.
+//! same reason: inspecting an installation must not change it. `apply` is the
+//! opposite and is ordered accordingly; see `danso_ops::install`.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use danso_ops::install;
 use danso_ops::update::{self, UpdateStatus};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -30,6 +34,61 @@ pub enum UpdateCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Install a signed release from a local directory. Exits 13 if it does
+    /// not verify, and there is no flag that skips the check.
+    Apply {
+        /// Directory holding `SHA256SUMS`, `SHA256SUMS.minisig` and the artifact.
+        #[arg(long, value_name = "DIR")]
+        artifact_dir: PathBuf,
+        /// Artifact file name, as listed in the signed manifest.
+        #[arg(long, value_name = "NAME")]
+        artifact: String,
+        /// Units this activation expects to restart. Repeatable.
+        #[arg(long = "service", value_name = "UNIT")]
+        services: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Install a verified release over `$DANSO_HOME/bin/danso`.
+///
+/// The trusted key is the one embedded in this binary unless `config.toml`
+/// overrides it. Reading the override through the normal config path is what
+/// makes rotation possible without shipping a new binary first; a broken
+/// override is an error rather than a silent fall back to the embedded key,
+/// because falling back would let a bad rotation keep trusting the old key.
+pub fn apply(
+    artifact_dir: &Path,
+    artifact: &str,
+    services: Vec<String>,
+) -> Result<install::ApplyReport, install::ApplyError> {
+    let home = crate::config::home()
+        .context("DANSO_HOME")
+        .map_err(install::ApplyError::Failed)?;
+    let key = configured_public_key(&home).map_err(install::ApplyError::Failed)?;
+    if !install::tar_available() {
+        return Err(install::ApplyError::Failed(anyhow::anyhow!(
+            "tar is required to unpack a release"
+        )));
+    }
+    install::apply(&install::ApplyPlan {
+        artifact_dir,
+        artifact_name: artifact,
+        public_key: &key,
+        danso_home: &home,
+        services,
+    })
+}
+
+/// The release key this installation trusts.
+fn configured_public_key(home: &Path) -> Result<String> {
+    let path = home.join(crate::config::FILE_NAME);
+    let override_key = match path.exists() {
+        true => crate::config::Config::load(&path)?.update.public_key,
+        false => None,
+    };
+    install::trusted_public_key(override_key.as_deref())
 }
 
 /// Collect the update status for this installation.
