@@ -15,7 +15,7 @@ pub use client::{
     Update, User,
 };
 pub use lock::{TOKEN_LOCK_FILE_NAME, TokenLock};
-pub use service::{TelegramArgs, TelegramService, run};
+pub use service::{DrainReport, TelegramArgs, TelegramService, run};
 pub use store::{
     ActiveTaskRecord, ConversationRecord, ConversationStore, MAX_PREVIOUS_SESSIONS, UsageRecord,
 };

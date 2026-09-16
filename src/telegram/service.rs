@@ -1034,6 +1034,20 @@ impl HealthFile {
     }
 }
 
+/// What a drain observed. `still_running > 0` means the inner budget expired
+/// with work outstanding; the journals are retained and nothing is replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainReport {
+    pub started_with: usize,
+    pub still_running: usize,
+}
+
+impl DrainReport {
+    pub fn is_complete(self) -> bool {
+        self.still_running == 0
+    }
+}
+
 struct ServiceInner {
     api: super::BotApi,
     access: super::AccessControl,
@@ -1128,6 +1142,65 @@ impl TelegramService {
     /// orderly embedding shutdowns from needing to kill a polling task.
     pub async fn run_until(self, shutdown: Arc<Notify>) -> Result<()> {
         self.run_loop(Some(shutdown)).await
+    }
+
+    /// Run until `shutdown` fires, then drain active turns within `budget`.
+    ///
+    /// This is the SIGTERM path. Leaving the loop stops admitting new turns;
+    /// draining gives the ones already running a bounded chance to finish
+    /// before teardown. The budget is the *inner* 45s tier — the caller still
+    /// owns the outer wall clock, and the difference between them is what pays
+    /// for teardown.
+    pub async fn run_until_drained(
+        self,
+        shutdown: Arc<Notify>,
+        budget: Duration,
+    ) -> Result<DrainReport> {
+        // `TelegramService` is an `Arc` handle, so the clone shares one service.
+        // The drain must run even when the loop ended with an error: turns are
+        // already in flight and a failed poll is no reason to abandon them.
+        let draining = self.clone();
+        let result = self.run_loop(Some(Arc::clone(&shutdown))).await;
+        let report = draining.drain(budget).await;
+        result.map(|()| report)
+    }
+
+    /// Interrupt every running turn and wait for them, bounded by `budget`.
+    ///
+    /// Turns run on their own threads and publish completion through
+    /// `ActiveTurn::completed`, so this polls that flag rather than joining:
+    /// a turn wedged in a tool call must not make the drain itself unbounded.
+    pub async fn drain(&self, budget: Duration) -> DrainReport {
+        let active: Vec<Arc<ActiveTurn>> = {
+            let chats = self.inner.chats.lock().expect("Telegram chat map lock");
+            chats
+                .values()
+                .filter_map(|state| state.active.lock().ok()?.as_ref().cloned())
+                .filter(|turn| turn.is_running())
+                .collect()
+        };
+        let started_with = active.len();
+        for turn in &active {
+            // One interrupt per turn. `interrupt` records the cancellation
+            // reason and notifies; repeating it would not make a wedged tool
+            // return any sooner.
+            turn.interrupt();
+        }
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if active.iter().all(|turn| !turn.is_running()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let still_running = active.iter().filter(|turn| turn.is_running()).count();
+        // Publish the final state so a `status` taken during teardown reflects
+        // what actually happened rather than the last poll's picture.
+        let _ = self.refresh_health(None);
+        DrainReport {
+            started_with,
+            still_running,
+        }
     }
 
     async fn run_loop(self, shutdown: Option<Arc<Notify>>) -> Result<()> {

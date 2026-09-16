@@ -91,12 +91,41 @@ fn main() {
                     std::process::exit(3);
                 }
             },
-            ServiceCommand::Run { data_dir } => {
+            ServiceCommand::Run {
+                data_dir,
+                supervise,
+            } => {
+                if supervise {
+                    match danso::service::supervise(data_dir) {
+                        Ok(0) => return,
+                        Ok(code) => std::process::exit(code),
+                        Err(error) => {
+                            eprintln!("service supervision failed: {error}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 if let Err(error) = danso::service::run(data_dir) {
                     eprintln!("service run failed: {error}");
                     std::process::exit(1);
                 }
                 return;
+            }
+            ServiceCommand::Stop {
+                data_dir,
+                grace_secs,
+            } => {
+                // The budget was validated during parsing, before any signal.
+                match danso::service::stop(data_dir, std::time::Duration::from_secs(grace_secs)) {
+                    Ok(outcome) => {
+                        println!("{}", danso::service::stop_text(outcome));
+                        std::process::exit(outcome.exit_code());
+                    }
+                    Err(_) => {
+                        eprintln!("service stop failed: state home unavailable");
+                        std::process::exit(3);
+                    }
+                }
             }
         }
     }
