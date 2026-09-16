@@ -20,8 +20,10 @@ pub mod status;
 pub mod stop;
 pub mod supervise;
 pub mod unit;
+pub mod update;
 
 pub use status::{ServiceState, StatusOutcome, StatusReport};
 pub use stop::{StopOutcome, TURN_DRAIN_SECS};
 pub use supervise::{CrashPolicy, Decision};
 pub use unit::{Drift, Scope, UnitSpec};
+pub use update::{InstalledGeneration, PendingActivation, UpdateStatus};

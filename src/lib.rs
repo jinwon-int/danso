@@ -18,4 +18,7 @@ pub mod service;
 pub mod session;
 pub mod telegram;
 pub mod tools;
+/// The self-update surface. Gated on `ops` like the service CLI.
+#[cfg(feature = "ops")]
+pub mod update;
 pub mod usage;

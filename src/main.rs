@@ -195,6 +195,37 @@ fn main() {
             }
         }
     }
+    // `update` is state inspection in this slice: read-only, offline, and no
+    // lock. Keep it ahead of config and async runtime setup for the same reason
+    // doctor is — inspecting an installation must not change it.
+    #[cfg(feature = "ops")]
+    if std::env::args().nth(1).as_deref() == Some("update") {
+        use danso::update::{UpdateArgs, UpdateCommand};
+        let args = match UpdateArgs::try_parse_from(std::env::args_os().skip(1)) {
+            Ok(args) => args,
+            Err(error) => {
+                let code = error.exit_code();
+                error.print().ok();
+                std::process::exit(code);
+            }
+        };
+        let UpdateCommand::Status { json } = args.command;
+        match danso::update::status() {
+            Ok(report) => {
+                if json {
+                    println!("{}", serde_json::to_string(&report).expect("serializable"));
+                } else {
+                    println!("{}", report.summary());
+                }
+                std::process::exit(report.exit_code());
+            }
+            Err(_) => {
+                // Body-free: never echo HOME/DANSO_HOME or filesystem text.
+                eprintln!("update status failed: state home unavailable");
+                std::process::exit(2);
+            }
+        }
+    }
     // Telegram is a service entry point, not a normal prompt positional. It
     // owns one process-wide token lock and keeps all turns in this process.
     if std::env::args().nth(1).as_deref() == Some("telegram") {
