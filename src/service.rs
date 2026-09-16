@@ -13,6 +13,7 @@ use danso_ops::{
     pidfile::{PidFile, SERVICE_PID_FILE_NAME, ServicePid},
     status::{StatusInputs, StatusReport},
     stop::{StopOutcome, TURN_DRAIN_SECS},
+    unit::{Drift, Scope, UnitSpec},
 };
 use std::{path::PathBuf, time::Duration};
 
@@ -47,6 +48,34 @@ pub enum ServiceCommand {
         /// Emit the machine-readable report instead of the text rendering.
         #[arg(long)]
         json: bool,
+    },
+    /// Render and install the systemd unit. Does not start the service.
+    Install {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Install into the per-user scope instead of the system scope.
+        #[arg(long)]
+        user: bool,
+        /// Print the rendered unit and the target path; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Compare the installed unit against what this binary renders.
+    ///
+    /// Reports drift and reloads the systemd daemon. It never rewrites the
+    /// unit, restarts the service or changes whether it is enabled.
+    Reconcile {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        user: bool,
+    },
+    /// Disable and remove the unit. Refuses while the service is still serving.
+    Uninstall {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        user: bool,
     },
     /// Stop the running service within a bounded wall-clock budget.
     Stop {
@@ -247,6 +276,168 @@ fn which(program: &str) -> Result<PathBuf> {
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
         .context("program not found")
+}
+
+/// Build the unit spec for this host.
+///
+/// `exe` is the running binary rather than a name looked up on `PATH`: the unit
+/// must keep pointing at the image that installed it, not at whatever a future
+/// `PATH` happens to resolve.
+pub fn unit_spec(data_dir: Option<PathBuf>, user: bool) -> Result<UnitSpec> {
+    let data_dir = resolve_data_dir(data_dir)?;
+    let home = home_dir()?;
+    Ok(UnitSpec {
+        scope: if user { Scope::User } else { Scope::System },
+        exe: std::env::current_exe().context("could not resolve the running binary")?,
+        working_directory: home.clone(),
+        data_dir,
+        home,
+        path_env: std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
+    })
+}
+
+fn home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .context("HOME must be set to an absolute path")
+}
+
+/// Whether this host has systemd to install into.
+///
+/// Termux has none, and that is the supported case rather than an error: the
+/// caller prints the Termux:Boot equivalent instead.
+pub fn has_systemd() -> bool {
+    which("systemctl").is_ok()
+}
+
+/// What an install attempt did.
+pub enum InstallOutcome {
+    /// Nothing was written. `unit` is the exact bytes that would have been.
+    DryRun { path: PathBuf, unit: String },
+    /// The unit was written, the daemon reloaded and the unit enabled.
+    Installed { path: PathBuf },
+}
+
+/// Render the unit and, unless `dry_run`, write it and reload the daemon.
+///
+/// Installing does **not** start the service. Starting is a lifecycle decision
+/// an operator makes; conflating it with installation means a config change
+/// silently becomes a restart.
+pub fn install(spec: &UnitSpec, dry_run: bool) -> Result<InstallOutcome> {
+    let path = spec.scope.unit_path(&spec.home);
+    let unit = spec.render();
+    if dry_run {
+        return Ok(InstallOutcome::DryRun { path, unit });
+    }
+    let dir = path.parent().context("unit path has no parent")?;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create unit directory: {}", dir.display()))?;
+    std::fs::write(&path, &unit).with_context(|| format!("write unit: {}", path.display()))?;
+    // Unlike reconcile's, these are substantive: a unit that was written but
+    // never loaded or enabled is not installed, and reporting success would be
+    // a lie the operator only discovers at the next boot.
+    systemctl(spec.scope, &["daemon-reload"])?;
+    systemctl(spec.scope, &["enable", danso_ops::unit::UNIT_NAME])?;
+    Ok(InstallOutcome::Installed { path })
+}
+
+/// Report drift and reload the daemon. Changes nothing else.
+pub fn reconcile(spec: &UnitSpec) -> Result<Drift> {
+    let path = spec.scope.unit_path(&spec.home);
+    let drift = danso_ops::unit::drift(spec, &path);
+    // The reload is safe on its own: it re-reads unit files without restarting
+    // or enabling anything. The drift itself is reported, never repaired here —
+    // rewriting a unit an operator edited on purpose is not reconciliation.
+    //
+    // A failed reload does not fail the command. Reporting drift is what
+    // `reconcile` is for, and `systemctl --user` fails outright on a host with
+    // no user session bus (headless root, CI). Turning that into an error would
+    // hide the answer behind an unrelated environment limitation.
+    if has_systemd() {
+        systemctl_best_effort(spec.scope, &["daemon-reload"]);
+    }
+    Ok(drift)
+}
+
+/// Disable and remove the unit.
+///
+/// Refuses while the service is still serving. Removing the unit under a live
+/// process leaves something running that nothing supervises and that no unit
+/// describes — the exact state `status` calls degraded.
+pub fn uninstall(spec: &UnitSpec) -> Result<String> {
+    let report = status(Some(spec.data_dir.clone()))?;
+    if matches!(
+        report.outcome(),
+        danso_ops::StatusOutcome::State(
+            danso_ops::ServiceState::Available | danso_ops::ServiceState::Degraded
+        )
+    ) {
+        anyhow::bail!(
+            "service is still {} — stop it before removing its unit",
+            report.state
+        );
+    }
+    let path = spec.scope.unit_path(&spec.home);
+    if has_systemd() {
+        // A unit that was never enabled makes `disable` fail; that is not a
+        // reason to leave the file behind.
+        let _ = systemctl(spec.scope, &["disable", danso_ops::unit::UNIT_NAME]);
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok("Unit: not installed".to_string());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("remove unit: {}", path.display()));
+        }
+    }
+    // The removal is the substantive act and it already happened. A reload that
+    // cannot run must not turn a completed uninstall into a reported failure.
+    if has_systemd() {
+        systemctl_best_effort(spec.scope, &["daemon-reload"]);
+    }
+    Ok(format!("Unit: removed {}", path.display()))
+}
+
+/// Run `systemctl` and report failure on stderr without failing the command.
+///
+/// For steps whose failure does not invalidate the result the caller already
+/// produced. The failure is still surfaced — silently swallowing it would leave
+/// an operator believing systemd picked up a change it never saw.
+fn systemctl_best_effort(scope: Scope, args: &[&str]) {
+    if let Err(error) = systemctl(scope, args) {
+        eprintln!("warning: {error}");
+    }
+}
+
+fn systemctl(scope: Scope, args: &[&str]) -> Result<()> {
+    let mut command = std::process::Command::new("systemctl");
+    if let Some(flag) = scope.systemctl_flag() {
+        command.arg(flag);
+    }
+    command.args(args);
+    let status = command
+        .status()
+        .with_context(|| format!("run systemctl {}", args.join(" ")))?;
+    anyhow::ensure!(
+        status.success(),
+        "systemctl {} failed with {status}",
+        args.join(" ")
+    );
+    Ok(())
+}
+
+/// The text `install` prints where systemd is absent.
+pub fn termux_guidance(spec: &UnitSpec) -> String {
+    let path = danso_ops::unit::termux_boot_path(&spec.home);
+    format!(
+        "Unit: systemd not present; nothing was installed.\n\
+         Termux:Boot equivalent — create {} yourself with:\n\n{}",
+        path.display(),
+        danso_ops::unit::termux_boot_script(&spec.exe, &spec.data_dir)
+    )
 }
 
 /// The text rendering of a stop outcome. Kept beside the states it names so a
