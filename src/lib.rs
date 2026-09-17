@@ -7,7 +7,9 @@ pub mod contracts;
 pub mod doctor;
 pub mod failure;
 /// The self-update surface. Gated on `ops` like the service CLI.
-#[cfg(feature = "ops")]
+// Not behind `ops`: `config` validates `[update] source` with it, and config
+// validation is part of every build. The crate it leans on (`danso-ops`) is an
+// unconditional dependency; only the CLI surface is feature-gated.
 pub mod fetch;
 pub mod long_task;
 pub mod memory;

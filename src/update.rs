@@ -118,11 +118,35 @@ pub enum Available {
         target: String,
         offered: Vec<String>,
     },
-    /// Nothing recorded the archive this node was installed from, so there is
-    /// nothing to compare against. The next `apply` records it.
+    /// Nothing is installed. The release is simply what this node would get.
+    NotInstalled {
+        artifact: String,
+        artifact_sha256: String,
+    },
+    /// Something is installed, but nothing recorded which archive it came
+    /// from, so there is nothing to compare against.
+    ///
+    /// **Exit 0, not 10.** Acting on "cannot tell" is the fail-open this
+    /// command exists to avoid: a wrapper that re-applies on 10 would, after
+    /// `update rollback` — which writes a record without these fields —
+    /// immediately reinstall the release the operator just rolled away from.
+    /// The next `apply` records the archive and the comparison starts working.
     Unknown {
         artifact: String,
         artifact_sha256: String,
+    },
+    /// The release names more than one artifact for this target.
+    ///
+    /// Not a choice to make silently. `Manifest` iterates a sorted map, so
+    /// "pick the first" means lexicographic order — under which a release
+    /// carrying both `…-0.1.0-…` and `…-0.2.0-…` reads as "up to date" on the
+    /// former while the latter sits in the same signed manifest. That is the
+    /// failure this command is written to avoid, reintroduced by map order
+    /// rather than by parsing a version. `release` refuses a duplicate *name*
+    /// for the same reason: both are signed, so neither is "the" one.
+    Ambiguous {
+        target: String,
+        candidates: Vec<String>,
     },
 }
 
@@ -134,7 +158,11 @@ impl Available {
             // Not a failure and not an update: a release that carries no
             // artifact for this machine is a fact about the release.
             Available::NothingForThisTarget { .. } => 0,
-            Available::Unknown { .. } => EXIT_UPDATE_AVAILABLE,
+            Available::NotInstalled { .. } => EXIT_UPDATE_AVAILABLE,
+            Available::Unknown { .. } => 0,
+            // Neither 0 nor 10: this is "cannot decide", and a cron wrapper
+            // that branches on those two must not take either branch.
+            Available::Ambiguous { .. } => 2,
         }
     }
 
@@ -151,9 +179,19 @@ impl Available {
                     false => offered.join(", "),
                 }
             ),
+            Available::NotInstalled { artifact, .. } => {
+                format!("nothing is installed; {artifact} is what this node would get")
+            }
             Available::Unknown { artifact, .. } => format!(
-                "{artifact} is available; this installation does not record \
-                 which archive it came from, so it cannot be compared"
+                "{artifact} is offered, but this installation does not record \
+                 which archive it came from, so the two cannot be compared; \
+                 the next `update apply` records it"
+            ),
+            Available::Ambiguous { target, candidates } => format!(
+                "the release names {} artifacts for {target} ({}); it is not \
+                 this command's job to choose between signed alternatives",
+                candidates.len(),
+                candidates.join(", ")
             ),
         }
     }
@@ -183,25 +221,46 @@ pub fn check() -> Result<Available> {
     let manifest = danso_ops::release::verify_manifest(&manifest_bytes, &signature, &key)?;
 
     let suffix = format!("-{TARGET}.tar.gz");
-    let Some(artifact) = manifest
+    // Collected, not `find`: the first match of a sorted map is an ordering
+    // this command refuses to have an opinion about.
+    let candidates: Vec<String> = manifest
         .names()
-        .find(|name| name.ends_with(&suffix))
+        .filter(|name| name.ends_with(&suffix))
         .map(str::to_string)
-    else {
-        return Ok(Available::NothingForThisTarget {
-            target: TARGET.to_string(),
-            offered: manifest.names().map(str::to_string).collect(),
-        });
+        .collect();
+    let artifact = match candidates.len() {
+        0 => {
+            return Ok(Available::NothingForThisTarget {
+                target: TARGET.to_string(),
+                offered: manifest.names().map(str::to_string).collect(),
+            });
+        }
+        1 => candidates.into_iter().next().expect("one candidate"),
+        _ => {
+            return Ok(Available::Ambiguous {
+                target: TARGET.to_string(),
+                candidates,
+            });
+        }
     };
     let artifact_sha256 = manifest
         .digest(&artifact)
         .context("the manifest names an artifact it does not list")?
         .to_string();
 
+    // Not `.ok()`: `read_installed` produces an error for a *corrupt* record on
+    // purpose, and swallowing it here would report "an update is available" on
+    // every tick while the only evidence of what this node is running sits
+    // damaged on disk.
     let installed = update::read_installed(&update::state_dir(&home))
-        .ok()
-        .flatten();
-    match installed.and_then(|generation| generation.artifact_sha256) {
+        .context("read the installed generation")?;
+    let Some(installed) = installed else {
+        return Ok(Available::NotInstalled {
+            artifact,
+            artifact_sha256,
+        });
+    };
+    match installed.artifact_sha256 {
         Some(previous) if previous == artifact_sha256 => Ok(Available::UpToDate { artifact }),
         Some(previous) => Ok(Available::Different {
             artifact,

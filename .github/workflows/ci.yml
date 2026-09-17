@@ -9,7 +9,11 @@ permissions:
   contents: read
 jobs:
   contracts:
-    runs-on: ubuntu-22.04
+    # noble, not jammy: `minisign` is not packaged before 24.04, and the test
+    # that needs it would otherwise skip in the one environment that matters.
+    # This is the *test* runner; `release.yml` keeps its build job on 22.04 so
+    # the glibc floor for shipped binaries stays low.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,7 +28,10 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
           sudo apt-get update -qq
-          sudo apt-get install -y bubblewrap
+          # minisign: `tests/update_check.rs` signs a manifest for this build's
+          # target triple, which no committed fixture can carry. Without it
+          # that test skips and the mutation it exists to kill survives.
+          sudo apt-get install -y bubblewrap minisign
       - name: Format, lint and test
         run: |
           cargo +1.98.1 fmt --check
@@ -36,6 +43,11 @@ jobs:
           cargo +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
           cargo +1.98.1 test --locked --workspace
           cargo +1.98.1 build --locked
+          # The CLI-only build is a supported configuration (Cargo.toml), and
+          # nothing else here compiles it: a `crate::` path added under the
+          # `ops` gate builds fine by default and breaks only this. Measured —
+          # that is exactly how it broke once.
+          cargo +1.98.1 check --locked --no-default-features
           cargo +1.98.1 build --release --locked
           python3 scripts/test_e2e.py
           # The documented install builds --release; run the CLI contract

@@ -141,9 +141,19 @@ would be the worst surprise a cron job could hold.
 
 | exit | meaning |
 |---|---|
-| 0 | the offered archive is the one this generation was installed from, or the release carries nothing for this target |
-| 10 | a **different** archive is available, or nothing recorded what this node was installed from |
-| 2 | no source configured, source unreachable, or the manifest did not verify |
+| 0 | the offered archive is the one this generation was installed from; the release carries nothing for this target; or nothing recorded which archive this node came from |
+| 10 | a **different** archive is available, or nothing is installed at all |
+| 2 | no source configured, unreachable, the manifest did not verify, the record is corrupt, or the release names more than one artifact for this target |
+
+**"Cannot tell" exits 0, not 10.** `update rollback` writes a record without
+the archive fields, so a wrapper that re-applies on 10 would immediately
+reinstall the release the operator had just rolled away from. The next `apply`
+records the archive and the comparison starts working again.
+
+**Two signed artifacts for one target is exit 2, not a choice.** The manifest
+is a sorted map, so "take the first" means lexicographic order — a release
+carrying both `…-0.1.0-…` and `…-0.2.0-…` would read as "up to date" on the
+former while the latter sat in the same signed manifest.
 
 **It says nothing about newer or older.** An ordering would have to be parsed
 out of a file name, and a source that has been rolled back would then read as
@@ -167,9 +177,19 @@ tamper-and-DoS — **not** because it is what makes an update safe.
 
 What the fetcher is responsible for is the part a signature cannot cover: a
 bounded download (the manifest declares digests, never sizes), a bounded
-redirect chain with every hop re-checked against the same scheme rule, a
-timeout, and an owner-only staging directory. Failures name a reason and never
-the URL: a release source can carry a token in a query string.
+redirect chain with every hop re-checked against the same scheme rule, and a
+wall-clock deadline.
+
+That deadline is this updater's own. `reqwest::blocking`'s `timeout` re-arms on
+every read, so it bounds a *stall* and not a transfer — measured, a source
+sending one byte every five seconds against a 30-second budget was still being
+read at 150 seconds.
+
+Failures name a reason and never the URL: a release source is operator
+configuration and a cron log is not where it belongs. A source may not carry a
+query string or fragment, because the sub-paths are joined onto the end —
+`…/rel?token=X` would become `…/rel?token=X/SHA256SUMS`, and the failure would
+arrive as a signature error pointing at the wrong thing.
 
 ## Archive layout
 

@@ -17,28 +17,24 @@
 //!
 //! What this module is responsible for is the part a signature cannot cover:
 //! not being made to download forever, not being redirected somewhere
-//! surprising, not writing what it got somewhere another user can reach, and
-//! not hanging a cron job until somebody notices.
+//! surprising, and not hanging a cron job until somebody notices.
+//!
+//! Errors name a reason and never the URL. A release source is operator
+//! configuration — a private mirror's path, an internal host — and a cron log
+//! is not where it belongs. (A source cannot carry a query string at all; see
+//! [`is_allowed`].)
 
 use anyhow::{Context, Result, bail, ensure};
-use std::path::Path;
 use std::time::Duration;
 
 /// A manifest is a few lines per artifact; this is room for hundreds.
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 /// A minisign signature file is two lines.
 pub const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
-/// The release archive. Measured: the 0.1.0 `x86_64-unknown-linux-gnu` archive
-/// is about 5 MB, so this is ample headroom and still bounded — the manifest
-/// declares a digest, never a size, so without a cap a hostile or broken
-/// server can make this run until the disk is full.
-pub const MAX_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
-
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Small files: a server that cannot produce two lines in this long is not
 /// going to produce an archive either.
 const MANIFEST_TIMEOUT: Duration = Duration::from_secs(30);
-const ARTIFACT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_REDIRECTS: usize = 5;
 
 /// Whether a URL may be fetched from.
@@ -49,6 +45,7 @@ const MAX_REDIRECTS: usize = 5;
 /// including `file:` and `ftp:`, not because the signature would accept them
 /// but because a release URL that is not a release URL is a configuration
 /// mistake worth naming.
+///
 /// Parsed rather than pattern-matched. Splitting a URL on `/`, `@` and `:` by
 /// hand gets `http://[::1]:9/x` wrong — it did, in the first version of this
 /// function — and every other way of getting a host out of a string by hand is
@@ -60,6 +57,14 @@ pub fn is_allowed(url: &str) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
+    // A base with a query or a fragment cannot work: the sub-paths are joined
+    // onto the end, so `…/rel?token=X` becomes `…/rel?token=X/SHA256SUMS` —
+    // the token is extended, not the path, and the failure arrives as a
+    // signature error pointing at the wrong thing entirely. Refusing it at
+    // config load says what is actually wrong.
+    if url.query().is_some() || url.fragment().is_some() {
+        return false;
+    }
     match url.scheme() {
         "https" => true,
         // `host_str` gives the bracketed form for IPv6, which is what a URL
@@ -93,8 +98,12 @@ pub enum Redirect {
 /// that does not resolve both come back as "unreachable", so an integration
 /// test cannot tell the policy working from the policy missing. That was
 /// measured — the mutation removing this check passed the redirect test.
-pub fn redirect_decision(url: &str, hops: usize) -> Redirect {
-    if hops >= MAX_REDIRECTS {
+/// `previous` is what `reqwest` passes: it **includes the original URL**, so
+/// the comparison is `>` and not `>=`. With `>=` the bound is one hop tighter
+/// than `MAX_REDIRECTS` says — measured, five requests where six were meant.
+/// reqwest's own `Policy::limited` compensates the same way.
+pub fn redirect_decision(url: &str, previous: usize) -> Redirect {
+    if previous > MAX_REDIRECTS {
         return Redirect::TooMany;
     }
     match is_allowed(url) {
@@ -135,20 +144,35 @@ pub fn get(url: &str, limit: u64, timeout: Duration) -> Result<Vec<u8>> {
     let response = client(timeout)?
         .get(url)
         .send()
-        // Body-free: the error carries the failure, never the URL — a release
-        // source can hold a token in a query string.
+        // Body-free: the error carries the failure, never the URL. A release
+        // source is operator configuration and a cron log is not where it
+        // belongs.
         .map_err(|_| anyhow::anyhow!("release source unreachable"))?;
     ensure!(
         response.status().is_success(),
         "release source answered {}",
         response.status().as_u16()
     );
+    // A deadline this function owns, because the client's does not mean what
+    // it looks like: `reqwest::blocking`'s `timeout` is re-armed on *every*
+    // `read`, so it bounds a stall and not a transfer. Measured — a source
+    // sending one byte every five seconds against a 30-second budget was
+    // still being read at 150 seconds. At that rate the manifest cap alone is
+    // three weeks, which is not a timeout, it is a wedged cron job.
+    let deadline = std::time::Instant::now() + timeout;
+    let mut reader = response.take(limit + 1);
     let mut bytes = Vec::new();
-    // One byte past the limit is enough to know it was exceeded.
-    response
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| anyhow::anyhow!("release source stopped mid-transfer"))?;
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            bail!("release source took longer than this updater will wait");
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+            Err(_) => bail!("release source stopped mid-transfer"),
+        }
+    }
     if bytes.len() as u64 > limit {
         bail!("release artifact is larger than this updater will download");
     }
@@ -173,60 +197,6 @@ pub fn manifest(base: &str) -> Result<(Vec<u8>, String)> {
     )?;
     let signature = String::from_utf8(signature).context("signature file is not text")?;
     Ok((manifest, signature))
-}
-
-/// Download one artifact named by an already-verified manifest.
-///
-/// `name` must come from [`danso_ops::release::Manifest`], never from a URL, a
-/// header or an operator's argument: the manifest is the only place a name has
-/// been signed, and `release` already refuses names that are paths, options or
-/// anything but a plain file name.
-pub fn artifact(base: &str, name: &str) -> Result<Vec<u8>> {
-    let base = base.trim_end_matches('/');
-    get(
-        &format!("{base}/{name}"),
-        MAX_ARTIFACT_BYTES,
-        ARTIFACT_TIMEOUT,
-    )
-}
-
-/// Write a downloaded release into a private directory `apply` can read.
-///
-/// Owner-only, and created fresh: `apply` is about to run `tar` and then a
-/// binary out of whatever is here, so a directory another user can write to
-/// would make the download the least interesting way in.
-pub fn stage(
-    dir: &Path,
-    manifest: &[u8],
-    signature: &str,
-    name: &str,
-    artifact: &[u8],
-) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| "create the staging directory".to_string())?;
-    for (file, bytes) in [
-        (danso_ops::release::MANIFEST_FILE, manifest),
-        (danso_ops::release::SIGNATURE_FILE, signature.as_bytes()),
-        (name, artifact),
-    ] {
-        let path = dir.join(file);
-        let mut handle = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .context("write the staged release")?;
-        handle
-            .write_all(bytes)
-            .context("write the staged release")?;
-        handle.sync_all().context("write the staged release")?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -275,6 +245,21 @@ mod tests {
     }
 
     #[test]
+    fn a_source_with_a_query_or_fragment_is_refused() {
+        // Not a style rule: `{base}/{file}` extends whatever comes last, so a
+        // query base produces `…?token=X/SHA256SUMS` and the operator is told
+        // the signature is malformed. Refused where it can be explained.
+        for url in [
+            "https://host.invalid/rel?token=X",
+            "https://host.invalid/rel#frag",
+            "https://host.invalid/?a=b",
+        ] {
+            assert!(!is_allowed(url), "{url}");
+        }
+        assert!(is_allowed("https://host.invalid/rel"));
+    }
+
+    #[test]
     fn other_schemes_are_refused() {
         for url in [
             "file:///etc/passwd",
@@ -316,59 +301,28 @@ mod tests {
 
     #[test]
     fn a_redirect_chain_is_bounded() {
-        assert_eq!(
-            redirect_decision("https://ok.invalid/x", MAX_REDIRECTS - 1),
-            Redirect::Follow
-        );
+        // The argument is `attempt.previous().len()`, which **includes the
+        // original URL**: at `previous == MAX_REDIRECTS` exactly
+        // `MAX_REDIRECTS - 1` hops have been followed, so this is the last one
+        // that may be. Getting this wrong makes the bound one tighter than the
+        // constant says, silently — measured, and the reason the comparison is
+        // `>` rather than `>=`.
         assert_eq!(
             redirect_decision("https://ok.invalid/x", MAX_REDIRECTS),
+            Redirect::Follow,
+            "the original URL is one of the `previous` entries"
+        );
+        assert_eq!(
+            redirect_decision("https://ok.invalid/x", MAX_REDIRECTS + 1),
             Redirect::TooMany,
             "a source that redirects forever is a source that hangs a cron job"
         );
         // The limit outranks the scheme check only in the sense that it is
         // reached first; both refuse.
         assert_eq!(
-            redirect_decision("http://bad.invalid/x", MAX_REDIRECTS),
+            redirect_decision("http://bad.invalid/x", MAX_REDIRECTS + 1),
             Redirect::TooMany
         );
-    }
-
-    #[test]
-    fn staging_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("release");
-        stage(
-            &dir,
-            b"manifest",
-            "signature",
-            "danso-0.0.0-x.tar.gz",
-            b"tar",
-        )
-        .unwrap();
-
-        assert_eq!(
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        for file in ["SHA256SUMS", "SHA256SUMS.minisig", "danso-0.0.0-x.tar.gz"] {
-            let mode = std::fs::metadata(dir.join(file))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600, "{file}");
-        }
-    }
-
-    #[test]
-    fn staging_refuses_to_write_over_an_existing_release() {
-        // `create_new`: a staging directory that already holds a manifest is
-        // one somebody else is using, or one a previous run left behind. Both
-        // are reasons to stop rather than to mix two releases in one place.
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("release");
-        stage(&dir, b"a", "b", "danso-0.0.0-x.tar.gz", b"c").unwrap();
-        assert!(stage(&dir, b"a", "b", "danso-0.0.0-x.tar.gz", b"c").is_err());
     }
 
     #[test]
@@ -377,6 +331,64 @@ mod tests {
         // network stack and without a timeout.
         let error = get("http://example.invalid/x", 10, Duration::from_secs(1)).unwrap_err();
         assert!(format!("{error}").contains("https"), "{error}");
+    }
+
+    /// A server that answers, then sends one byte at a time, forever.
+    ///
+    /// `reqwest::blocking`'s own timeout re-arms on every `read`, so this is
+    /// the shape that slips past it: never stalled, never finished.
+    fn trickle() -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = format!("http://{}", listener.local_addr().expect("address"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 1024];
+                use std::io::Read;
+                let _ = stream.read(&mut buffer);
+                if stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                loop {
+                    if stream.write_all(b"x").is_err() || stream.flush().is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        });
+        address
+    }
+
+    #[test]
+    fn a_source_that_trickles_forever_is_still_bounded() {
+        // Measured before this bound existed: a source sending one byte every
+        // five seconds against a 30-second budget was still being read at 150
+        // seconds. The client's timeout bounds a stall, not a transfer.
+        let address = trickle();
+        let started = std::time::Instant::now();
+        let error = get(
+            &format!("{address}/x"),
+            64 * 1024,
+            Duration::from_millis(400),
+        )
+        .expect_err("a transfer that never ends must not be waited on forever");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "gave up after {elapsed:?}; the budget was 400ms"
+        );
+        assert!(
+            format!("{error}").contains("longer than"),
+            "and it says the wait ended, not that the source stalled: {error}"
+        );
     }
 
     #[test]

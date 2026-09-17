@@ -123,6 +123,25 @@ fn a_configured_key_is_what_makes_the_fixture_installable() {
         home.join("state/pending-activation.json").exists(),
         "an install that records no activation is one nobody can verify"
     );
+
+    // The archive's own digest, not the binary's. `update check` compares
+    // against this, and the two are never equal — a record without it makes
+    // every later check report "cannot tell" forever.
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.join("state/installed-generation.json")).expect("record"),
+    )
+    .expect("json");
+    let manifest = std::fs::read_to_string(release.join("SHA256SUMS")).expect("manifest");
+    let signed = manifest
+        .lines()
+        .find(|line| line.ends_with(OK))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("the manifest lists the artifact");
+    assert_eq!(record["artifact_name"], OK);
+    assert_eq!(
+        record["artifact_sha256"], signed,
+        "the recorded archive digest must be the one the signed manifest lists"
+    );
 }
 
 #[test]

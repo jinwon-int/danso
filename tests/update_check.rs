@@ -160,6 +160,101 @@ fn report(output: &std::process::Output) -> serde_json::Value {
     })
 }
 
+/// Sign a manifest naming `artifacts` with a throwaway key, and return the
+/// public half.
+///
+/// The fixture's own key cannot sign — its private half was destroyed, which
+/// is the point of it — so anything naming this build's target triple has to
+/// be made here. Same practice `tests/fixtures/release/README.md` documents.
+///
+/// `None` when `minisign` is missing, which is a skip on a contributor's
+/// machine and a failure in CI: this is the only path that reaches the
+/// comparison at all.
+fn resign(dir: &Path, keys: &Path, artifacts: &[&str]) -> Option<String> {
+    std::fs::create_dir_all(keys).expect("keys");
+    let generated = std::process::Command::new("minisign")
+        .args(["-G", "-W", "-p"])
+        .arg(keys.join("pub"))
+        .arg("-s")
+        .arg(keys.join("sec"))
+        .output();
+    let Ok(generated) = generated else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "minisign is missing in CI; these tests cannot skip there"
+        );
+        eprintln!("SKIPPED: minisign is not installed on this machine");
+        return None;
+    };
+    assert!(generated.status.success(), "generate a throwaway key");
+
+    for name in artifacts {
+        // Only when absent: a caller that put a *different* archive under this
+        // name is testing exactly that, and re-copying would quietly undo it.
+        if !dir.join(name).exists() {
+            std::fs::copy(dir.join("danso-9.9.9-ok.tar.gz"), dir.join(name)).expect("artifact");
+        }
+    }
+    let digests = std::process::Command::new("sha256sum")
+        .args(artifacts)
+        .current_dir(dir)
+        .output()
+        .expect("sha256sum");
+    assert!(digests.status.success(), "digest the artifacts");
+    std::fs::write(dir.join("SHA256SUMS"), &digests.stdout).expect("manifest");
+    std::fs::remove_file(dir.join("SHA256SUMS.minisig")).expect("drop the old signature");
+    let signed = std::process::Command::new("minisign")
+        .args(["-S", "-s"])
+        .arg(keys.join("sec"))
+        .args(["-m", "SHA256SUMS"])
+        .current_dir(dir)
+        .output()
+        .expect("sign");
+    assert!(signed.status.success(), "sign the manifest");
+
+    let key = std::fs::read_to_string(keys.join("pub")).expect("public key");
+    Some(key.lines().last().expect("key line").trim().to_string())
+}
+
+/// The artifact name this build's `check` will look for.
+fn artifact_for_this_target(version: &str) -> String {
+    // `build.rs` sets this for the whole package, integration tests included,
+    // so the test and the binary agree on the triple by construction.
+    format!("danso-{version}-{}.tar.gz", env!("DANSO_TARGET"))
+}
+
+/// Record an installed generation that came out of `artifact`.
+fn record_installed(home: &Path, release_dir: &Path, artifact: &str) {
+    let state = home.join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    // Via `sha256sum` rather than a crate: this file needs one digest and the
+    // tool is already a dependency of `resign`.
+    let digested = std::process::Command::new("sha256sum")
+        .arg(artifact)
+        .current_dir(release_dir)
+        .output()
+        .expect("sha256sum");
+    let digest = String::from_utf8_lossy(&digested.stdout)
+        .split_whitespace()
+        .next()
+        .expect("digest")
+        .to_string();
+    let record = serde_json::json!({
+        "schema": "danso.installed-generation.v1",
+        "version": "9.9.9",
+        "binary_sha256": "0".repeat(64),
+        "installed_at": chrono::Utc::now().to_rfc3339(),
+        "source": "release",
+        "artifact_name": artifact,
+        "artifact_sha256": digest,
+    });
+    std::fs::write(
+        state.join("installed-generation.json"),
+        serde_json::to_vec(&record).expect("record"),
+    )
+    .expect("write the record");
+}
+
 #[test]
 fn a_release_the_source_serves_is_reported_without_downloading_it() {
     let temp = tempfile::tempdir().expect("temp");
@@ -196,55 +291,14 @@ fn a_release_the_source_serves_is_reported_without_downloading_it() {
 }
 
 #[test]
-fn an_artifact_for_this_target_is_offered() {
+fn nothing_installed_reports_what_this_node_would_get() {
     let temp = tempfile::tempdir().expect("temp");
     let home = temp.path().join("home");
     let dir = release_copy(temp.path());
-
-    // Re-sign a manifest naming an artifact for the target this test binary
-    // was built for. The fixture's own key cannot sign — its private half was
-    // destroyed — so this uses a throwaway pair, which is the same practice
-    // `tests/fixtures/release/README.md` documents.
-    let keys = temp.path().join("keys");
-    std::fs::create_dir_all(&keys).expect("keys");
-    let generated = std::process::Command::new("minisign")
-        .args(["-G", "-W", "-p"])
-        .arg(keys.join("pub"))
-        .arg("-s")
-        .arg(keys.join("sec"))
-        .output();
-    let Ok(generated) = generated else {
-        // minisign is a contract of the release runner, not of every
-        // developer machine. Skipping loudly beats a green run that proved
-        // nothing, so say so.
-        eprintln!("SKIPPED: minisign is not installed on this machine");
+    let name = artifact_for_this_target("9.9.9");
+    let Some(key) = resign(&dir, &temp.path().join("keys"), &[&name]) else {
         return;
     };
-    assert!(generated.status.success(), "generate a throwaway key");
-
-    // `build.rs` sets this for the whole package, integration tests included,
-    // so the test and the binary agree on the triple by construction.
-    let name = format!("danso-9.9.9-{}.tar.gz", env!("DANSO_TARGET"));
-    std::fs::copy(dir.join("danso-9.9.9-ok.tar.gz"), dir.join(&name)).expect("name for target");
-
-    let digest = std::process::Command::new("sha256sum")
-        .arg(&name)
-        .current_dir(&dir)
-        .output()
-        .expect("sha256sum");
-    std::fs::write(dir.join("SHA256SUMS"), &digest.stdout).expect("manifest");
-    std::fs::remove_file(dir.join("SHA256SUMS.minisig")).expect("drop the old signature");
-    let signed = std::process::Command::new("minisign")
-        .args(["-S", "-s"])
-        .arg(keys.join("sec"))
-        .args(["-m", "SHA256SUMS"])
-        .current_dir(&dir)
-        .output()
-        .expect("sign");
-    assert!(signed.status.success(), "sign the manifest");
-
-    let key = std::fs::read_to_string(keys.join("pub")).expect("public key");
-    let key = key.lines().last().expect("key line").trim().to_string();
     let source = serve(dir);
     configure(&home, &source.address, &key);
 
@@ -252,12 +306,11 @@ fn an_artifact_for_this_target_is_offered() {
     assert_eq!(
         code(&output),
         EXIT_UPDATE_AVAILABLE,
-        "nothing recorded what this node was installed from, so it cannot be \
-         compared — that is an update to consider, not 'up to date'; stderr: {}",
+        "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let report = report(&output);
-    assert_eq!(report["result"], "unknown");
+    assert_eq!(report["result"], "not_installed");
     assert_eq!(report["artifact"], name);
 
     // The assertion that matters, and it has to be here rather than on a
@@ -267,6 +320,158 @@ fn an_artifact_for_this_target_is_offered() {
     assert!(
         !asked.iter().any(|path| path.ends_with(".tar.gz")),
         "a check reports what is available; downloading it is `apply`'s job: {asked:?}"
+    );
+}
+
+#[test]
+fn the_archive_this_generation_came_from_is_what_up_to_date_means() {
+    let temp = tempfile::tempdir().expect("temp");
+    let home = temp.path().join("home");
+    let dir = release_copy(temp.path());
+    let name = artifact_for_this_target("9.9.9");
+    let Some(key) = resign(&dir, &temp.path().join("keys"), &[&name]) else {
+        return;
+    };
+    record_installed(&home, &dir, &name);
+    let source = serve(dir);
+    configure(&home, &source.address, &key);
+
+    let output = check(&home);
+    assert_eq!(
+        code(&output),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(report(&output)["result"], "up_to_date");
+}
+
+#[test]
+fn a_different_archive_is_reported_as_different() {
+    let temp = tempfile::tempdir().expect("temp");
+    let home = temp.path().join("home");
+    let dir = release_copy(temp.path());
+    let name = artifact_for_this_target("9.9.9");
+    // The first pass only puts the archive in place and records it as
+    // installed; its key is superseded below.
+    if resign(&dir, &temp.path().join("keys"), &[&name]).is_none() {
+        return;
+    }
+    record_installed(&home, &dir, &name);
+    // The source now serves a different archive under the same name.
+    std::fs::copy(dir.join("danso-9.9.9-badexit.tar.gz"), dir.join(&name))
+        .expect("swap the archive");
+    let key = resign(&dir, &temp.path().join("keys2"), &[&name]).expect("re-sign");
+    let source = serve(dir);
+    configure(&home, &source.address, &key);
+
+    let output = check(&home);
+    assert_eq!(
+        code(&output),
+        EXIT_UPDATE_AVAILABLE,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = report(&output);
+    assert_eq!(report["result"], "different");
+    assert_ne!(report["artifact_sha256"], report["installed_sha256"]);
+}
+
+#[test]
+fn two_signed_artifacts_for_one_target_are_not_chosen_between() {
+    // `Manifest` iterates a sorted map, so "the first match" is lexicographic
+    // order: a release carrying both 0.1.0 and 0.2.0 for this target would
+    // otherwise read as "up to date" on 0.1.0 while 0.2.0 sat in the same
+    // signed manifest. That is the failure this command exists to avoid,
+    // reintroduced by map order rather than by parsing a version.
+    let temp = tempfile::tempdir().expect("temp");
+    let home = temp.path().join("home");
+    let dir = release_copy(temp.path());
+    let older = artifact_for_this_target("0.1.0");
+    let newer = artifact_for_this_target("0.2.0");
+    let Some(key) = resign(&dir, &temp.path().join("keys"), &[&older, &newer]) else {
+        return;
+    };
+    record_installed(&home, &dir, &older);
+    let source = serve(dir);
+    configure(&home, &source.address, &key);
+
+    let output = check(&home);
+    assert_eq!(
+        code(&output),
+        2,
+        "neither 0 nor 10: a wrapper branching on those must take neither \
+         branch; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = report(&output);
+    assert_eq!(report["result"], "ambiguous");
+    assert_eq!(
+        report["candidates"].as_array().expect("candidates").len(),
+        2
+    );
+}
+
+#[test]
+fn a_record_that_does_not_name_its_archive_is_not_an_update() {
+    // `update rollback` writes exactly this record. Reporting it as "update
+    // available" would make a cron wrapper reinstall the release the operator
+    // had just rolled away from.
+    let temp = tempfile::tempdir().expect("temp");
+    let home = temp.path().join("home");
+    let dir = release_copy(temp.path());
+    let name = artifact_for_this_target("9.9.9");
+    let Some(key) = resign(&dir, &temp.path().join("keys"), &[&name]) else {
+        return;
+    };
+    let state = home.join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    std::fs::write(
+        state.join("installed-generation.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "danso.installed-generation.v1",
+            "version": "9.9.9",
+            "binary_sha256": "0".repeat(64),
+            "installed_at": chrono::Utc::now().to_rfc3339(),
+            "source": "release",
+        }))
+        .expect("record"),
+    )
+    .expect("write the record");
+    let source = serve(dir);
+    configure(&home, &source.address, &key);
+
+    let output = check(&home);
+    assert_eq!(
+        code(&output),
+        0,
+        "acting on 'cannot tell' is the fail-open this command avoids; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(report(&output)["result"], "unknown");
+}
+
+#[test]
+fn a_corrupt_generation_record_is_an_error_not_an_absence() {
+    let temp = tempfile::tempdir().expect("temp");
+    let home = temp.path().join("home");
+    let dir = release_copy(temp.path());
+    let name = artifact_for_this_target("9.9.9");
+    let Some(key) = resign(&dir, &temp.path().join("keys"), &[&name]) else {
+        return;
+    };
+    let state = home.join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    std::fs::write(state.join("installed-generation.json"), b"not json").expect("corrupt");
+    let source = serve(dir);
+    configure(&home, &source.address, &key);
+
+    let output = check(&home);
+    assert_eq!(
+        code(&output),
+        2,
+        "the only evidence of what this node runs is damaged; saying \
+         'update available' every tick hides that"
     );
 }
 
