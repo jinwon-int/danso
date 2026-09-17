@@ -14,7 +14,81 @@
 //! to block the next start. (Operator decision 2026-09-16, #118.)
 
 use crate::probe;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Marker a stop leaves while it is in progress.
+pub const STOP_MARKER_FILE: &str = "stopping.json";
+pub const STOP_MARKER_SCHEMA: &str = "danso.service.stopping.v1";
+
+/// How long after it was written a marker still explains a death.
+///
+/// Bounded so a stop that was itself killed cannot silence a real crash for
+/// the rest of the installation's life. The window is the whole stop budget
+/// plus slack for the supervisor to notice.
+pub const STOP_MARKER_MAX_AGE_SECS: i64 = DEFAULT_GRACE_SECS as i64 + 30;
+
+/// Written by `service stop`, read by supervision.
+///
+/// `service stop` escalates to `SIGKILL` when the grace budget runs out, and a
+/// kill is indistinguishable from a crash by signal alone. The marker is how
+/// the supervisor knows which one it just watched — it names the pid, so a
+/// leftover marker cannot explain away the death of anything else.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopMarker {
+    pub schema: String,
+    pub pid: u32,
+    pub at: String,
+}
+
+/// Remove the marker when the stop ends, however it ends.
+#[must_use = "the marker is removed when this is dropped"]
+pub struct StopMarkerGuard {
+    path: PathBuf,
+}
+
+impl Drop for StopMarkerGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Announce that `pid` is being stopped on purpose.
+pub fn begin_stop(data_dir: &Path, pid: u32) -> Result<StopMarkerGuard> {
+    let path = data_dir.join(STOP_MARKER_FILE);
+    let marker = StopMarker {
+        schema: STOP_MARKER_SCHEMA.to_string(),
+        pid,
+        at: chrono::Utc::now().to_rfc3339(),
+    };
+    let payload = serde_json::to_vec(&marker).context("serialize the stop marker")?;
+    std::fs::write(&path, payload).context("write the stop marker")?;
+    Ok(StopMarkerGuard { path })
+}
+
+/// Whether a deliberate stop of `pid` is under way.
+///
+/// A marker for another pid, an unreadable one, or one older than
+/// [`STOP_MARKER_MAX_AGE_SECS`] does not count: it would otherwise turn every
+/// later crash into a silent shutdown.
+pub fn stop_in_progress(data_dir: &Path, pid: u32, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let Ok(raw) = std::fs::read(data_dir.join(STOP_MARKER_FILE)) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_slice::<StopMarker>(&raw) else {
+        return false;
+    };
+    if marker.pid != pid {
+        return false;
+    }
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(&marker.at) else {
+        return false;
+    };
+    let age = (now - at.with_timezone(&chrono::Utc)).num_seconds();
+    (0..=STOP_MARKER_MAX_AGE_SECS).contains(&age)
+}
 
 /// The inner budget: how long an active turn may keep running after SIGTERM.
 pub const TURN_DRAIN_SECS: u64 = 45;
@@ -165,6 +239,70 @@ fn decide(
         StopOutcome::Survived
     } else {
         StopOutcome::Killed
+    }
+}
+
+#[cfg(test)]
+mod stop_marker_tests {
+    use super::*;
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+
+    #[test]
+    fn a_marker_explains_the_death_of_the_pid_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = begin_stop(dir.path(), 4242).unwrap();
+        assert!(stop_in_progress(dir.path(), 4242, now()));
+        // Not any other process. A stop of one service must not silence the
+        // crash of another.
+        assert!(!stop_in_progress(dir.path(), 4243, now()));
+        drop(guard);
+        assert!(
+            !stop_in_progress(dir.path(), 4242, now()),
+            "the marker is gone once the stop is over"
+        );
+    }
+
+    #[test]
+    fn a_marker_that_outlived_its_stop_explains_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STOP_MARKER_FILE);
+        let stale = StopMarker {
+            schema: STOP_MARKER_SCHEMA.to_string(),
+            pid: 4242,
+            at: (now() - chrono::Duration::seconds(STOP_MARKER_MAX_AGE_SECS + 1)).to_rfc3339(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(
+            !stop_in_progress(dir.path(), 4242, now()),
+            "a stop that was itself killed must not silence every later crash"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_or_absent_marker_is_not_a_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!stop_in_progress(dir.path(), 1, now()));
+        std::fs::write(dir.path().join(STOP_MARKER_FILE), b"not json").unwrap();
+        assert!(!stop_in_progress(dir.path(), 1, now()));
+    }
+
+    #[test]
+    fn a_marker_from_the_future_is_not_a_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let ahead = StopMarker {
+            schema: STOP_MARKER_SCHEMA.to_string(),
+            pid: 7,
+            at: (now() + chrono::Duration::seconds(60)).to_rfc3339(),
+        };
+        std::fs::write(
+            dir.path().join(STOP_MARKER_FILE),
+            serde_json::to_vec(&ahead).unwrap(),
+        )
+        .unwrap();
+        assert!(!stop_in_progress(dir.path(), 7, now()));
     }
 }
 
