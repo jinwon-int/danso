@@ -28,7 +28,9 @@ use std::{
 
 pub const BOT_TOKEN_ENV: &str = "DANSO_TELEGRAM_BOT_TOKEN";
 pub const ALLOWED_USER_IDS_ENV: &str = "DANSO_TELEGRAM_ALLOWED_USER_IDS";
-pub const DATA_DIR_ENV: &str = "DANSO_TELEGRAM_DATA_DIR";
+/// Re-exported, not redefined: `danso-ops` writes this name into the systemd
+/// unit, and a second copy here is how the two drift apart.
+pub use danso_ops::unit::DATA_DIR_ENV;
 pub const DEFAULT_DATA_DIR_SUFFIX: &str = ".danso/telegram";
 pub const WORKSPACE_ENV: &str = "DANSO_TELEGRAM_WORKSPACE";
 pub const PROVIDER_ENV: &str = "DANSO_TELEGRAM_PROVIDER";

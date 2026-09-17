@@ -87,12 +87,27 @@ pub struct UnitSpec {
     pub path_env: String,
 }
 
+/// The variable a service publishes its state root through.
+///
+/// The renderer writes it into the unit and the root package reads it back, so
+/// it is defined once here rather than in each. Two copies of a name that has
+/// to match is the same shape of bug as the one this export fixes.
+pub const DATA_DIR_ENV: &str = "DANSO_TELEGRAM_DATA_DIR";
+
 impl UnitSpec {
     /// Render the unit file.
     ///
     /// Deterministic: the same spec always produces byte-identical output. That
     /// is what makes `reconcile` able to detect drift by comparison rather than
     /// by parsing.
+    ///
+    /// The state root is published **twice**: as `--data-dir` for the process
+    /// and as `DANSO_TELEGRAM_DATA_DIR` for everything that has to ask the
+    /// installation about itself afterwards. Measured on yukson 2026-09-17
+    /// (#118): with only the argument, `fleet-bridge-watch.sh` ran
+    /// `danso service status --json` with no way to learn the directory, got
+    /// `unavailable`, and reported a serving node as `AVAIL=no` — the
+    /// false-DOWN class the watch exists to prevent.
     pub fn render(&self) -> String {
         format!(
             "[Unit]\n\
@@ -104,6 +119,7 @@ impl UnitSpec {
              WorkingDirectory={working_directory}\n\
              Environment=HOME={home}\n\
              Environment=PATH={path_env}\n\
+             Environment={data_dir_env}={data_dir}\n\
              ExecStart={exe} service run --data-dir {data_dir}\n\
              UMask={umask}\n\
              Restart=always\n\
@@ -117,6 +133,7 @@ impl UnitSpec {
             home = self.home.display(),
             path_env = self.path_env,
             exe = self.exe.display(),
+            data_dir_env = DATA_DIR_ENV,
             data_dir = self.data_dir.display(),
             umask = UMASK,
             restart_sec = RESTART_SEC,
@@ -354,6 +371,36 @@ mod tests {
     }
 
     #[test]
+    fn the_unit_publishes_the_state_root_to_anything_that_asks_later() {
+        let rendered = spec(Scope::System).render();
+        assert!(
+            rendered.contains("Environment=DANSO_TELEGRAM_DATA_DIR=/root/.danso/telegram\n"),
+            "the state root has to be readable from the unit, not only passed \
+             as an argument: `fleet-bridge-watch.sh` runs `danso service \
+             status --json` with no arguments and no other way to learn the \
+             directory. Measured on yukson 2026-09-17 (#118), a serving node \
+             reported AVAIL=no without this line.\n{rendered}"
+        );
+        // Both, and they have to agree. The argument is what the process uses;
+        // the variable is what everything else reads.
+        assert!(
+            rendered.contains("--data-dir /root/.danso/telegram\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_exported_name_is_the_one_the_binary_reads() {
+        assert_eq!(DATA_DIR_ENV, "DANSO_TELEGRAM_DATA_DIR");
+        assert!(
+            spec(Scope::System)
+                .render()
+                .contains(&format!("Environment={DATA_DIR_ENV}=")),
+            "the unit must export the same name the binary resolves from"
+        );
+    }
+
+    #[test]
     fn the_unit_snapshot_is_stable() {
         // A full snapshot so any field change has to be an intentional edit
         // here, not an unnoticed side effect.
@@ -368,6 +415,7 @@ mod tests {
              WorkingDirectory=/root/.danso\n\
              Environment=HOME=/root\n\
              Environment=PATH=/usr/local/bin:/usr/bin:/bin\n\
+             Environment=DANSO_TELEGRAM_DATA_DIR=/root/.danso/telegram\n\
              ExecStart=/usr/local/bin/danso service run --data-dir /root/.danso/telegram\n\
              UMask=0077\n\
              Restart=always\n\
