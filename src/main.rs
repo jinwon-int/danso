@@ -193,6 +193,138 @@ fn main() {
                     }
                 }
             }
+            ServiceCommand::Restart {
+                data_dir,
+                user,
+                delay_secs,
+                wait,
+                json,
+            } => {
+                let scheduled = match danso::service::restart(data_dir.clone(), user, delay_secs) {
+                    Ok(scheduled) => scheduled,
+                    Err(error) => {
+                        // Body-free: the code is the whole message. A restart
+                        // that was not scheduled has not happened, and the
+                        // service is still running.
+                        if json {
+                            println!("{}", serde_json::json!({"error": error.code()}));
+                        }
+                        eprintln!(
+                            "service restart not scheduled: {} (the service is still running)",
+                            error.code()
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                if !wait {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&scheduled).expect("serializable")
+                        );
+                    } else {
+                        println!(
+                            "Restart {} scheduled in {}s",
+                            &scheduled.request_id[..8],
+                            scheduled.delay_seconds
+                        );
+                    }
+                    return;
+                }
+                // Only a caller outside the unit can do this; the process this
+                // restart replaces would be killed partway through the wait.
+                let deadline = std::time::Instant::now()
+                    + Duration::from_secs(danso_ops::handoff::wait_budget_seconds(
+                        scheduled.delay_seconds,
+                    ));
+                while std::time::Instant::now() < deadline {
+                    match danso::service::restart_status(data_dir.clone(), user) {
+                        // This request's answer, not whatever answer is
+                        // current: a receipt from an earlier request would
+                        // otherwise be reported as this one's outcome and then
+                        // archived, losing both.
+                        Ok(Some(receipt))
+                            if receipt.request_id == scheduled.request_id
+                                && receipt.state.is_terminal() =>
+                        {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string(&receipt).expect("serializable")
+                                );
+                            } else {
+                                println!("{}", receipt.summary());
+                            }
+                            let code = match receipt.state {
+                                danso_ops::handoff::State::Completed => 0,
+                                _ => 1,
+                            };
+                            // Delivered, so file it away — after printing, and
+                            // only this request's. Leaving it would block the
+                            // next restart forever.
+                            let _ = danso::service::acknowledge_restart(
+                                data_dir,
+                                user,
+                                &scheduled.request_id,
+                            );
+                            std::process::exit(code);
+                        }
+                        _ => std::thread::sleep(Duration::from_secs(1)),
+                    }
+                }
+                eprintln!("service restart: no result within the budget");
+                std::process::exit(3);
+            }
+            ServiceCommand::RestartWorker {
+                data_dir,
+                request_id,
+                user_scope,
+            } => {
+                std::process::exit(danso::service::restart_worker(
+                    data_dir, request_id, user_scope,
+                ));
+            }
+            ServiceCommand::RestartStatus {
+                data_dir,
+                acknowledge,
+                json,
+            } => match danso::service::restart_status(data_dir.clone(), false) {
+                Ok(Some(receipt)) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&receipt).expect("serializable"));
+                    } else {
+                        println!("{}", receipt.summary());
+                    }
+                    // Archive only after the answer has been delivered: doing
+                    // it first means a closed pipe destroys the only copy.
+                    if acknowledge
+                        && let Err(error) = danso::service::acknowledge_restart(
+                            data_dir,
+                            false,
+                            &receipt.request_id,
+                        )
+                    {
+                        eprintln!("service restart-status: not archived: {error}");
+                        std::process::exit(3);
+                    }
+                    std::process::exit(match receipt.state {
+                        danso_ops::handoff::State::Failed => 1,
+                        _ => 0,
+                    });
+                }
+                Ok(None) => {
+                    if json {
+                        println!("{}", serde_json::json!({"receipt": null}));
+                    } else {
+                        println!("No restart to report");
+                    }
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("service restart-status failed: {error}");
+                    std::process::exit(3);
+                }
+            },
         }
     }
     // `update` is state inspection in this slice: read-only, offline, and no
