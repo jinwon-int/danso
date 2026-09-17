@@ -14,7 +14,9 @@
 
 pub mod activate;
 pub mod generation;
+pub mod handoff;
 pub mod health;
+pub mod idle;
 pub mod install;
 pub mod pidfile;
 pub mod probe;
@@ -26,6 +28,8 @@ pub mod unit;
 pub mod update;
 
 pub use activate::{Activation, Serving};
+pub use handoff::{HandoffError, Receipt, Scheduled};
+pub use idle::{BusyReason, Gate, Proceeding};
 pub use install::{ApplyError, ApplyPlan, ApplyReport};
 pub use release::{Manifest, verify_artifact, verify_manifest};
 pub use status::{ServiceState, StatusOutcome, StatusReport};

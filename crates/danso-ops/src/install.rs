@@ -828,6 +828,14 @@ struct LogLine<'a> {
     replaced: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
+    // Idle-gate counts. Omitted on every other event, so the schema is
+    // unchanged for existing readers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_requests: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_request_age_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waited_seconds: Option<i64>,
 }
 
 pub const UPDATE_LOG_SCHEMA: &str = "danso.self-update.log.v1";
@@ -852,6 +860,44 @@ pub(crate) fn log_event(
             previous_sha256: report.and_then(|r| r.previous_sha256.as_deref()),
             replaced: report.map(|r| r.replaced),
             reason,
+            active_requests: None,
+            oldest_request_age_seconds: None,
+            waited_seconds: None,
+        },
+    );
+}
+
+/// Record what the idle gate decided.
+///
+/// Every attempt gets a line, including one that never started: a node sitting
+/// several generations behind is diagnosed from this log, and a deferral that
+/// leaves nothing behind makes "the service was busy every time" and "the
+/// updater never ran" look identical. ccc logs the same two events
+/// (`deferred reason=bridge-busy …` and `proceed reason=defer-cap-exceeded …`)
+/// for the same reason.
+///
+/// `event` is a fixed token from [`crate::idle::Gate::log_event`] and the two
+/// numbers are counts, so the line stays body-free.
+pub fn log_gate(
+    danso_home: &Path,
+    event: &'static str,
+    busy: Option<crate::idle::BusyReason>,
+    waited_seconds: Option<i64>,
+) {
+    log_line(
+        danso_home,
+        LogLine {
+            schema: UPDATE_LOG_SCHEMA,
+            at: chrono::Utc::now().to_rfc3339(),
+            event,
+            version: None,
+            target_sha256: None,
+            previous_sha256: None,
+            replaced: None,
+            reason: None,
+            active_requests: busy.map(|busy| busy.active),
+            oldest_request_age_seconds: busy.map(|busy| busy.oldest_seconds),
+            waited_seconds,
         },
     );
 }
@@ -879,6 +925,9 @@ pub(crate) fn log_generation_event(
             previous_sha256,
             replaced: None,
             reason: None,
+            active_requests: None,
+            oldest_request_age_seconds: None,
+            waited_seconds: None,
         },
     );
 }

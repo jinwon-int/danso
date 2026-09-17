@@ -66,9 +66,26 @@ pub enum UpdateCommand {
         /// Units this activation expects to restart. Repeatable.
         #[arg(long = "service", value_name = "UNIT")]
         services: Vec<String>,
+        /// Where `health.json` lives; defaults to the service data directory.
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        /// Install even while the service is serving a turn. This kills the
+        /// turn in flight; the gate exists so that is a decision, not an
+        /// accident.
+        #[arg(long)]
+        force: bool,
         #[arg(long)]
         json: bool,
     },
+}
+
+/// What `apply` did, or declined to do.
+///
+/// A deferral is not a failure — nothing was read, locked or written — so it
+/// is an `Ok` outcome with its own exit code rather than an `ApplyError`.
+pub enum Applied {
+    Installed(install::ApplyReport),
+    Deferred(danso_ops::idle::Gate),
 }
 
 /// Install a verified release over `$DANSO_HOME/bin/danso`.
@@ -82,10 +99,64 @@ pub fn apply(
     artifact_dir: &Path,
     artifact: &str,
     services: Vec<String>,
-) -> Result<install::ApplyReport, install::ApplyError> {
+    data_dir: Option<PathBuf>,
+    force: bool,
+) -> Result<Applied, install::ApplyError> {
     let home = crate::config::home()
         .context("DANSO_HOME")
         .map_err(install::ApplyError::Failed)?;
+
+    // The gate comes first, before the key, before `tar`, before the lock:
+    // a deferred run must leave no trace that it considered running, and
+    // holding the update lock while deferring would block a concurrent
+    // `activate` for no reason. Same resolver as `activate`, so the two
+    // cannot disagree about which health document describes this service.
+    let health = crate::service::resolve_data_dir(data_dir)
+        .ok()
+        .map(|dir| dir.join(danso_ops::health::HEALTH_FILE_NAME));
+    let gate = danso_ops::idle::check(
+        &danso_ops::update::state_dir(&home),
+        health.as_deref(),
+        force,
+        chrono::Utc::now(),
+    );
+    // An attempt that never started still gets a log line. A node several
+    // generations behind is diagnosed from this file, and a silent deferral
+    // makes "busy every time" and "the updater never ran" identical.
+    match &gate {
+        danso_ops::idle::Gate::Deferred {
+            reason,
+            waited_seconds,
+        } => {
+            install::log_gate(
+                &home,
+                gate.log_event(),
+                Some(*reason),
+                Some(*waited_seconds),
+            );
+            return Ok(Applied::Deferred(gate));
+        }
+        danso_ops::idle::Gate::Proceed(danso_ops::idle::Proceeding::Idle) => {}
+        danso_ops::idle::Gate::Proceed(proceeding) => {
+            let (busy, waited) = match proceeding {
+                danso_ops::idle::Proceeding::BudgetExhausted {
+                    busy,
+                    waited_seconds,
+                } => (Some(*busy), Some(*waited_seconds)),
+                danso_ops::idle::Proceeding::Untrackable { busy } => (Some(*busy), None),
+                danso_ops::idle::Proceeding::Forced { busy } => (*busy, None),
+                danso_ops::idle::Proceeding::Idle => (None, None),
+            };
+            install::log_gate(&home, gate.log_event(), busy, waited);
+            // The one case where the gate knowingly does what it exists to
+            // prevent has to be said out loud. stderr, so a `--json` consumer's
+            // document shape is unchanged.
+            if gate.overrides_a_live_turn() {
+                eprintln!("warning: {}", gate.summary());
+            }
+        }
+    }
+
     let key = configured_public_key(&home).map_err(install::ApplyError::Failed)?;
     if !install::tar_available() {
         return Err(install::ApplyError::Failed(anyhow::anyhow!(
@@ -99,6 +170,7 @@ pub fn apply(
         danso_home: &home,
         services,
     })
+    .map(Applied::Installed)
 }
 
 /// Resolve an outstanding activation.

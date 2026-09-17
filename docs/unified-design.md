@@ -432,8 +432,23 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
 - `danso update --check` / `--apply`: 다운로드 → 해시·서명 검증(실패 시 exit 13,
   우회 없음) → 임시 경로에 풀고 `--version` 실행 검증 → 원자적 rename → 서비스
   모드면 §6.4 핸드오프로 재시작 → `state/self-update.log`(JSONL, 본문 없음) +
-  스풀 알림. 유휴 게이트: `health.json`의 `turn_occupancy`가 90초 내
-  `idle`일 때만, 최대 1시간 연기(fail-open은 ccc와 동일하게 유지).
+  스풀 알림.
+- 유휴 게이트(`danso-ops::idle`, ccc `bridge_is_busy` 이식): `health.json`의
+  `workload.active_requests`와 `oldest_request_age_seconds`를 읽고, 문서
+  신선도는 **최상위 `updated_at`이 90초 이내**인지로 본다. **`turn_occupancy`는
+  읽지 않는다** — 그건 같은 상태를 `status`·doctor용으로 렌더한 것이고,
+  게이트가 그걸 근거로 삼으면 한 사실에 정본이 둘이 된다(ccc 원본도 읽지
+  않으며, 그 테스트 픽스처가 두 스칼라만 쓴다). busy는 `신선 ∧ active>0 ∧
+  oldest < 1800초`이고, **1800초 상한**이 없으면 멈춘 턴 하나가 업데이트를
+  굶긴다. 연기는 마커 파일에 누적해 최대 1시간이며, 예산이 소진되면 busy여도
+  **진행한다**. 모르는 모든 경우(문서 없음·못 읽음·깨진 JSON·필드 없음·낡음)는
+  fail-open — 게이트는 안전 속성이 아니라 흔한 경우를 위한 최적화이고,
+  파일 하나가 업데이트를 영구히 막는 쪽이 더 나쁘다. 핸드오프(§6.4)가
+  fail-**closed**인 것과 방향이 반대이며, 둘 다 의도된 것이다.
+  연기 종료 코드는 **8**(ccc와 동일, cron이 정상 틱으로 취급).
+  문서는 교체 대상인 **옛 세대**가 쓴 것이므로 스키마는 느슨하게 읽는다 —
+  엄격히 파싱하면 스키마 추가가 파싱 실패가 되고, 파싱 실패는 fail-open이라
+  하필 지켜야 할 턴을 죽인다.
 - 소스 빌드 모드(`--from-git`): Termux 등 바이너리가 없는 대상용. 태그의
   서명(`git verify-tag`, 외부 `git`/`gpg` 필요)을 검증하고 `cargo build --locked`.
   이 모드는 선택이며 "Rust 재구현 완료" 판정에 포함하지 않는다.
@@ -491,7 +506,32 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
 - `danso bridge` 프로세스는 **자기 유닛을 직접 재시작하지 않는다**.
   `/restart`·update는 `systemd-run --on-active=<delay>`로 별도 cgroup의 일회성
   유닛을 만들어 그 유닛이 `systemctl restart`를 수행하고 본문 없는 영수증을
-  남긴다(ccc `restart_handoff` 불변조건).
+  남긴다(ccc `restart_handoff` 불변조건). 구현은 `danso-ops::handoff`,
+  진입점은 `danso service restart` / `restart-status`(+ 숨김 `restart-worker`).
+  - **fail-closed 양방향**(유휴 게이트와 반대): 영수증을 못 쓰면 타이머를 만들지
+    않고, 타이머를 못 만들면 영수증을 지운다. `systemctl restart`·`kill`·재exec
+    폴백은 없다 — 그 셋이 이 모듈이 막으려는 버그 그 자체다. systemd가 없으면
+    (Termux) 예약이 그냥 실패하고, 그 플랫폼은 `run --supervise`로 재시작한다.
+  - **영수증이 곧 뮤텍스**: 아직 읽히지 않은 종료 영수증은 새 요청을 **무기한**
+    막는다(답을 잃는 쪽이 재시작을 거절하는 쪽보다 나쁘다). 진행 중인 것은
+    `ACTIVE_TTL_SECONDS`(300초)까지만 막아, 멈춘 워커가 문을 영원히 잡지 못한다.
+  - **완료 판정은 §6.3과 같은 규칙**: "유닛이 재시작됐다"는 증거가 아니다
+    (#1527). 요청보다 **뒤에** 쓰였고, `service.state=available`이고,
+    `MainPID`가 **재시작 직전 그 유닛의 MainPID와 다른** health 문서만 완료로
+    친다. 기준점은 워커가 재시작 전에 읽은 **유닛 자신의 pid**이지 요청자의
+    pid가 아니다 — ccc는 요청자가 곧 브리지라 둘이 일치하지만, 여기서는
+    요청자가 대개 짧게 사는 CLI라 그 pid를 유닛이 가진 적이 없고, 그걸 비교하면
+    **항상 참이 되어 증명이 공허해진다**(적대적 리뷰 F1).
+  - `--data-dir`는 **절대 경로만** 받는다(`relative_data_dir`). transient
+    유닛의 working directory는 `/`라 상대 경로는 다른 곳을 가리키고, 워커는
+    영수증을 못 찾고 조용히 끝나며, 운영자는 예약됐다고 들은 채 5분간 막힌다.
+  - **`--timer-property=AccuracySec=1s`가 load-bearing.** systemd 기본
+    `AccuracySec`은 **1분**이라 `--on-active=5s`는 하한일 뿐이다. yukson
+    2026-09-17 실측: 5초로 요청한 핸드오프가 **18초** 뒤 발화했고
+    `systemctl show -p AccuracyUSec`가 `1min`을 보고했다. 수정 후 3회 연속
+    5~6초. 대기 예산은 `delay + accuracy + health deadline + 여유`로 계산한다
+    (`handoff::wait_budget_seconds`) — delay만으로 예산을 짜면 재시작이 오는
+    도중에 포기한다.
 - systemd가 없는 환경(Termux): `danso service run --supervise`가 포그라운드
   감시 루프를 제공한다. crash policy는 60초 내 5회 급속 크래시면 중단.
   **시그널 사망은 그 자체로 정상 종료가 아니다** — SIGTERM·SIGINT·SIGHUP만
