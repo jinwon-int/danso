@@ -225,6 +225,48 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            UpdateCommand::Activate {
+                data_dir,
+                retry,
+                json,
+            } => match danso::update::activate(data_dir, retry) {
+                Ok(outcome) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&outcome).expect("serializable"));
+                    } else {
+                        println!("{}", outcome.summary());
+                    }
+                    std::process::exit(outcome.exit_code());
+                }
+                Err(_) => {
+                    // Body-free: an unreadable record or a contended lock must
+                    // not echo `DANSO_HOME` or filesystem text. The `snapshot`
+                    // field in a `--json` report is a deliberate exception —
+                    // it is the path an operator has to be told about.
+                    eprintln!("update activate failed: state unavailable");
+                    std::process::exit(2);
+                }
+            },
+            UpdateCommand::Rollback { services, json } => match danso::update::rollback(services) {
+                Ok(report) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&report).expect("serializable"));
+                    } else {
+                        println!("restored {} ({})", report.version, report.target_sha256);
+                    }
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"error": error.reason(), "exit_code": error.exit_code()})
+                        );
+                    }
+                    eprintln!("update rollback failed: {}", error.reason());
+                    std::process::exit(error.exit_code());
+                }
+            },
             UpdateCommand::Apply {
                 artifact_dir,
                 artifact,

@@ -34,6 +34,26 @@ pub enum UpdateCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Resolve an outstanding activation by checking which image is serving.
+    /// Exits 1 if the replacement is not serving and 3 if that cannot be told.
+    Activate {
+        /// Where `health.json` lives; defaults to the service data directory.
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        /// Judge again even if the activation is already recorded as failed.
+        #[arg(long)]
+        retry: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Put `bin/danso.prev` back, recording the swap before performing it.
+    Rollback {
+        /// Units this activation expects to restart. Repeatable.
+        #[arg(long = "service", value_name = "UNIT")]
+        services: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Install a signed release from a local directory. Exits 13 if it does
     /// not verify, and there is no flag that skips the check.
     Apply {
@@ -79,6 +99,35 @@ pub fn apply(
         danso_home: &home,
         services,
     })
+}
+
+/// Resolve an outstanding activation.
+///
+/// The health document is the one `service status` reads, resolved through the
+/// same helper: two resolvers would eventually look at two different files and
+/// disagree about what is serving.
+pub fn activate(data_dir: Option<PathBuf>, retry: bool) -> Result<danso_ops::Activation> {
+    let home = crate::config::home().context("DANSO_HOME")?;
+    // A CLI-only installation has no service data directory, and requiring one
+    // would make `activate` unusable exactly where it is simplest. An
+    // unresolvable directory becomes "no health evidence", which a record that
+    // names services reports as `unverified` rather than as a failure.
+    let health = crate::service::resolve_data_dir(data_dir)
+        .ok()
+        .map(|dir| dir.join("health.json"));
+    let now = chrono::Utc::now();
+    match retry {
+        true => danso_ops::activate::retry(&home, health.as_deref(), now),
+        false => danso_ops::activate::activate(&home, health.as_deref(), now),
+    }
+}
+
+/// Put the previous binary back.
+pub fn rollback(services: Vec<String>) -> Result<install::RollbackReport, install::ApplyError> {
+    let home = crate::config::home()
+        .context("DANSO_HOME")
+        .map_err(install::ApplyError::Failed)?;
+    install::rollback(&home, services)
 }
 
 /// The release key this installation trusts.

@@ -12,6 +12,7 @@
 //! * The kernel lock, not the presence of a file, is the ownership signal.
 //! * A zombie has exited and cannot poll or hold a lock, so it is not live.
 
+pub mod activate;
 pub mod generation;
 pub mod health;
 pub mod install;
@@ -24,6 +25,7 @@ pub mod supervise;
 pub mod unit;
 pub mod update;
 
+pub use activate::{Activation, Serving};
 pub use install::{ApplyError, ApplyPlan, ApplyReport};
 pub use release::{Manifest, verify_artifact, verify_manifest};
 pub use status::{ServiceState, StatusOutcome, StatusReport};

@@ -85,6 +85,9 @@ pub const ARCHIVE_MEMBER: &str = "danso";
 
 /// Default time the staged binary gets to answer `--version`.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to keep retrying a probe whose image is still held open for
+/// writing by a descriptor some other thread's child inherited.
+const SPAWN_RETRY_WINDOW: Duration = Duration::from_secs(5);
 /// Hard cap on what the probe may write, enforced with `RLIMIT_FSIZE` so the
 /// kernel stops the child at the limit instead of this module noticing
 /// afterwards that a disk was filled.
@@ -270,7 +273,7 @@ fn apply_verified(plan: &ApplyPlan<'_>, artifact: &[u8]) -> Result<ApplyReport> 
     let staged_bytes = extract_member(&bin_dir, artifact)?;
     let target_sha256 = release::hex_digest(&staged_bytes);
 
-    let installed_now = match fs::read(&target) {
+    let installed_now = match read_no_follow(&target) {
         Ok(bytes) => Some(release::hex_digest(&bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error).context("read the installed binary"),
@@ -280,11 +283,22 @@ fn apply_verified(plan: &ApplyPlan<'_>, artifact: &[u8]) -> Result<ApplyReport> 
     // overwrite the record and the `danso.prev` the outstanding one still needs
     // to roll back to. `update activate` or `update rollback` resolves it; this
     // refuses rather than quietly discarding the evidence.
-    if let Some(pending) = update::read_pending(&state)?
-        && pending.is_unresolved()
-        && pending.target.binary_sha256 != target_sha256
+    if let Some(previous) = update::read_pending(&state)?
+        && previous.target.binary_sha256 != target_sha256
     {
-        bail!("an activation is still outstanding; resolve it before installing another release");
+        match previous.outcome {
+            update::Outcome::Pending => bail!(
+                "an activation is still outstanding; resolve it before installing another release"
+            ),
+            // A failed activation still owns `bin/danso.prev`. Installing over
+            // it would snapshot the binary that just failed on top of the
+            // known-good one, destroying the rollback target at the exact
+            // moment it is the only way back.
+            update::Outcome::Failed => bail!(
+                "the last activation failed; roll back or re-judge it before installing another release"
+            ),
+            update::Outcome::Activated => {}
+        }
     }
 
     // Same directory as the target, so the final step is a rename and not a
@@ -380,6 +394,164 @@ fn apply_verified(plan: &ApplyPlan<'_>, artifact: &[u8]) -> Result<ApplyReport> 
     Ok(report)
 }
 
+// Stop a rollback between its two renames, so the crash window the ordering
+// exists to protect can be observed. The claim "the snapshot moves first so a
+// crash cannot make the record lie" is only checkable from inside that window;
+// asserting the final state passes for either order. Outside tests this
+// compiles to `false` and the branch disappears.
+#[cfg(test)]
+thread_local! {
+    static STOP_AFTER_SNAPSHOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn stop_after_snapshot() -> bool {
+    #[cfg(test)]
+    {
+        STOP_AFTER_SNAPSHOT.with(|flag| flag.replace(false))
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Swap the installed binary back to `bin/danso.prev`.
+///
+/// Rollback is an install in the other direction, so it obeys the same rule:
+/// the pending record is written before anything is swapped, and if it cannot
+/// be written nothing is swapped at all. A rollback nobody recorded is exactly
+/// as unverifiable as an update nobody recorded — `status` would report the
+/// forward activation as still outstanding while a different image served.
+///
+/// The two binaries trade places rather than one being discarded. Whatever was
+/// rolled *out of* becomes the new `danso.prev`, so a rollback is itself
+/// reversible; discarding it would make "roll back, discover the old one was
+/// worse, roll forward" impossible without a fresh download.
+pub fn rollback(danso_home: &Path, services: Vec<String>) -> Result<RollbackReport, ApplyError> {
+    match rollback_inner(danso_home, services) {
+        Ok(report) => {
+            log_generation_event(
+                danso_home,
+                "rolled_back",
+                Some(&report.version),
+                Some(&report.target_sha256),
+                Some(&report.previous_sha256),
+            );
+            Ok(report)
+        }
+        Err(error) => {
+            let error = ApplyError::Failed(error);
+            log_event(danso_home, "rollback_failed", None, Some(error.reason()));
+            Err(error)
+        }
+    }
+}
+
+/// What a rollback did.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RollbackReport {
+    /// The version the restored binary reports.
+    pub version: String,
+    /// Digest of the binary now installed.
+    pub target_sha256: String,
+    /// Digest of the binary that was rolled out of, now the rollback target.
+    pub previous_sha256: String,
+}
+
+fn rollback_inner(danso_home: &Path, services: Vec<String>) -> Result<RollbackReport> {
+    for service in &services {
+        check_unit_name(service)?;
+    }
+    let state = update::state_dir(danso_home);
+    let lock = UpdateLock::acquire(&state)?;
+
+    // Inherit the units from the record being superseded unless the caller
+    // named some. `activate` picks its evidence from this list: a rollback of a
+    // service install that recorded no services would be judged by reading the
+    // file the rollback itself just wrote, which proves nothing.
+    let superseded = update::read_pending(&state)?;
+    let services = match (services.is_empty(), &superseded) {
+        (true, Some(previous)) => previous.services.clone(),
+        _ => services,
+    };
+
+    let target = update::installed_binary(danso_home);
+    let snapshot = update::previous_binary(danso_home);
+    let bin_dir = target
+        .parent()
+        .context("installed binary has no parent directory")?
+        .to_path_buf();
+
+    let restored = read_no_follow(&snapshot).context("no rollback target is available")?;
+    ensure!(!restored.is_empty(), "the rollback target is empty");
+    let outgoing = read_no_follow(&target).context("read the installed binary")?;
+    let target_sha256 = release::hex_digest(&restored);
+    let previous_sha256 = release::hex_digest(&outgoing);
+    ensure!(
+        target_sha256 != previous_sha256,
+        "the rollback target is already installed"
+    );
+
+    // Prove the old binary still runs before trusting it with the position.
+    // "It used to work" is not evidence about the file as it exists now.
+    let staged = bin_dir.join(format!(".danso.rollback.{}", std::process::id()));
+    let staged_guard = TempFile::new(staged.clone());
+    write_new_executable(&staged, &restored).context("stage the rollback target")?;
+    let capture = bin_dir.join(format!(".danso.rollback-probe.{}", std::process::id()));
+    let version = probe_version(&staged, &capture, PROBE_TIMEOUT)
+        .context("the rollback target failed its --version probe")?;
+
+    // Keep the outgoing binary before the swap so the new `danso.prev` is
+    // never missing between the two renames.
+    let keep = bin_dir.join(format!(".danso.rollback-keep.{}", std::process::id()));
+    let keep_guard = TempFile::new(keep.clone());
+    write_new_executable(&keep, &outgoing).context("stage the outgoing binary")?;
+
+    // The invariant, in the other direction.
+    let record = PendingActivation::new(
+        GenerationRef {
+            version: version.clone(),
+            binary_sha256: target_sha256.clone(),
+        },
+        Some(GenerationRef {
+            version: String::new(),
+            binary_sha256: previous_sha256.clone(),
+        }),
+        services,
+        Some(snapshot.display().to_string()),
+    );
+    update::write_pending(&state, &record).context("record the pending activation")?;
+
+    // Snapshot first, then install. A crash between the two leaves
+    // `danso == danso.prev == outgoing`, which is exactly what the record now
+    // says: target not yet installed, previous is the outgoing image, and the
+    // snapshot path holds it. `activate` then reports "not activated", which is
+    // true and actionable. The other order leaves `danso.prev` still holding
+    // the image that was just installed, so the record names a previous
+    // generation that is nowhere on disk — a record that lies is worse than one
+    // that reports unfinished work.
+    fs::rename(&keep, &snapshot).context("keep the rolled-out binary")?;
+    keep_guard.released();
+    if stop_after_snapshot() {
+        bail!("stopped between the snapshot and the install");
+    }
+    fs::rename(&staged, &target).context("restore the previous binary")?;
+    staged_guard.released();
+
+    update::write_installed(
+        &state,
+        &InstalledGeneration::new(version.clone(), target_sha256.clone(), Source::Release),
+    )
+    .context("record the installed generation")?;
+    drop(lock);
+
+    Ok(RollbackReport {
+        version,
+        target_sha256,
+        previous_sha256,
+    })
+}
+
 /// Extract the one expected member, to memory, without letting `tar` touch disk.
 ///
 /// `archive` is the **verified** byte string, re-written to a private path this
@@ -454,7 +626,11 @@ fn run_tar(flags: &[&str], archive: &Path, member: Option<&str>) -> Result<Vec<u
 /// `O_EXCL | O_NOFOLLOW` at a per-process path, and the child runs under
 /// `RLIMIT_FSIZE` so the size cap is enforced by the kernel rather than
 /// discovered afterwards.
-fn probe_version(binary: &Path, capture_path: &Path, timeout: Duration) -> Result<String> {
+pub(crate) fn probe_version(
+    binary: &Path,
+    capture_path: &Path,
+    timeout: Duration,
+) -> Result<String> {
     let capture = TempFile::new(capture_path.to_path_buf());
     let file = create_new_file(capture_path, 0o600).context("create probe capture")?;
     let mut command = std::process::Command::new(binary);
@@ -464,7 +640,7 @@ fn probe_version(binary: &Path, capture_path: &Path, timeout: Duration) -> Resul
         .stdout(std::process::Stdio::from(file))
         .stderr(std::process::Stdio::null());
     limit_output(&mut command, PROBE_OUTPUT_LIMIT);
-    let mut child = command.spawn().context("run the staged binary")?;
+    let mut child = spawn_probe(&mut command)?;
 
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -506,6 +682,37 @@ fn probe_version(binary: &Path, capture_path: &Path, timeout: Duration) -> Resul
     Ok(version.to_string())
 }
 
+/// Spawn the probe, retrying while the image is still held open for writing.
+///
+/// `execve` fails with `ETXTBSY` while *any* process holds a write descriptor
+/// to the file. This module closes its own before probing, but a child forked
+/// by another thread inherits a copy of every open descriptor and keeps it
+/// until its own `exec` — the same fork window that makes the update lock need
+/// a retry. The descriptor is `CLOEXEC`, so the window is short and closes on
+/// its own; failing the whole update because of it would mean a busy host
+/// cannot install a release.
+///
+/// `EAGAIN` is retried for the same reason: a `fork` that could not get a
+/// process slot is a transient condition, not a bad artifact.
+fn spawn_probe(command: &mut std::process::Command) -> Result<std::process::Child> {
+    let deadline = Instant::now() + SPAWN_RETRY_WINDOW;
+    loop {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) => {
+                let transient = matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::ETXTBSY || code == libc::EAGAIN
+                );
+                if !transient || Instant::now() >= deadline {
+                    return Err(error).context("run the staged binary");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 /// Cap what a child may write, so a flooding probe is stopped by the kernel.
 #[cfg(unix)]
 fn limit_output(command: &mut std::process::Command, bytes: u64) {
@@ -528,6 +735,28 @@ fn limit_output(command: &mut std::process::Command, bytes: u64) {
 
 #[cfg(not(unix))]
 fn limit_output(_command: &mut std::process::Command, _bytes: u64) {}
+
+/// Read a file, refusing to follow a symlink at that path.
+///
+/// Every path this module *writes* is `O_EXCL | O_NOFOLLOW`; the paths it
+/// *reads* must be too. `bin/danso.prev` is content that gets installed and
+/// `bin/danso` is content that gets snapshotted, so a link planted at either
+/// turns a write in the bin directory into "copy any file the updater can
+/// read into a 0755 file it can".
+pub(crate) fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
 
 /// Create a file that must not already exist and must not be a symlink.
 fn create_new_file(path: &Path, mode: u32) -> Result<fs::File> {
@@ -564,7 +793,7 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
     write_replacing(path, bytes, 0o600)
 }
 
-fn write_new_executable(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_new_executable(path: &Path, bytes: &[u8]) -> Result<()> {
     write_replacing(path, bytes, 0o755)
 }
 
@@ -574,7 +803,7 @@ fn write_new_executable(path: &Path, bytes: &[u8]) -> Result<()> {
 /// the bytes lets the caller digest what it kept instead of re-reading the
 /// source, which may no longer be the same file.
 fn copy_to_new_executable(from: &Path, to: &Path) -> Result<Vec<u8>> {
-    let bytes = fs::read(from).context("read the binary being replaced")?;
+    let bytes = read_no_follow(from).context("read the binary being replaced")?;
     write_new_executable(to, &bytes)?;
     Ok(bytes)
 }
@@ -606,22 +835,55 @@ pub const UPDATE_LOG_SCHEMA: &str = "danso.self-update.log.v1";
 /// Append to the log. Never fails an apply: the log is evidence, not a gate,
 /// and losing the ability to write it must not be a reason to leave a
 /// half-finished install behind.
-fn log_event(
+pub(crate) fn log_event(
     danso_home: &Path,
     event: &str,
     report: Option<&ApplyReport>,
     reason: Option<&'static str>,
 ) {
-    let line = LogLine {
-        schema: UPDATE_LOG_SCHEMA,
-        at: chrono::Utc::now().to_rfc3339(),
-        event,
-        version: report.map(|r| r.version.as_str()),
-        target_sha256: report.map(|r| r.target_sha256.as_str()),
-        previous_sha256: report.and_then(|r| r.previous_sha256.as_deref()),
-        replaced: report.map(|r| r.replaced),
-        reason,
-    };
+    log_line(
+        danso_home,
+        LogLine {
+            schema: UPDATE_LOG_SCHEMA,
+            at: chrono::Utc::now().to_rfc3339(),
+            event,
+            version: report.map(|r| r.version.as_str()),
+            target_sha256: report.map(|r| r.target_sha256.as_str()),
+            previous_sha256: report.and_then(|r| r.previous_sha256.as_deref()),
+            replaced: report.map(|r| r.replaced),
+            reason,
+        },
+    );
+}
+
+/// Log an event that names a generation but is not an apply.
+///
+/// The digests are the point. A line that says only `activation_failed` leaves
+/// nobody able to say *which* generation failed once the record it referred to
+/// has been superseded, and superseding it is the next thing an operator does.
+pub(crate) fn log_generation_event(
+    danso_home: &Path,
+    event: &str,
+    version: Option<&str>,
+    target_sha256: Option<&str>,
+    previous_sha256: Option<&str>,
+) {
+    log_line(
+        danso_home,
+        LogLine {
+            schema: UPDATE_LOG_SCHEMA,
+            at: chrono::Utc::now().to_rfc3339(),
+            event,
+            version,
+            target_sha256,
+            previous_sha256,
+            replaced: None,
+            reason: None,
+        },
+    );
+}
+
+fn log_line(danso_home: &Path, line: LogLine<'_>) {
     let Ok(mut encoded) = serde_json::to_string(&line) else {
         return;
     };
@@ -660,13 +922,13 @@ const LOCK_WAIT: Duration = Duration::from_secs(2);
 ///
 /// The lock is released when the file closes, including on a crash, so a
 /// killed updater never leaves the next one wedged.
-struct UpdateLock {
+pub(crate) struct UpdateLock {
     #[allow(dead_code)]
     file: fs::File,
 }
 
 impl UpdateLock {
-    fn acquire(state_dir: &Path) -> Result<Self> {
+    pub(crate) fn acquire(state_dir: &Path) -> Result<Self> {
         fs::create_dir_all(state_dir).context("create state directory")?;
         let path = state_dir.join(UPDATE_LOCK_FILE);
         let file = fs::OpenOptions::new()
@@ -701,17 +963,17 @@ impl UpdateLock {
 /// A staged binary left behind after a failure is a file that looks installable
 /// and is not; on the success path the rename consumes it and there is nothing
 /// to remove.
-struct TempFile {
+pub(crate) struct TempFile {
     path: PathBuf,
     active: bool,
 }
 
 impl TempFile {
-    fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self { path, active: true }
     }
 
-    fn released(mut self) {
+    pub(crate) fn released(mut self) {
         self.active = false;
     }
 }
@@ -1438,6 +1700,351 @@ mod tests {
         if tar_available() {
             assert!(apply(&fixture.plan(OK_NAME)).is_ok());
         }
+    }
+
+    #[test]
+    fn a_rollback_restores_the_snapshot_and_keeps_the_outgoing_binary() {
+        require_tar();
+        let fixture = Fixture::new();
+        let old = fixture.install_marker("#!/bin/sh\necho 'danso 0.0.1'\n");
+        let applied = apply(&fixture.plan(OK_NAME)).unwrap();
+        assert_eq!(applied.previous_sha256.as_deref(), Some(old.as_str()));
+
+        let report = rollback(&fixture.home, vec![]).unwrap();
+        assert_eq!(report.target_sha256, old, "the old binary is back");
+        assert_eq!(report.previous_sha256, applied.target_sha256);
+        assert_eq!(report.version, "0.0.1");
+        assert_eq!(
+            release::hex_digest(&fs::read(fixture.target()).unwrap()),
+            old
+        );
+        assert_eq!(
+            release::hex_digest(&fs::read(update::previous_binary(&fixture.home)).unwrap()),
+            applied.target_sha256,
+            "the binary that was rolled out of becomes the new rollback target, \
+             so the rollback is itself reversible"
+        );
+        assert!(fixture.strays().is_empty(), "{:?}", fixture.strays());
+    }
+
+    #[test]
+    fn a_rollback_records_a_pending_activation_of_its_own() {
+        require_tar();
+        let fixture = Fixture::new();
+        fixture.install_marker("#!/bin/sh\necho 'danso 0.0.1'\n");
+        apply(&fixture.plan(OK_NAME)).unwrap();
+        // Rollback is the remedy for a bad activation, so it deliberately
+        // does *not* require the outstanding one to be resolved first.
+        let report = rollback(&fixture.home, vec![]).unwrap();
+        let pending = update::read_pending(&fixture.state()).unwrap().unwrap();
+        assert!(
+            pending.is_unresolved(),
+            "a rollback nobody recorded is exactly as unverifiable as an \
+             update nobody recorded"
+        );
+        assert_eq!(pending.target.binary_sha256, report.target_sha256);
+        assert_eq!(
+            pending.previous.unwrap().binary_sha256,
+            report.previous_sha256
+        );
+    }
+
+    #[test]
+    fn a_rollback_inherits_the_units_of_the_record_it_supersedes() {
+        require_tar();
+        let fixture = Fixture::new();
+        fixture.install_marker("#!/bin/sh\necho 'danso 0.0.1'\n");
+        let mut plan = fixture.plan(OK_NAME);
+        plan.services = vec!["danso.service".into()];
+        apply(&plan).unwrap();
+
+        // No `--service` on the rollback. Dropping the list would make the
+        // follow-up `activate` judge a service install by reading the file the
+        // rollback itself just wrote, which proves nothing.
+        rollback(&fixture.home, vec![]).unwrap();
+        let pending = update::read_pending(&fixture.state()).unwrap().unwrap();
+        assert_eq!(pending.services, vec!["danso.service".to_string()]);
+    }
+
+    #[test]
+    fn an_explicit_service_list_overrides_the_inherited_one() {
+        require_tar();
+        let fixture = Fixture::new();
+        fixture.install_marker("#!/bin/sh\necho 'danso 0.0.1'\n");
+        let mut plan = fixture.plan(OK_NAME);
+        plan.services = vec!["danso.service".into()];
+        apply(&plan).unwrap();
+
+        rollback(&fixture.home, vec!["other.service".into()]).unwrap();
+        let pending = update::read_pending(&fixture.state()).unwrap().unwrap();
+        assert_eq!(pending.services, vec!["other.service".to_string()]);
+    }
+
+    #[test]
+    fn a_rollback_records_the_generation_it_installed() {
+        require_tar();
+        let fixture = Fixture::new();
+        fixture.install_marker("#!/bin/sh\necho 'danso 0.0.1'\n");
+        apply(&fixture.plan(OK_NAME)).unwrap();
+        let report = rollback(&fixture.home, vec![]).unwrap();
+
+        let installed = update::read_installed(&fixture.state()).unwrap().unwrap();
+        assert_eq!(
+            installed.binary_sha256, report.target_sha256,
+            "without this `status` reports the rolled-out version as installed \
+             for as long as the installation lives"
+        );
+        assert_eq!(installed.version, "0.0.1");
+    }
+
+    #[test]
+    fn a_rollback_logs_the_digests_it_moved_between() {
+        require_tar();
+        let fixture = Fixture::new();
+        fixture.install_marker("#!/bin/sh\necho 'danso 0.0.1'\n");
+        apply(&fixture.plan(OK_NAME)).unwrap();
+        let report = rollback(&fixture.home, vec![]).unwrap();
+
+        let line = fixture
+            .log_lines()
+            .into_iter()
+            .find(|line| line["event"] == "rolled_back")
+            .expect("the rollback is logged");
+        assert_eq!(line["target_sha256"], report.target_sha256);
+        assert_eq!(line["previous_sha256"], report.previous_sha256);
+    }
+
+    #[test]
+    fn a_crash_between_the_two_renames_leaves_a_record_that_matches_disk() {
+        require_tar();
+        let fixture = Fixture::new();
+        let old = fixture.install_marker("#!/bin/sh\necho 'danso 0.0.1'\n");
+        let applied = apply(&fixture.plan(OK_NAME)).unwrap();
+
+        STOP_AFTER_SNAPSHOT.with(|flag| flag.set(true));
+        let error = rollback(&fixture.home, vec![]).unwrap_err();
+        assert!(error.to_string().contains("stopped between"), "{error:#}");
+
+        // What a crash in that window leaves behind. The record is the
+        // contract, so it has to describe this exactly.
+        let pending = update::read_pending(&fixture.state()).unwrap().unwrap();
+        let snapshot = update::previous_binary(&fixture.home);
+        assert_eq!(
+            release::hex_digest(&fs::read(&snapshot).unwrap()),
+            applied.target_sha256,
+            "the snapshot holds the image being rolled out of"
+        );
+        assert_eq!(
+            pending.previous.as_ref().unwrap().binary_sha256,
+            applied.target_sha256,
+            "and the record names that same image as `previous`; the other \
+             rename order leaves `danso.prev` holding the image that was just \
+             installed, so the record points at a generation that is nowhere \
+             on disk"
+        );
+        assert_eq!(
+            pending.snapshot.as_deref(),
+            Some(snapshot.to_str().unwrap())
+        );
+        assert_eq!(pending.target.binary_sha256, old);
+        assert_eq!(
+            release::hex_digest(&fs::read(fixture.target()).unwrap()),
+            applied.target_sha256,
+            "the install has not happened yet, which is what `activate` will \
+             report: not activated, which is true and actionable"
+        );
+        assert!(fixture.strays().is_empty(), "{:?}", fixture.strays());
+    }
+
+    #[test]
+    fn a_symlinked_rollback_target_is_not_followed() {
+        let fixture = Fixture::new();
+        let current = fixture.install_marker("#!/bin/sh\necho 'danso 9.9.9'\n");
+        let secret = fixture.home.join("secret");
+        fs::write(&secret, b"#!/bin/sh\necho 'danso 0.0.1-SECRET'\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, update::previous_binary(&fixture.home)).unwrap();
+
+        let error = rollback(&fixture.home, vec![]).unwrap_err();
+        assert_eq!(error.exit_code(), EXIT_APPLY_FAILED);
+        assert_eq!(
+            release::hex_digest(&fs::read(fixture.target()).unwrap()),
+            current,
+            "a link planted in the bin directory must not decide what gets \
+             installed"
+        );
+        assert!(fixture.strays().is_empty(), "{:?}", fixture.strays());
+    }
+
+    #[test]
+    fn a_symlinked_installed_binary_is_not_snapshotted_through() {
+        require_tar();
+        let fixture = Fixture::new();
+        let secret = fixture.home.join("secret");
+        fs::write(&secret, b"root only\n").unwrap();
+        fs::create_dir_all(fixture.home.join("bin")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, fixture.target()).unwrap();
+
+        let error = apply(&fixture.plan(OK_NAME)).unwrap_err();
+        assert_eq!(error.exit_code(), EXIT_APPLY_FAILED);
+        assert!(
+            !update::previous_binary(&fixture.home).exists(),
+            "the snapshot must not become a copy of whatever the link pointed at"
+        );
+    }
+
+    #[test]
+    fn a_failed_activation_blocks_an_install_that_would_destroy_its_rollback_target() {
+        require_tar();
+        let fixture = Fixture::new();
+        fixture.install_marker("#!/bin/sh\necho 'danso 0.0.1'\n");
+        apply(&fixture.plan(OK_NAME)).unwrap();
+        let mut record = update::read_pending(&fixture.state()).unwrap().unwrap();
+        record.outcome = update::Outcome::Failed;
+        update::write_pending(&fixture.state(), &record).unwrap();
+
+        let error = apply(&fixture.plan("danso-9.9.9-badexit.tar.gz")).unwrap_err();
+        assert!(
+            error.to_string().contains("last activation failed"),
+            "installing over a failed activation snapshots the binary that \
+             just failed on top of the known-good one; {error}"
+        );
+        assert_eq!(
+            release::hex_digest(&fs::read(update::previous_binary(&fixture.home)).unwrap()),
+            release::hex_digest(b"#!/bin/sh\necho 'danso 0.0.1'\n"),
+            "the known-good rollback target is untouched"
+        );
+    }
+
+    /// `execve` returns `ETXTBSY` while any process holds the image open for
+    /// writing. This module closes its own descriptor first, but a child
+    /// forked by another thread carries a copy until its own `exec`, so on a
+    /// busy host the probe can hit a file nothing is really writing to. A
+    /// write handle held here reproduces that deterministically.
+    #[test]
+    fn a_probe_waits_out_a_write_handle_someone_else_still_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("probe-target");
+        write_new_executable(&binary, script("echo 'danso 4.5.6'").as_bytes()).unwrap();
+
+        let holder = fs::OpenOptions::new().write(true).open(&binary).unwrap();
+        // Without a retry the spawn fails immediately; with one it waits for
+        // the descriptor to go away, which is what the fork window does.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(holder);
+        });
+
+        let version = probe_version(&binary, &dir.path().join("capture"), Duration::from_secs(5))
+            .expect("a transient ETXTBSY must not fail the update");
+        release.join().unwrap();
+        assert_eq!(version, "4.5.6");
+    }
+
+    #[test]
+    fn a_probe_gives_up_on_a_write_handle_that_never_goes_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("probe-target");
+        write_new_executable(&binary, script("echo 'danso 4.5.6'").as_bytes()).unwrap();
+        let _holder = fs::OpenOptions::new().write(true).open(&binary).unwrap();
+
+        // Held for longer than the retry window: the retry is bounded, so a
+        // genuinely unusable image still fails rather than hanging the update.
+        let error = probe_version(
+            &binary,
+            &dir.path().join("capture"),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("staged binary"), "{error:#}");
+    }
+
+    #[test]
+    fn a_rollback_with_no_snapshot_changes_nothing() {
+        let fixture = Fixture::new();
+        let only = fixture.install_marker("#!/bin/sh\necho 'danso 0.0.1'\n");
+        let error = rollback(&fixture.home, vec![]).unwrap_err();
+        assert_eq!(error.exit_code(), EXIT_APPLY_FAILED);
+        assert!(error.to_string().contains("rollback target"), "{error}");
+        assert_eq!(
+            release::hex_digest(&fs::read(fixture.target()).unwrap()),
+            only
+        );
+        assert!(update::read_pending(&fixture.state()).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_rollback_target_that_cannot_run_is_refused() {
+        let fixture = Fixture::new();
+        let current = fixture.install_marker("#!/bin/sh\necho 'danso 9.9.9'\n");
+        write_new_executable(
+            &update::previous_binary(&fixture.home),
+            b"#!/bin/sh\nexit 3\n",
+        )
+        .unwrap();
+
+        let error = rollback(&fixture.home, vec![]).unwrap_err();
+        assert_eq!(error.exit_code(), EXIT_APPLY_FAILED);
+        assert_eq!(
+            release::hex_digest(&fs::read(fixture.target()).unwrap()),
+            current,
+            "\"it used to work\" is not evidence about the file as it is now"
+        );
+        assert!(update::read_pending(&fixture.state()).unwrap().is_none());
+        assert!(fixture.strays().is_empty(), "{:?}", fixture.strays());
+    }
+
+    #[test]
+    fn rolling_back_to_what_is_already_installed_is_refused() {
+        let fixture = Fixture::new();
+        let same = "#!/bin/sh\necho 'danso 9.9.9'\n";
+        fixture.install_marker(same);
+        write_new_executable(&update::previous_binary(&fixture.home), same.as_bytes()).unwrap();
+
+        let error = rollback(&fixture.home, vec![]).unwrap_err();
+        assert!(error.to_string().contains("already installed"), "{error}");
+        assert!(update::read_pending(&fixture.state()).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_rollback_service_must_be_a_unit_name() {
+        let fixture = Fixture::new();
+        fixture.install_marker("#!/bin/sh\necho 'danso 9.9.9'\n");
+        write_new_executable(
+            &update::previous_binary(&fixture.home),
+            b"#!/bin/sh\necho 'danso 0.0.1'\n",
+        )
+        .unwrap();
+
+        let error = rollback(&fixture.home, vec!["--now".into()]).unwrap_err();
+        assert!(error.to_string().contains("unit name"), "{error}");
+        assert!(update::read_pending(&fixture.state()).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_rollback_is_never_performed_when_its_record_cannot_be_written() {
+        let fixture = Fixture::new();
+        let current = fixture.install_marker("#!/bin/sh\necho 'danso 9.9.9'\n");
+        write_new_executable(
+            &update::previous_binary(&fixture.home),
+            b"#!/bin/sh\necho 'danso 0.0.1'\n",
+        )
+        .unwrap();
+        // The lock lives under `state/`, so create the directory first and then
+        // occupy the record's own path with a directory: the lock still works,
+        // the record write cannot.
+        fs::create_dir_all(fixture.state()).unwrap();
+        fs::create_dir_all(fixture.state().join("pending-activation.json")).unwrap();
+
+        let error = rollback(&fixture.home, vec![]).unwrap_err();
+        assert_eq!(error.exit_code(), EXIT_APPLY_FAILED);
+        assert_eq!(
+            release::hex_digest(&fs::read(fixture.target()).unwrap()),
+            current,
+            "the swap must not happen when the record could not be written"
+        );
+        assert!(fixture.strays().is_empty(), "{:?}", fixture.strays());
     }
 
     #[test]
