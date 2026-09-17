@@ -19,6 +19,7 @@
 //!   turn drain.
 
 use crate::stop::DEFAULT_GRACE_SECS;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// `Restart=always` recovery delay, as in ccc-node.
@@ -85,6 +86,55 @@ pub struct UnitSpec {
     pub working_directory: PathBuf,
     pub home: PathBuf,
     pub path_env: String,
+}
+
+/// Environment a unit declares, including anything its drop-ins add.
+///
+/// systemd merges `<unit>.d/*.conf` over the unit itself, so what the service
+/// will actually see is both. `install` has to look at both too: a unit that
+/// declares nothing is perfectly startable when a drop-in supplies the rest,
+/// and refusing that would be wrong.
+pub fn declared_environment(unit_text: &str, drop_in_dir: &Path) -> BTreeMap<String, String> {
+    let mut declared = BTreeMap::new();
+    let mut absorb = |text: &str| {
+        for line in text.lines() {
+            let line = line.trim();
+            let Some(assignment) = line.strip_prefix("Environment=") else {
+                continue;
+            };
+            // `Environment=NAME=VALUE`, optionally quoted. Only the simple form
+            // the renderer and a hand-written drop-in use is understood; a
+            // shell-quoted multi-assignment line is left alone rather than
+            // half-parsed into a wrong answer.
+            let assignment = assignment.trim().trim_matches('"');
+            if let Some((name, value)) = assignment.split_once('=') {
+                declared.insert(name.trim().to_string(), value.to_string());
+            }
+        }
+    };
+    absorb(unit_text);
+    let Ok(entries) = std::fs::read_dir(drop_in_dir) else {
+        return declared;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "conf"))
+        .collect();
+    // systemd applies drop-ins in lexical order; later ones win.
+    files.sort();
+    for file in files {
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            absorb(&text);
+        }
+    }
+    declared
+}
+
+/// `<unit>.d`, where systemd looks for drop-ins.
+pub fn drop_in_dir(unit_path: &Path) -> PathBuf {
+    let mut name = unit_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".d");
+    unit_path.with_file_name(name)
 }
 
 /// The variable a service publishes its state root through.
@@ -367,6 +417,50 @@ mod tests {
         assert_eq!(
             termux_boot_path(Path::new("/data/data/com.termux/files/home")),
             PathBuf::from("/data/data/com.termux/files/home/.termux/boot/danso-service")
+        );
+    }
+
+    #[test]
+    fn declared_environment_merges_the_unit_and_its_drop_ins() {
+        let dir = tempfile::tempdir().unwrap();
+        let drop_ins = dir.path().join("danso.service.d");
+        std::fs::create_dir_all(&drop_ins).unwrap();
+        // Lexical order, later wins — the order systemd applies them in.
+        std::fs::write(
+            drop_ins.join("10-first.conf"),
+            "[Service]\nEnvironment=A=one\nEnvironment=B=keep\n",
+        )
+        .unwrap();
+        std::fs::write(drop_ins.join("20-second.conf"), "Environment=A=two\n").unwrap();
+        // Not a drop-in: systemd only reads `*.conf`.
+        std::fs::write(drop_ins.join("notes.txt"), "Environment=C=ignored\n").unwrap();
+
+        let unit = "[Service]\nEnvironment=HOME=/root\nEnvironment=A=unit\n";
+        let declared = declared_environment(unit, &drop_ins);
+        assert_eq!(declared.get("HOME").map(String::as_str), Some("/root"));
+        assert_eq!(
+            declared.get("A").map(String::as_str),
+            Some("two"),
+            "the last drop-in wins, as systemd applies them"
+        );
+        assert_eq!(declared.get("B").map(String::as_str), Some("keep"));
+        assert!(!declared.contains_key("C"), "only *.conf is a drop-in");
+    }
+
+    #[test]
+    fn a_missing_drop_in_directory_is_not_an_error() {
+        let declared = declared_environment(
+            "Environment=A=1\n",
+            Path::new("/nonexistent/danso.service.d"),
+        );
+        assert_eq!(declared.get("A").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn the_drop_in_directory_is_the_unit_path_plus_d() {
+        assert_eq!(
+            drop_in_dir(Path::new("/etc/systemd/system/danso.service")),
+            PathBuf::from("/etc/systemd/system/danso.service.d")
         );
     }
 

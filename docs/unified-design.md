@@ -459,6 +459,11 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
     부팅 동작을 바꾸는 일이라 운영자가 직접 해야 한다. 그 스크립트는
     `service run --supervise`를 쓴다 — systemd가 없으면 `--supervise`가 유일한
     재시작 정책이다.
+  - `install`은 쓰기 **전에** 그 유닛이 기동 가능한지 본다 — 유닛과 기존
+    드롭인이 선언한 환경에 필수 변수(`DANSO_TELEGRAM_BOT_TOKEN`, 모델)가 없거나
+    상태 루트가 workspace 안이면 **거부**하고 빠진 **이름**을 말한다(값은 절대
+    출력하지 않는다). 설치 절차·함정은 `docs/service-install.md`.
+    #118 실측: 이 점검이 없던 유닛은 `systemctl start` 시 13회 크래시 루프였다.
 - `danso service run [--data-dir D]`: 포그라운드 실행. 기존 `danso telegram`
   루프를 **그대로 호출**하고 pid·health 부기만 더한다(런타임 이중화 금지).
   `danso telegram`은 같은 경로의 별칭으로 남는다.

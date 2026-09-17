@@ -6,7 +6,7 @@
 //! duplicating the runtime is the failure this module exists to avoid, and
 //! `danso telegram` stays as an alias for the same path.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use danso_ops::{
     health::{self, HEALTH_FILE_NAME, RunMode},
@@ -15,6 +15,7 @@ use danso_ops::{
     stop::{StopOutcome, TURN_DRAIN_SECS},
     unit::{Drift, Scope, UnitSpec},
 };
+use std::path::Path;
 use std::{path::PathBuf, time::Duration};
 
 #[derive(Parser)]
@@ -345,11 +346,89 @@ pub enum InstallOutcome {
 /// Installing does **not** start the service. Starting is a lifecycle decision
 /// an operator makes; conflating it with installation means a config change
 /// silently becomes a restart.
+/// What would stop the unit `install` is about to write from ever starting.
+///
+/// Measured on yukson 2026-09-17 (#118): a freshly installed unit crash-looped
+/// thirteen times because it declared none of the configuration the service
+/// requires, and `install` had reported success. An install whose only possible
+/// outcome is a crash loop is not an install.
+///
+/// Both checks are decidable here, before anything is written: the unit's own
+/// `Environment=` lines plus its drop-ins are exactly what systemd will hand
+/// the service, and the working directory and state root are both in the spec.
+///
+/// Only names are reported, never values — one of them is a bot token.
+pub fn install_problems(spec: &UnitSpec, unit: &str, unit_path: &Path) -> Vec<String> {
+    let declared =
+        danso_ops::unit::declared_environment(unit, &danso_ops::unit::drop_in_dir(unit_path));
+    let mut problems = Vec::new();
+
+    if !declared.contains_key(crate::telegram::BOT_TOKEN_ENV) {
+        problems.push(format!(
+            "{} is not set for the unit",
+            crate::telegram::BOT_TOKEN_ENV
+        ));
+    }
+    // The model can arrive under any of the names the service accepts; naming
+    // only the canonical one in the error would send an operator to change a
+    // variable that was already fine.
+    let model_names = [crate::telegram::MODEL_ENV, "DANSO_MODEL"];
+    if !model_names.iter().any(|name| declared.contains_key(*name)) {
+        problems.push(format!(
+            "none of {} is set for the unit",
+            model_names.join(", ")
+        ));
+    }
+
+    // With no workspace declared the service falls back to its working
+    // directory, which this unit sets to the home that contains the state
+    // root — and journals inside the workspace are refused. The default
+    // layout is self-contradictory, so it has to be said at install time
+    // rather than discovered in the journal.
+    let workspace = declared
+        .get(crate::telegram::WORKSPACE_ENV)
+        .or_else(|| declared.get("DANSO_WORKSPACE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| spec.working_directory.clone());
+    if spec.data_dir.starts_with(&workspace) {
+        problems.push(format!(
+            "the state root is inside the workspace the unit would use; set {} to a directory that does not contain it",
+            crate::telegram::WORKSPACE_ENV
+        ));
+    }
+    problems
+}
+
+fn drop_in_hint(unit_path: &Path) -> String {
+    format!(
+        "supply them through a systemd drop-in at {}/10-danso.conf \
+         ([Service] with one Environment= line each); the unit itself must not \
+         carry the bot token, because it is world-readable",
+        danso_ops::unit::drop_in_dir(unit_path).display()
+    )
+}
+
 pub fn install(spec: &UnitSpec, dry_run: bool) -> Result<InstallOutcome> {
     let path = spec.scope.unit_path(&spec.home);
     let unit = spec.render();
+    let problems = install_problems(spec, &unit, &path);
     if dry_run {
+        // A dry run changes nothing, so it reports rather than refuses — the
+        // rendered unit on stdout stays usable as `--dry-run > danso.service`.
+        for problem in &problems {
+            eprintln!("warning: {problem}");
+        }
+        if !problems.is_empty() {
+            eprintln!("warning: {}", drop_in_hint(&path));
+        }
         return Ok(InstallOutcome::DryRun { path, unit });
+    }
+    if !problems.is_empty() {
+        bail!(
+            "refusing to install a unit that cannot start:\n  - {}\n{}",
+            problems.join("\n  - "),
+            drop_in_hint(&path)
+        );
     }
     let dir = path.parent().context("unit path has no parent")?;
     std::fs::create_dir_all(dir)
@@ -469,6 +548,148 @@ pub fn stop_text(outcome: StopOutcome) -> &'static str {
         StopOutcome::Drained => "Bot stop: drained",
         StopOutcome::Killed => "Bot stop: killed after the grace budget; pid and lock retained",
         StopOutcome::Survived => "Bot stop: target survived SIGKILL; pid and lock retained",
+    }
+}
+
+#[cfg(test)]
+mod install_preflight_tests {
+    use super::*;
+    use danso_ops::unit::Scope;
+
+    fn spec(home: &Path, data_dir: &Path) -> UnitSpec {
+        UnitSpec {
+            scope: Scope::System,
+            exe: PathBuf::from("/usr/local/bin/danso"),
+            working_directory: home.to_path_buf(),
+            data_dir: data_dir.to_path_buf(),
+            home: home.to_path_buf(),
+            path_env: "/usr/bin:/bin".into(),
+        }
+    }
+
+    /// The state the acceptance run found: nothing supplied, and a state root
+    /// inside the working directory the unit sets.
+    #[test]
+    fn a_bare_install_names_every_reason_it_cannot_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let spec = spec(home, &home.join(".danso/telegram"));
+        let unit = spec.render();
+        let problems = install_problems(&spec, &unit, &home.join("danso.service"));
+
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("DANSO_TELEGRAM_BOT_TOKEN"))
+        );
+        assert!(problems.iter().any(|p| p.contains("DANSO_TELEGRAM_MODEL")));
+        assert!(problems.iter().any(|p| p.contains("inside the workspace")));
+    }
+
+    #[test]
+    fn a_drop_in_that_supplies_them_clears_the_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let workspace = home.join("ws");
+        let spec = spec(home, &home.join(".danso/telegram"));
+        let unit_path = home.join("danso.service");
+        let drop_ins = danso_ops::unit::drop_in_dir(&unit_path);
+        std::fs::create_dir_all(&drop_ins).unwrap();
+        std::fs::write(
+            drop_ins.join("10-danso.conf"),
+            format!(
+                "[Service]\nEnvironment={}=000000:TEST\nEnvironment={}=claude-opus-5\nEnvironment={}={}\n",
+                crate::telegram::BOT_TOKEN_ENV,
+                crate::telegram::MODEL_ENV,
+                crate::telegram::WORKSPACE_ENV,
+                workspace.display()
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            install_problems(&spec, &spec.render(), &unit_path).is_empty(),
+            "a unit a drop-in completes is installable; refusing it would break \
+             the ordinary way an operator supplies a secret"
+        );
+    }
+
+    #[test]
+    fn the_alternate_model_variable_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let spec = spec(home, &home.join(".danso/telegram"));
+        let unit_path = home.join("danso.service");
+        let drop_ins = danso_ops::unit::drop_in_dir(&unit_path);
+        std::fs::create_dir_all(&drop_ins).unwrap();
+        std::fs::write(
+            drop_ins.join("10-danso.conf"),
+            format!(
+                "[Service]\nEnvironment={}=000000:TEST\nEnvironment=DANSO_MODEL=claude-opus-5\nEnvironment={}={}\n",
+                crate::telegram::BOT_TOKEN_ENV,
+                crate::telegram::WORKSPACE_ENV,
+                home.join("ws").display()
+            ),
+        )
+        .unwrap();
+        let problems = install_problems(&spec, &spec.render(), &unit_path);
+        assert!(
+            !problems.iter().any(|p| p.contains("MODEL")),
+            "naming only the canonical variable would send an operator to \
+             change one that was already fine: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_workspace_that_contains_the_state_root_is_refused_however_it_was_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let spec = spec(home, &home.join("state"));
+        let unit_path = home.join("danso.service");
+        let drop_ins = danso_ops::unit::drop_in_dir(&unit_path);
+        std::fs::create_dir_all(&drop_ins).unwrap();
+        // Explicitly set, and still containing the state root.
+        std::fs::write(
+            drop_ins.join("10-danso.conf"),
+            format!(
+                "[Service]\nEnvironment={}=000000:TEST\nEnvironment={}=m\nEnvironment={}={}\n",
+                crate::telegram::BOT_TOKEN_ENV,
+                crate::telegram::MODEL_ENV,
+                crate::telegram::WORKSPACE_ENV,
+                home.display()
+            ),
+        )
+        .unwrap();
+        let problems = install_problems(&spec, &spec.render(), &unit_path);
+        assert!(
+            problems.iter().any(|p| p.contains("inside the workspace")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn no_problem_names_a_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let spec = spec(home, &home.join(".danso/telegram"));
+        let unit_path = home.join("danso.service");
+        let drop_ins = danso_ops::unit::drop_in_dir(&unit_path);
+        std::fs::create_dir_all(&drop_ins).unwrap();
+        std::fs::write(
+            drop_ins.join("10-danso.conf"),
+            format!(
+                "[Service]\nEnvironment={}=SECRET-TOKEN-VALUE\n",
+                crate::telegram::BOT_TOKEN_ENV
+            ),
+        )
+        .unwrap();
+        for problem in install_problems(&spec, &spec.render(), &unit_path) {
+            assert!(
+                !problem.contains("SECRET-TOKEN-VALUE"),
+                "the report names variables, never their values: {problem}"
+            );
+        }
     }
 }
 
