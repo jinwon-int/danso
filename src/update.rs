@@ -120,8 +120,41 @@ pub fn apply(
         force,
         chrono::Utc::now(),
     );
-    if matches!(gate, danso_ops::idle::Gate::Deferred { .. }) {
-        return Ok(Applied::Deferred(gate));
+    // An attempt that never started still gets a log line. A node several
+    // generations behind is diagnosed from this file, and a silent deferral
+    // makes "busy every time" and "the updater never ran" identical.
+    match &gate {
+        danso_ops::idle::Gate::Deferred {
+            reason,
+            waited_seconds,
+        } => {
+            install::log_gate(
+                &home,
+                gate.log_event(),
+                Some(*reason),
+                Some(*waited_seconds),
+            );
+            return Ok(Applied::Deferred(gate));
+        }
+        danso_ops::idle::Gate::Proceed(danso_ops::idle::Proceeding::Idle) => {}
+        danso_ops::idle::Gate::Proceed(proceeding) => {
+            let (busy, waited) = match proceeding {
+                danso_ops::idle::Proceeding::BudgetExhausted {
+                    busy,
+                    waited_seconds,
+                } => (Some(*busy), Some(*waited_seconds)),
+                danso_ops::idle::Proceeding::Untrackable { busy } => (Some(*busy), None),
+                danso_ops::idle::Proceeding::Forced { busy } => (*busy, None),
+                danso_ops::idle::Proceeding::Idle => (None, None),
+            };
+            install::log_gate(&home, gate.log_event(), busy, waited);
+            // The one case where the gate knowingly does what it exists to
+            // prevent has to be said out loud. stderr, so a `--json` consumer's
+            // document shape is unchanged.
+            if gate.overrides_a_live_turn() {
+                eprintln!("warning: {}", gate.summary());
+            }
+        }
     }
 
     let key = configured_public_key(&home).map_err(install::ApplyError::Failed)?;

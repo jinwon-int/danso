@@ -224,6 +224,24 @@ mod idle_gate {
         home.join("bin").join("danso").exists()
     }
 
+    /// Every line of `state/self-update.log`, as JSON.
+    fn log(home: &Path) -> Vec<serde_json::Value> {
+        let path = home.join("state").join("self-update.log");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .map(|line| serde_json::from_str(line).expect("log line is json"))
+            .collect()
+    }
+
+    fn events(home: &Path) -> Vec<String> {
+        log(home)
+            .iter()
+            .map(|line| line["event"].as_str().expect("event").to_string())
+            .collect()
+    }
+
     #[test]
     fn a_serving_service_defers_and_installs_nothing() {
         let temp = tempfile::tempdir().expect("temp");
@@ -247,6 +265,110 @@ mod idle_gate {
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
         assert_eq!(report["gate"], "deferred");
         assert_eq!(report["reason"]["active"], 1);
+
+        // An attempt that never started still leaves evidence. Without it a
+        // node several generations behind cannot be told apart from one whose
+        // updater never ran at all.
+        let lines = log(&home);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["event"], "deferred");
+        assert_eq!(lines[0]["active_requests"], 1);
+        assert_eq!(lines[0]["waited_seconds"], 0);
+        assert!(
+            lines[0].get("target_sha256").is_none(),
+            "nothing was read, so nothing may be named: {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn proceeding_over_a_live_turn_says_so_and_is_logged() {
+        // `--force` is the reachable case; the cap-exceeded and unrecordable
+        // cases take the same branch and are unit-tested in `danso_ops::idle`.
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let data_dir = temp.path().join("data");
+        let release = release_copy(temp.path());
+        trust_fixture_key(&home);
+        serving(&data_dir, 2, 9);
+
+        let output = apply_with(
+            &home,
+            &release,
+            OK,
+            &["--data-dir", data_dir.to_str().expect("utf-8"), "--force"],
+        );
+        assert_eq!(code(&output), 0);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("while serving"),
+            "ending a live turn on purpose must be said out loud: {stderr}"
+        );
+        // stdout stays the install report: a --json consumer's shape must not
+        // change depending on what the gate decided.
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+        assert_eq!(report["replaced"], true);
+        assert!(report.get("gate").is_none());
+
+        let recorded = events(&home);
+        assert_eq!(recorded, ["gate_forced", "applied"], "{recorded:?}");
+    }
+
+    #[test]
+    fn an_ordinary_idle_install_does_not_clutter_the_log() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let data_dir = temp.path().join("data");
+        let release = release_copy(temp.path());
+        trust_fixture_key(&home);
+        serving(&data_dir, 0, 0);
+
+        assert_eq!(
+            code(&apply_with(
+                &home,
+                &release,
+                OK,
+                &["--data-dir", data_dir.to_str().expect("utf-8")]
+            )),
+            0
+        );
+        assert_eq!(
+            events(&home),
+            ["applied"],
+            "the common case is the install line alone; a gate line on every \
+             run would bury the ones that mean something"
+        );
+    }
+
+    #[test]
+    fn the_default_data_dir_is_what_the_service_env_names() {
+        // Without `--data-dir` the gate resolves the same directory the
+        // service uses. If that resolution fails the gate is inert and silent,
+        // so the resolved case needs a test of its own.
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let data_dir = temp.path().join("data");
+        let release = release_copy(temp.path());
+        trust_fixture_key(&home);
+        serving(&data_dir, 1, 7);
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_danso"))
+            .args(["update", "apply", "--artifact-dir"])
+            .arg(&release)
+            .args(["--artifact", OK, "--json"])
+            .env("DANSO_HOME", &home)
+            .env("DANSO_TELEGRAM_DATA_DIR", &data_dir)
+            .env_remove("HOME")
+            .output()
+            .expect("run danso update apply");
+        assert_eq!(
+            code(&output),
+            EXIT_DEFERRED,
+            "the gate must find the service's health document without being \
+             told where it is; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!installed(&home));
     }
 
     #[test]
@@ -323,6 +445,52 @@ mod idle_gate {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(installed(&home));
+    }
+
+    #[test]
+    fn a_deferral_does_not_wait_for_the_update_lock() {
+        // The gate is ordered before `UpdateLock::acquire`, and this is what
+        // that ordering is worth: a deferring run must not queue behind — or
+        // block — a concurrent `apply`. Held from this process, the lock makes
+        // the two orderings give different exit codes, which is the only way
+        // to tell them apart from outside.
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let data_dir = temp.path().join("data");
+        let release = release_copy(temp.path());
+        trust_fixture_key(&home);
+        serving(&data_dir, 1, 4);
+
+        let state = home.join("state");
+        std::fs::create_dir_all(&state).expect("state");
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(state.join("update.lock"))
+            .expect("open the update lock");
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `lock` owns the descriptor for the whole call.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the test must hold the lock for this to prove anything"
+        );
+
+        let output = apply_with(
+            &home,
+            &release,
+            OK,
+            &["--data-dir", data_dir.to_str().expect("utf-8")],
+        );
+        assert_eq!(
+            code(&output),
+            EXIT_DEFERRED,
+            "a gate placed after the lock would fail on contention (exit 2) \
+             instead of deferring; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(lock);
     }
 
     #[test]

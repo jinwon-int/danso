@@ -27,7 +27,7 @@ pub mod unit;
 pub mod update;
 
 pub use activate::{Activation, Serving};
-pub use idle::{BusyReason, Gate};
+pub use idle::{BusyReason, Gate, Proceeding};
 pub use install::{ApplyError, ApplyPlan, ApplyReport};
 pub use release::{Manifest, verify_artifact, verify_manifest};
 pub use status::{ServiceState, StatusOutcome, StatusReport};

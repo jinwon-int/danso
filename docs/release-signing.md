@@ -133,12 +133,45 @@ Four rules, each of which exists because its absence breaks something:
 - **Fail-open.** No health document, unreadable, invalid, missing fields,
   stale — all mean *proceed*. The gate is an optimisation for the common case,
   not a safety property, and an update lane that one corrupt file can stop
-  silently is worse than a turn that occasionally dies.
+  silently is worse than a turn that occasionally dies. This extends to the
+  marker itself: a deferral that cannot be written down cannot be bounded, so
+  it is not made. Without that rule an unwritable state directory — a
+  root-created marker a lower-privileged run can neither read nor replace —
+  would defer from zero on every run and block updates forever.
 
 `--force` skips the gate. It kills the turn in flight, which is why it is a
 flag rather than the default.
 
-A node with no service publishes no health document and is never gated.
+A node with no service publishes no health document and is never gated. If the
+update runs in an environment that does not set `DANSO_TELEGRAM_DATA_DIR` while
+the service does — a different unit, a different user, a cron job without
+`HOME` — the gate resolves a path that does not exist and proceeds every time.
+Pass `--data-dir` explicitly wherever the two environments can differ.
+
+### What it does not protect
+
+`apply` replaces a file. It does not restart anything, and the SIGTERM that
+ends a turn comes from the restart that follows. An operator who runs `apply`,
+sees exit 8, and restarts by hand anyway is not protected by any of this. The
+gate's job is to make the *wrapper* stop early, which is why a deferral is an
+exit code rather than a warning.
+
+### Reading the log
+
+Every attempt leaves a line in `state/self-update.log`, including one that
+never started — otherwise a node several generations behind is
+indistinguishable from one whose updater never ran:
+
+| `event` | Meaning |
+|---|---|
+| `deferred` | busy; nothing was read, locked or written |
+| `gate_budget_exhausted` | busy, the hour ran out, **the turn was ended** |
+| `gate_untrackable` | busy, the deferral could not be recorded, **the turn was ended** |
+| `gate_forced` | `--force`; `active_requests` present if a turn was ended |
+
+The two that end a turn also print a warning to stderr. The counts
+(`active_requests`, `oldest_request_age_seconds`, `waited_seconds`) are the
+only thing carried over from the health document.
 
 ## Rotation
 
