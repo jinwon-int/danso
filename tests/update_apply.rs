@@ -190,3 +190,179 @@ fn applying_twice_reports_the_second_as_already_installed() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(report["replaced"], false);
 }
+
+/// The full cycle an operator actually runs: install, resolve the activation,
+/// then put the old binary back. Each step's exit code is the contract.
+mod lifecycle {
+    use super::*;
+
+    fn update(home: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_danso"))
+            .arg("update")
+            .args(args)
+            .env("DANSO_HOME", home)
+            .env_remove("HOME")
+            .output()
+            .expect("run danso update")
+    }
+
+    /// A CLI-only install has no service to ask, so `activate` judges it by the
+    /// installed file — which is what every future invocation will run.
+    #[test]
+    fn install_then_activate_then_roll_back() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let release = release_copy(temp.path());
+        trust_fixture_key(&home);
+
+        // Something to roll back to.
+        std::fs::create_dir_all(home.join("bin")).expect("bin");
+        std::fs::write(home.join("bin/danso"), "#!/bin/sh\necho 'danso 0.0.1'\n").expect("seed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                home.join("bin/danso"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+
+        assert_eq!(code(&apply(&home, &release, OK)), 0);
+
+        // Before activation the record is outstanding, so `status` is non-zero.
+        assert_eq!(
+            code(&update(&home, &["status"])),
+            1,
+            "a replacement that has not been shown to serve is not done"
+        );
+
+        let activated = update(&home, &["activate", "--json"]);
+        assert_eq!(
+            code(&activated),
+            0,
+            "stderr: {}",
+            String::from_utf8_lossy(&activated.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&activated.stdout).expect("json activation");
+        assert_eq!(report["result"], "activated");
+
+        assert_eq!(
+            code(&update(&home, &["status"])),
+            0,
+            "the record is resolved, so nothing is outstanding"
+        );
+
+        let rolled = update(&home, &["rollback", "--json"]);
+        assert_eq!(
+            code(&rolled),
+            0,
+            "stderr: {}",
+            String::from_utf8_lossy(&rolled.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&rolled.stdout).expect("json");
+        assert_eq!(report["version"], "0.0.1", "the seeded binary is back");
+
+        // The rollback records an activation of its own, so it is outstanding
+        // until it too is shown to be serving.
+        assert_eq!(code(&update(&home, &["status"])), 1);
+        assert_eq!(code(&update(&home, &["activate"])), 0);
+    }
+
+    /// A service install cannot be judged by a file the installer wrote; it
+    /// needs a health document that postdates the activation.
+    #[test]
+    fn a_service_install_is_unverified_until_something_publishes_health() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let data = temp.path().join("data");
+        let release = release_copy(temp.path());
+        trust_fixture_key(&home);
+        std::fs::create_dir_all(&data).expect("data");
+
+        let applied = std::process::Command::new(env!("CARGO_BIN_EXE_danso"))
+            .args(["update", "apply", "--artifact-dir"])
+            .arg(&release)
+            .args(["--artifact", OK, "--service", "danso.service", "--json"])
+            .env("DANSO_HOME", &home)
+            .env_remove("HOME")
+            .output()
+            .expect("apply");
+        assert_eq!(
+            code(&applied),
+            0,
+            "{}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_danso"))
+            .args(["update", "activate", "--data-dir"])
+            .arg(&data)
+            .arg("--json")
+            .env("DANSO_HOME", &home)
+            .env_remove("HOME")
+            .output()
+            .expect("activate");
+        assert_eq!(
+            code(&out),
+            3,
+            "no health document exists, so which image is serving is unknown"
+        );
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+        assert_eq!(report["result"], "unverified");
+        assert_eq!(report["serving"]["evidence"], "missing");
+    }
+
+    #[test]
+    fn activate_is_a_no_op_when_nothing_is_pending() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let output = update(&home, &["activate", "--json"]);
+        assert_eq!(code(&output), 0);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+        assert_eq!(report["result"], "nothing");
+    }
+
+    #[test]
+    fn rollback_without_a_snapshot_fails_without_touching_anything() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let output = update(&home, &["rollback", "--json"]);
+        assert_eq!(code(&output), 2);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+        assert_eq!(report["exit_code"], 2);
+        assert!(!home.join("state/pending-activation.json").exists());
+    }
+
+    #[test]
+    fn an_outstanding_activation_blocks_the_next_install() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let release = release_copy(temp.path());
+        trust_fixture_key(&home);
+
+        assert_eq!(code(&apply(&home, &release, OK)), 0);
+        // A *different* artifact while the first activation is unresolved: it
+        // would destroy the record and the rollback target that record needs.
+        let second = apply(&home, &release, "danso-9.9.9-badexit.tar.gz");
+        assert_eq!(code(&second), 2);
+        assert_eq!(
+            code(&update(&home, &["activate"])),
+            0,
+            "and resolving the activation is what unblocks it"
+        );
+        // Still refused, but now for the artifact's own reason rather than the
+        // outstanding record.
+        let third = apply(&home, &release, "danso-9.9.9-badexit.tar.gz");
+        assert_eq!(code(&third), 2);
+        let stderr = String::from_utf8_lossy(&third.stderr);
+        assert_eq!(
+            stderr.trim(),
+            "update apply failed: apply_failed",
+            "{stderr}"
+        );
+    }
+}

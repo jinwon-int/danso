@@ -414,7 +414,10 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
   `danso-ops::release` — 서명을 **먼저** 검증하고 그 다음에야 매니페스트를
   파싱한다(우회 경로 없음). 설치는 `danso-ops::install` — pending 레코드를
   교체 **이전에** 기록하고, 기록할 수 없으면 아무것도 교체하지 않는다.
-  `release.yml`(생산 쪽)과 다운로드 단계는 아직 없다.
+  활성화 판정은 `danso-ops::activate` — "유닛이 재시작됐다"가 아니라
+  **서빙 중인 이미지의 다이제스트**로 판정하고, 증거가 없거나 낡았으면
+  실패가 아니라 `unverified`(exit 3)다. `release.yml`(생산 쪽)과
+  다운로드 단계는 아직 없다.
 - `danso update --check` / `--apply`: 다운로드 → 해시·서명 검증(실패 시 exit 13,
   우회 없음) → 임시 경로에 풀고 `--version` 실행 검증 → 원자적 rename → 서비스
   모드면 §6.4 핸드오프로 재시작 → `state/self-update.log`(JSONL, 본문 없음) +

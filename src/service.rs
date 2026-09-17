@@ -121,7 +121,10 @@ pub fn is_service_argv(argv: &[String]) -> bool {
         && !argv.iter().any(|arg| arg == "status")
 }
 
-fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
+/// `update activate` needs the same health document `service status` reads;
+/// resolving it twice in two places is how the two end up looking at
+/// different files.
+pub(crate) fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
     match explicit {
         Some(dir) => Ok(dir),
         None => crate::telegram::data_dir_from_env().context(crate::telegram::DATA_DIR_ENV),

@@ -7,9 +7,11 @@ locations and rules.
 
 **Status.** `danso update apply --artifact-dir <dir> --artifact <name>`
 verifies and installs a signed release that is already on disk, exiting 13 with
-no bypass if it does not verify. What is still missing is the other end:
-there is no `release.yml`, so nothing **produces** a signed release yet, and
-`apply` has no fetch step — it is pointed at a directory, not a URL.
+no bypass if it does not verify; `danso update activate` decides whether the
+replacement is actually serving, and `danso update rollback` puts the previous
+binary back. What is still missing is the other end: there is no `release.yml`,
+so nothing **produces** a signed release yet, and `apply` has no fetch step —
+it is pointed at a directory, not a URL.
 
 ## The key
 
@@ -82,6 +84,28 @@ else. This is not pedantry: `tar -xzO -- danso` does not match a stored
 *concatenates* duplicate members onto stdout, which would install two binaries
 glued together. Both are silent at build time, so the check is on the install
 side where it can still refuse.
+
+## The update state machine
+
+```
+apply  ->  pending        activate  ->  activated     (done)
+                                    ->  failed        (rollback, or fix and
+                                    ->  unverified        `activate --retry`)
+```
+
+`activate` compares the **serving** image's digest against the recorded target.
+It refuses to decide on evidence that does not postdate the activation — the
+health document the not-yet-restarted process wrote is fresh and says the old
+digest, and reading that as failure condemns a generation that was merely not
+restarted yet. So `apply; activate; restart; activate` is the ordinary
+sequence and the first `activate` reports `unverified` (exit 3).
+
+A failed activation keeps reporting exit 1, and `apply` refuses past it:
+installing again would snapshot the binary that just failed on top of the
+known-good `bin/danso.prev`, at the exact moment that file is the only way
+back. The two ways forward are `update rollback`, which supersedes the record
+and swaps the binaries back, and `update activate --retry`, for when the
+failure was environmental.
 
 ## Rotation
 
