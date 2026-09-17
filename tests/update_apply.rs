@@ -43,14 +43,34 @@ fn trust_fixture_key(home: &Path) {
 }
 
 fn apply(home: &Path, release: &Path, artifact: &str) -> std::process::Output {
+    apply_with(home, release, artifact, &[])
+}
+
+fn apply_with(home: &Path, release: &Path, artifact: &str, extra: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_danso"))
         .args(["update", "apply", "--artifact-dir"])
         .arg(release)
         .args(["--artifact", artifact, "--json"])
+        .args(extra)
         .env("DANSO_HOME", home)
         .env_remove("HOME")
         .output()
         .expect("run danso update apply")
+}
+
+/// Write only the fields the idle gate reads.
+fn serving(data_dir: &Path, active: u64, oldest_seconds: u64) -> PathBuf {
+    std::fs::create_dir_all(data_dir).expect("data dir");
+    let document = serde_json::json!({
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+        "workload": {
+            "active_requests": active,
+            "oldest_request_age_seconds": oldest_seconds,
+        },
+    });
+    let path = data_dir.join("health.json");
+    std::fs::write(&path, serde_json::to_vec(&document).expect("health")).expect("write health");
+    path
 }
 
 fn code(output: &std::process::Output) -> i32 {
@@ -189,6 +209,148 @@ fn applying_twice_reports_the_second_as_already_installed() {
     assert_eq!(code(&output), 0);
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(report["replaced"], false);
+}
+
+/// The idle gate (`docs/unified-design.md` §6.3), at the level a cron wrapper
+/// sees it. The decision logic is unit-tested in `danso_ops::idle`; what only
+/// a process can show is that a deferral really installs nothing.
+mod idle_gate {
+    use super::*;
+
+    /// ccc-node's exit 8: deferred, nothing changed.
+    const EXIT_DEFERRED: i32 = 8;
+
+    fn installed(home: &Path) -> bool {
+        home.join("bin").join("danso").exists()
+    }
+
+    #[test]
+    fn a_serving_service_defers_and_installs_nothing() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let data_dir = temp.path().join("data");
+        let release = release_copy(temp.path());
+        trust_fixture_key(&home);
+        serving(&data_dir, 1, 12);
+
+        let output = apply_with(
+            &home,
+            &release,
+            OK,
+            &["--data-dir", data_dir.to_str().expect("utf-8")],
+        );
+        assert_eq!(code(&output), EXIT_DEFERRED);
+        assert!(
+            !installed(&home),
+            "a deferral must not replace the binary it declined to replace"
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+        assert_eq!(report["gate"], "deferred");
+        assert_eq!(report["reason"]["active"], 1);
+    }
+
+    #[test]
+    fn an_idle_service_installs() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let data_dir = temp.path().join("data");
+        let release = release_copy(temp.path());
+        trust_fixture_key(&home);
+        serving(&data_dir, 0, 0);
+
+        let output = apply_with(
+            &home,
+            &release,
+            OK,
+            &["--data-dir", data_dir.to_str().expect("utf-8")],
+        );
+        assert_eq!(
+            code(&output),
+            0,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(installed(&home));
+    }
+
+    #[test]
+    fn force_installs_over_a_serving_turn() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let data_dir = temp.path().join("data");
+        let release = release_copy(temp.path());
+        trust_fixture_key(&home);
+        serving(&data_dir, 3, 12);
+
+        let output = apply_with(
+            &home,
+            &release,
+            OK,
+            &["--data-dir", data_dir.to_str().expect("utf-8"), "--force"],
+        );
+        assert_eq!(
+            code(&output),
+            0,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(installed(&home));
+    }
+
+    #[test]
+    fn a_node_with_no_service_is_not_gated() {
+        // A CLI-only installation publishes no health document. Requiring one
+        // would make the gate a reason updates never run on exactly the hosts
+        // that have no service to protect.
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let release = release_copy(temp.path());
+        trust_fixture_key(&home);
+
+        let output = apply_with(
+            &home,
+            &release,
+            OK,
+            &[
+                "--data-dir",
+                temp.path().join("absent").to_str().expect("utf-8"),
+            ],
+        );
+        assert_eq!(
+            code(&output),
+            0,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(installed(&home));
+    }
+
+    #[test]
+    fn a_deferral_leaves_the_verification_path_untouched() {
+        // The gate runs before the signature check, so a deferral must not be
+        // reachable as a way to get a bad release past verification: once the
+        // service goes idle the same artifact is still refused.
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let data_dir = temp.path().join("data");
+        let release = release_copy(temp.path());
+        std::fs::create_dir_all(&home).expect("home");
+        // No config.toml: the embedded key did not sign the fixture.
+        serving(&data_dir, 1, 12);
+        let dir = data_dir.to_str().expect("utf-8");
+
+        assert_eq!(
+            code(&apply_with(&home, &release, OK, &["--data-dir", dir])),
+            EXIT_DEFERRED
+        );
+        serving(&data_dir, 0, 0);
+        assert_eq!(
+            code(&apply_with(&home, &release, OK, &["--data-dir", dir])),
+            EXIT_VERIFICATION_FAILED,
+            "deferring must not become a way around the signature check"
+        );
+        assert!(!installed(&home));
+    }
 }
 
 /// The full cycle an operator actually runs: install, resolve the activation,

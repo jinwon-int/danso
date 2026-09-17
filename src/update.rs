@@ -66,9 +66,26 @@ pub enum UpdateCommand {
         /// Units this activation expects to restart. Repeatable.
         #[arg(long = "service", value_name = "UNIT")]
         services: Vec<String>,
+        /// Where `health.json` lives; defaults to the service data directory.
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        /// Install even while the service is serving a turn. This kills the
+        /// turn in flight; the gate exists so that is a decision, not an
+        /// accident.
+        #[arg(long)]
+        force: bool,
         #[arg(long)]
         json: bool,
     },
+}
+
+/// What `apply` did, or declined to do.
+///
+/// A deferral is not a failure — nothing was read, locked or written — so it
+/// is an `Ok` outcome with its own exit code rather than an `ApplyError`.
+pub enum Applied {
+    Installed(install::ApplyReport),
+    Deferred(danso_ops::idle::Gate),
 }
 
 /// Install a verified release over `$DANSO_HOME/bin/danso`.
@@ -82,10 +99,31 @@ pub fn apply(
     artifact_dir: &Path,
     artifact: &str,
     services: Vec<String>,
-) -> Result<install::ApplyReport, install::ApplyError> {
+    data_dir: Option<PathBuf>,
+    force: bool,
+) -> Result<Applied, install::ApplyError> {
     let home = crate::config::home()
         .context("DANSO_HOME")
         .map_err(install::ApplyError::Failed)?;
+
+    // The gate comes first, before the key, before `tar`, before the lock:
+    // a deferred run must leave no trace that it considered running, and
+    // holding the update lock while deferring would block a concurrent
+    // `activate` for no reason. Same resolver as `activate`, so the two
+    // cannot disagree about which health document describes this service.
+    let health = crate::service::resolve_data_dir(data_dir)
+        .ok()
+        .map(|dir| dir.join(danso_ops::health::HEALTH_FILE_NAME));
+    let gate = danso_ops::idle::check(
+        &danso_ops::update::state_dir(&home),
+        health.as_deref(),
+        force,
+        chrono::Utc::now(),
+    );
+    if matches!(gate, danso_ops::idle::Gate::Deferred { .. }) {
+        return Ok(Applied::Deferred(gate));
+    }
+
     let key = configured_public_key(&home).map_err(install::ApplyError::Failed)?;
     if !install::tar_available() {
         return Err(install::ApplyError::Failed(anyhow::anyhow!(
@@ -99,6 +137,7 @@ pub fn apply(
         danso_home: &home,
         services,
     })
+    .map(Applied::Installed)
 }
 
 /// Resolve an outstanding activation.

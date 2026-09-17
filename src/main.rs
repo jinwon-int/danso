@@ -271,9 +271,22 @@ fn main() {
                 artifact_dir,
                 artifact,
                 services,
+                data_dir,
+                force,
                 json,
-            } => match danso::update::apply(&artifact_dir, &artifact, services) {
-                Ok(report) => {
+            } => match danso::update::apply(&artifact_dir, &artifact, services, data_dir, force) {
+                // A deferral changed nothing, so it is not an error and must
+                // not read like one. Its own exit code lets a cron wrapper
+                // treat "the service was busy" as an ordinary tick.
+                Ok(danso::update::Applied::Deferred(gate)) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&gate).expect("serializable"));
+                    } else {
+                        println!("{}", gate.summary());
+                    }
+                    std::process::exit(gate.exit_code());
+                }
+                Ok(danso::update::Applied::Installed(report)) => {
                     if json {
                         println!("{}", serde_json::to_string(&report).expect("serializable"));
                     } else if report.replaced {

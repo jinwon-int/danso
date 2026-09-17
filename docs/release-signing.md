@@ -107,6 +107,39 @@ back. The two ways forward are `update rollback`, which supersedes the record
 and swaps the binaries back, and `update activate --retry`, for when the
 failure was environmental.
 
+## The idle gate
+
+Before any of that, `apply` asks whether the service is in the middle of a
+turn, and defers if it is — replacing the binary means restarting, and a
+restart during a turn kills the work in flight. The gate reads
+`workload.active_requests` and `workload.oldest_request_age_seconds` out of
+`health.json`, with the document's top-level `updated_at` for freshness.
+
+```
+danso update apply --artifact-dir <dir> --artifact <name> --data-dir <state-root>
+# exit 8: deferred, nothing was read, locked or written
+```
+
+Four rules, each of which exists because its absence breaks something:
+
+- **Exit 8, not an error.** Nothing happened, so a cron wrapper should treat
+  it as an ordinary tick (ccc registers its task `--success-exit-codes 0,8,11`).
+- **Bounded.** The wait accumulates in `state/self-update.deferred-since`
+  across runs and tops out at one hour, after which the update proceeds even
+  though the service is busy. Continuous load must not stop updates forever.
+- **A turn older than 30 minutes stops counting.** It is a wedged turn, not a
+  healthy service doing work, and treating it as busy lets one stuck turn hold
+  the deferral budget open.
+- **Fail-open.** No health document, unreadable, invalid, missing fields,
+  stale — all mean *proceed*. The gate is an optimisation for the common case,
+  not a safety property, and an update lane that one corrupt file can stop
+  silently is worse than a turn that occasionally dies.
+
+`--force` skips the gate. It kills the turn in flight, which is why it is a
+flag rather than the default.
+
+A node with no service publishes no health document and is never gated.
+
 ## Rotation
 
 1. Generate a new key pair on a trusted node, in memory-backed storage.
