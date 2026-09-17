@@ -107,6 +107,72 @@ back. The two ways forward are `update rollback`, which supersedes the record
 and swaps the binaries back, and `update activate --retry`, for when the
 failure was environmental.
 
+## The idle gate
+
+Before any of that, `apply` asks whether the service is in the middle of a
+turn, and defers if it is — replacing the binary means restarting, and a
+restart during a turn kills the work in flight. The gate reads
+`workload.active_requests` and `workload.oldest_request_age_seconds` out of
+`health.json`, with the document's top-level `updated_at` for freshness.
+
+```
+danso update apply --artifact-dir <dir> --artifact <name> --data-dir <state-root>
+# exit 8: deferred, nothing was read, locked or written
+```
+
+Four rules, each of which exists because its absence breaks something:
+
+- **Exit 8, not an error.** Nothing happened, so a cron wrapper should treat
+  it as an ordinary tick (ccc registers its task `--success-exit-codes 0,8,11`).
+- **Bounded.** The wait accumulates in `state/self-update.deferred-since`
+  across runs and tops out at one hour, after which the update proceeds even
+  though the service is busy. Continuous load must not stop updates forever.
+- **A turn older than 30 minutes stops counting.** It is a wedged turn, not a
+  healthy service doing work, and treating it as busy lets one stuck turn hold
+  the deferral budget open.
+- **Fail-open.** No health document, unreadable, invalid, missing fields,
+  stale — all mean *proceed*. The gate is an optimisation for the common case,
+  not a safety property, and an update lane that one corrupt file can stop
+  silently is worse than a turn that occasionally dies. This extends to the
+  marker itself: a deferral that cannot be written down cannot be bounded, so
+  it is not made. Without that rule an unwritable state directory — a
+  root-created marker a lower-privileged run can neither read nor replace —
+  would defer from zero on every run and block updates forever.
+
+`--force` skips the gate. It kills the turn in flight, which is why it is a
+flag rather than the default.
+
+A node with no service publishes no health document and is never gated. If the
+update runs in an environment that does not set `DANSO_TELEGRAM_DATA_DIR` while
+the service does — a different unit, a different user, a cron job without
+`HOME` — the gate resolves a path that does not exist and proceeds every time.
+Pass `--data-dir` explicitly wherever the two environments can differ.
+
+### What it does not protect
+
+`apply` replaces a file. It does not restart anything, and the SIGTERM that
+ends a turn comes from the restart that follows. An operator who runs `apply`,
+sees exit 8, and restarts by hand anyway is not protected by any of this. The
+gate's job is to make the *wrapper* stop early, which is why a deferral is an
+exit code rather than a warning.
+
+### Reading the log
+
+Every attempt leaves a line in `state/self-update.log`, including one that
+never started — otherwise a node several generations behind is
+indistinguishable from one whose updater never ran:
+
+| `event` | Meaning |
+|---|---|
+| `deferred` | busy; nothing was read, locked or written |
+| `gate_budget_exhausted` | busy, the hour ran out, **the turn was ended** |
+| `gate_untrackable` | busy, the deferral could not be recorded, **the turn was ended** |
+| `gate_forced` | `--force`; `active_requests` present if a turn was ended |
+
+The two that end a turn also print a warning to stderr. The counts
+(`active_requests`, `oldest_request_age_seconds`, `waited_seconds`) are the
+only thing carried over from the health document.
+
 ## Rotation
 
 1. Generate a new key pair on a trusted node, in memory-backed storage.

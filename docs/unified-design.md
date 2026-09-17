@@ -421,8 +421,23 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
 - `danso update --check` / `--apply`: 다운로드 → 해시·서명 검증(실패 시 exit 13,
   우회 없음) → 임시 경로에 풀고 `--version` 실행 검증 → 원자적 rename → 서비스
   모드면 §6.4 핸드오프로 재시작 → `state/self-update.log`(JSONL, 본문 없음) +
-  스풀 알림. 유휴 게이트: `health.json`의 `turn_occupancy`가 90초 내
-  `idle`일 때만, 최대 1시간 연기(fail-open은 ccc와 동일하게 유지).
+  스풀 알림.
+- 유휴 게이트(`danso-ops::idle`, ccc `bridge_is_busy` 이식): `health.json`의
+  `workload.active_requests`와 `oldest_request_age_seconds`를 읽고, 문서
+  신선도는 **최상위 `updated_at`이 90초 이내**인지로 본다. **`turn_occupancy`는
+  읽지 않는다** — 그건 같은 상태를 `status`·doctor용으로 렌더한 것이고,
+  게이트가 그걸 근거로 삼으면 한 사실에 정본이 둘이 된다(ccc 원본도 읽지
+  않으며, 그 테스트 픽스처가 두 스칼라만 쓴다). busy는 `신선 ∧ active>0 ∧
+  oldest < 1800초`이고, **1800초 상한**이 없으면 멈춘 턴 하나가 업데이트를
+  굶긴다. 연기는 마커 파일에 누적해 최대 1시간이며, 예산이 소진되면 busy여도
+  **진행한다**. 모르는 모든 경우(문서 없음·못 읽음·깨진 JSON·필드 없음·낡음)는
+  fail-open — 게이트는 안전 속성이 아니라 흔한 경우를 위한 최적화이고,
+  파일 하나가 업데이트를 영구히 막는 쪽이 더 나쁘다. 핸드오프(§6.4)가
+  fail-**closed**인 것과 방향이 반대이며, 둘 다 의도된 것이다.
+  연기 종료 코드는 **8**(ccc와 동일, cron이 정상 틱으로 취급).
+  문서는 교체 대상인 **옛 세대**가 쓴 것이므로 스키마는 느슨하게 읽는다 —
+  엄격히 파싱하면 스키마 추가가 파싱 실패가 되고, 파싱 실패는 fail-open이라
+  하필 지켜야 할 턴을 죽인다.
 - 소스 빌드 모드(`--from-git`): Termux 등 바이너리가 없는 대상용. 태그의
   서명(`git verify-tag`, 외부 `git`/`gpg` 필요)을 검증하고 `cargo build --locked`.
   이 모드는 선택이며 "Rust 재구현 완료" 판정에 포함하지 않는다.
