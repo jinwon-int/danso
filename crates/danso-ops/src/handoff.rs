@@ -124,10 +124,22 @@ pub enum HandoffError {
     RestartResultPending,
     /// The data directory is not a private directory this user owns.
     UnsafeDataDir,
+    /// The data directory was given as a relative path.
+    ///
+    /// Its own code, not [`UnsafeDataDir`]: the transient unit resolves it
+    /// against `/`, so this is a specific, recoverable operator mistake rather
+    /// than a permissions problem — and one an error message should name.
+    ///
+    /// [`UnsafeDataDir`]: HandoffError::UnsafeDataDir
+    RelativeDataDir,
     /// The receipt is not a private regular file this user owns.
     UnsafeReceipt,
-    /// The receipt is unreadable, oversized, or not this schema.
+    /// The receipt is unreadable or not this schema.
     InvalidReceipt,
+    /// The receipt is larger than the published surface is allowed to be.
+    ReceiptTooLarge,
+    /// The unit named is not one this module will restart.
+    InvalidUnit,
     /// The worker binary path does not name a file that can be executed.
     UnusableWorker,
 }
@@ -140,8 +152,11 @@ impl HandoffError {
             HandoffError::RestartAlreadyPending => "restart_already_pending",
             HandoffError::RestartResultPending => "restart_result_pending",
             HandoffError::UnsafeDataDir => "unsafe_data_dir",
+            HandoffError::RelativeDataDir => "relative_data_dir",
             HandoffError::UnsafeReceipt => "unsafe_receipt",
             HandoffError::InvalidReceipt => "invalid_receipt",
+            HandoffError::ReceiptTooLarge => "receipt_too_large",
+            HandoffError::InvalidUnit => "invalid_unit",
             HandoffError::UnusableWorker => "unusable_worker",
         }
     }
@@ -192,8 +207,22 @@ pub struct Receipt {
     pub request_id: String,
     pub state: State,
     pub unit: String,
-    /// The pid that asked. The replacement must not have it.
+    /// The pid that asked. Provenance only — **not** the completion anchor.
+    ///
+    /// ccc compares the replacement against this because its scheduler is the
+    /// bridge process itself. Here the scheduler is usually a short-lived CLI
+    /// whose pid the unit never had, so comparing against it would always
+    /// succeed and the proof would mean nothing. See [`previous_pid`].
+    ///
+    /// [`previous_pid`]: Receipt::previous_pid
     pub origin_pid: u32,
+    /// The unit's MainPID immediately before the restart, read by the worker.
+    ///
+    /// This is what the replacement must differ from. `None` when the unit was
+    /// not running, or systemd would not say — then anything that comes up is
+    /// a replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_pid: Option<u32>,
     pub created_at: i64,
     pub updated_at: i64,
     /// Whether the units are the user manager's rather than the system's.
@@ -241,17 +270,40 @@ pub fn archive_path(data_dir: &Path) -> PathBuf {
 /// `Ok(None)` means there is none, which is not an error — the ordinary state
 /// of a service nobody has asked to restart.
 pub fn read_receipt(data_dir: &Path) -> Result<Option<Receipt>, HandoffError> {
-    let path = receipt_path(data_dir);
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
+    // The directory is checked on every read, not only on write: a receipt
+    // that is itself a private file this user owns can still have been put
+    // there by somebody who could write the directory.
+    check_private_dir(data_dir)?;
+
+    // `O_NOFOLLOW` and then `fstat` on **this descriptor** — every check below
+    // is about the file that was actually opened. Checking a path and then
+    // opening it again leaves a window in which the name can become a symlink
+    // to something else; ccc opens dirfd-relative with `O_NOFOLLOW` and fstats
+    // the fd for exactly this reason.
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(receipt_path(data_dir))
+    {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // ELOOP lands here: the name is a symlink, which is not a receipt.
         Err(_) => return Err(HandoffError::UnsafeReceipt),
     };
+    let metadata = file.metadata().map_err(|_| HandoffError::UnsafeReceipt)?;
     check_private_file(&metadata)?;
-    if metadata.len() > MAX_RECEIPT_BYTES {
-        return Err(HandoffError::InvalidReceipt);
+    // The ceiling is on the bytes actually read, not on `metadata.len()`: the
+    // size of a file that can still grow is a hint, and an unbounded read of
+    // whatever is at that name is how this module already killed itself once.
+    let mut raw = Vec::new();
+    file.take(MAX_RECEIPT_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| HandoffError::UnsafeReceipt)?;
+    if raw.len() as u64 > MAX_RECEIPT_BYTES {
+        return Err(HandoffError::ReceiptTooLarge);
     }
-    let raw = std::fs::read(&path).map_err(|_| HandoffError::UnsafeReceipt)?;
     let receipt: Receipt =
         serde_json::from_slice(&raw).map_err(|_| HandoffError::InvalidReceipt)?;
     if receipt.schema != SCHEMA || receipt.schema_version != SCHEMA_VERSION {
@@ -265,16 +317,27 @@ pub fn read_receipt(data_dir: &Path) -> Result<Option<Receipt>, HandoffError> {
 /// believes about a restart.
 fn check_private_file(metadata: &std::fs::Metadata) -> Result<(), HandoffError> {
     use std::os::unix::fs::MetadataExt;
-    if !metadata.is_file() || metadata.nlink() != 1 {
-        return Err(HandoffError::UnsafeReceipt);
+    match is_private(
+        metadata.is_file(),
+        metadata.nlink(),
+        metadata.uid(),
+        metadata.mode(),
+        // SAFETY: `getuid` is always successful and has no preconditions.
+        unsafe { libc::getuid() },
+    ) {
+        true => Ok(()),
+        false => Err(HandoffError::UnsafeReceipt),
     }
-    if metadata.uid() != unsafe { libc::getuid() } {
-        return Err(HandoffError::UnsafeReceipt);
-    }
-    if metadata.mode() & 0o077 != 0 {
-        return Err(HandoffError::UnsafeReceipt);
-    }
-    Ok(())
+}
+
+/// The predicate, apart from the syscalls that feed it.
+///
+/// Separated so the owner clause can be tested. Every other clause can be
+/// arranged on a real file; "a file belonging to somebody else" cannot, inside
+/// a single-user test run, and an owner check no test reaches is an owner
+/// check that can be deleted without anybody noticing.
+fn is_private(is_file: bool, nlink: u64, uid: u32, mode: u32, expected_uid: u32) -> bool {
+    is_file && nlink == 1 && uid == expected_uid && mode & 0o077 == 0
 }
 
 /// The data directory must be ours and ours alone before anything is written
@@ -295,11 +358,17 @@ fn write_receipt(data_dir: &Path, receipt: &Receipt) -> Result<(), HandoffError>
     check_private_dir(data_dir)?;
     let encoded = serde_json::to_vec(receipt).map_err(|_| HandoffError::InvalidReceipt)?;
     if encoded.len() as u64 > MAX_RECEIPT_BYTES {
-        return Err(HandoffError::InvalidReceipt);
+        return Err(HandoffError::ReceiptTooLarge);
     }
-    let temporary = data_dir.join(format!(".{RECEIPT_FILE}.{}", std::process::id()));
-    write_private(&temporary, &encoded).map_err(|_| HandoffError::UnsafeReceipt)?;
-    if std::fs::rename(&temporary, receipt_path(data_dir)).is_err() {
+    // A random suffix, not just the pid: `create_new` on a pid-only name that
+    // a crashed predecessor left behind fails for every later process that
+    // recycles the pid, turning one interrupted write into a permanently
+    // unwritable receipt. ccc randomises for the same reason.
+    let temporary = data_dir.join(format!(".{RECEIPT_FILE}.{}", request_id()));
+    let written = write_private(&temporary, &encoded)
+        .and_then(|()| std::fs::rename(&temporary, receipt_path(data_dir)));
+    if written.is_err() {
+        // A partial write must not survive to be found later.
         let _ = std::fs::remove_file(&temporary);
         return Err(HandoffError::UnsafeReceipt);
     }
@@ -369,6 +438,14 @@ pub struct Plan<'a> {
 pub fn schedule(plan: &Plan<'_>, now: i64) -> Result<Scheduled, HandoffError> {
     check_unit(plan.unit)?;
     check_worker(plan.worker)?;
+    // A relative path would be resolved by the transient unit, whose working
+    // directory is `/` and not the caller's — measured on yukson 2026-09-17.
+    // The worker would find no receipt, exit quietly having restarted nothing,
+    // and leave the `prepared` receipt blocking every later request for its
+    // whole TTL, while the caller was told a restart was scheduled.
+    if !plan.data_dir.is_absolute() {
+        return Err(HandoffError::RelativeDataDir);
+    }
     check_private_dir(plan.data_dir)?;
 
     // The receipt is the mutex. A finished result nobody has read outranks a
@@ -407,6 +484,7 @@ pub fn schedule(plan: &Plan<'_>, now: i64) -> Result<Scheduled, HandoffError> {
         created_at: now,
         updated_at: now,
         user_scope,
+        previous_pid: None,
         new_pid: None,
         reason_code: None,
     };
@@ -431,19 +509,29 @@ pub fn schedule(plan: &Plan<'_>, now: i64) -> Result<Scheduled, HandoffError> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    match command.status() {
-        Ok(status) if status.success() => Ok(Scheduled {
+    // Bounded: `systemd-run` talks to the manager over D-Bus, and a caller
+    // that is itself a service must not hang here. ccc allows 8 seconds.
+    //
+    // A run that timed out is reported as refused, and the receipt removed. It
+    // may in fact have armed the timer before hanging — in which case that
+    // timer fires, finds no receipt, and restarts nothing. Both halves of that
+    // are fail-closed, which is the direction to be wrong in.
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            remove_receipt(plan.data_dir);
+            return Err(HandoffError::SystemdRunUnavailable);
+        }
+    };
+    match wait_bounded(&mut child, SCHEDULE_TIMEOUT) {
+        Some(true) => Ok(Scheduled {
             request_id,
             transient_unit,
             delay_seconds: delay,
         }),
-        Ok(_) => {
+        _ => {
             remove_receipt(plan.data_dir);
             Err(HandoffError::SystemdRunRejected)
-        }
-        Err(_) => {
-            remove_receipt(plan.data_dir);
-            Err(HandoffError::SystemdRunUnavailable)
         }
     }
 }
@@ -515,9 +603,7 @@ fn check_unit(unit: &str) -> Result<(), HandoffError> {
             .all(|c| c.is_ascii_alphanumeric() || "-_.@:".contains(c));
     match plausible {
         true => Ok(()),
-        // Reuse of the receipt vocabulary: an implausible unit reaching here
-        // means the caller is not the caller this module expects.
-        false => Err(HandoffError::UnsafeDataDir),
+        false => Err(HandoffError::InvalidUnit),
     }
 }
 
@@ -596,9 +682,16 @@ pub struct WorkerPlan<'a> {
 /// where it was taken as one: systemd reported success, the generation had not
 /// changed, and a failed activation went unnoticed for days. So the worker
 /// requires a health document that (a) postdates the request, (b) says
-/// `available`, and (c) names a *different* pid from the one that asked. A
-/// restart that re-executes the same image satisfies the first two and fails
-/// the third.
+/// `available`, and (c) names a MainPID **different from the one the unit had
+/// immediately before the restart**. A restart that re-executed the same image
+/// satisfies the first two and fails the third.
+///
+/// That third anchor is the pid read here, not the pid of whoever asked. ccc
+/// uses `origin_pid` because its scheduler *is* the bridge process, so the two
+/// coincide; here the scheduler is usually a short-lived CLI whose pid the
+/// unit never has, which would make the comparison trivially true and the
+/// whole proof vacuous. Reading the unit's own MainPID first holds for any
+/// caller.
 pub fn run_worker(plan: &WorkerPlan<'_>, mut now: impl FnMut() -> i64) -> i32 {
     let Ok(Some(mut receipt)) = read_receipt(plan.data_dir) else {
         return EXIT_WORKER_NOT_MINE;
@@ -611,6 +704,17 @@ pub fn run_worker(plan: &WorkerPlan<'_>, mut now: impl FnMut() -> i64) -> i32 {
         || receipt.user_scope != plan.user_scope
     {
         return EXIT_WORKER_NOT_MINE;
+    }
+    // The receipt is untrusted input even to its own worker: it names the unit
+    // that is about to be restarted, and this process can restart anything the
+    // manager will let it.
+    if check_unit(&receipt.unit).is_err() {
+        return finish(
+            plan.data_dir,
+            &mut receipt,
+            Err(FailureCode::WorkerError),
+            now(),
+        );
     }
     let systemctl = match plan.systemctl {
         Some(path) => path.to_path_buf(),
@@ -627,6 +731,12 @@ pub fn run_worker(plan: &WorkerPlan<'_>, mut now: impl FnMut() -> i64) -> i32 {
         },
     };
 
+    // Before the restart, so it describes the generation being replaced.
+    // `None` — the unit is not running, or systemd would not say — is not a
+    // reason to stop: anything that comes up afterwards is a replacement.
+    let previous_pid = main_pid(&systemctl, plan.user_scope, &receipt.unit);
+    receipt.previous_pid = previous_pid;
+
     receipt.state = State::Armed;
     receipt.updated_at = now();
     if write_receipt(plan.data_dir, &receipt).is_err() {
@@ -642,6 +752,7 @@ pub fn run_worker(plan: &WorkerPlan<'_>, mut now: impl FnMut() -> i64) -> i32 {
         &systemctl,
         plan.user_scope,
         &["restart", "--", &receipt.unit],
+        RESTART_TIMEOUT,
     );
     if !restarted {
         return finish(
@@ -668,24 +779,34 @@ pub fn run_worker(plan: &WorkerPlan<'_>, mut now: impl FnMut() -> i64) -> i32 {
     )
 }
 
+/// What systemd says the unit's main process is, if it says anything usable.
+fn main_pid(systemctl: &Path, user_scope: bool, unit: &str) -> Option<u32> {
+    let pid = systemctl_output(
+        systemctl,
+        user_scope,
+        &["show", "--property=MainPID", "--value", "--", unit],
+    )?
+    .trim()
+    .parse::<u32>()
+    .ok()?;
+    // systemd reports 0 for a unit with no main process.
+    (pid != 0).then_some(pid)
+}
+
 /// The pid that is serving, if it satisfies every part of the proof.
 fn serving_pid(systemctl: &Path, plan: &WorkerPlan<'_>, receipt: &Receipt) -> Option<u32> {
     if !systemctl_ok(
         systemctl,
         plan.user_scope,
         &["is-active", "--quiet", "--", &receipt.unit],
+        QUERY_TIMEOUT,
     ) {
         return None;
     }
-    let main_pid = systemctl_output(
-        systemctl,
-        plan.user_scope,
-        &["show", "--property=MainPID", "--value", "--", &receipt.unit],
-    )?
-    .trim()
-    .parse::<u32>()
-    .ok()?;
-    if main_pid == 0 || main_pid == receipt.origin_pid {
+    let main_pid = main_pid(systemctl, plan.user_scope, &receipt.unit)?;
+    // The generation being replaced, read before the restart. Equal means the
+    // unit re-executed the same process and nothing was replaced — #1527.
+    if Some(main_pid) == receipt.previous_pid {
         return None;
     }
     let raw = std::fs::read(plan.health_path).ok()?;
@@ -720,10 +841,21 @@ fn finish(
         }
     }
     receipt.updated_at = at;
-    // A worker that cannot write its own result still exits with the right
-    // code; the alternative is dying silently and leaving a `prepared` receipt
-    // that blocks the next request for its whole TTL.
-    let _ = write_receipt(data_dir, receipt);
+    // Only over its own request. A worker still running past
+    // `ACTIVE_TTL_SECONDS` may find that a second scheduler has taken over and
+    // written a fresh `prepared` receipt; writing this one on top would
+    // destroy that request, and the new timer would then fire, see a foreign
+    // id and restart nothing. ccc guards its failure path the same way.
+    //
+    // A worker that cannot write its result still exits with the right code:
+    // dying silently would leave a `prepared` receipt blocking the next
+    // request for its whole TTL.
+    if matches!(
+        read_receipt(data_dir),
+        Ok(Some(ref current)) if current.request_id == receipt.request_id
+    ) {
+        let _ = write_receipt(data_dir, receipt);
+    }
     match outcome {
         Ok(()) => 0,
         Err(_) => 1,
@@ -739,27 +871,74 @@ fn systemctl_command(systemctl: &Path, user_scope: bool, args: &[&str]) -> std::
     command
 }
 
-fn systemctl_ok(systemctl: &Path, user_scope: bool, args: &[&str]) -> bool {
-    systemctl_command(systemctl, user_scope, args)
+/// Bounds for the children this module spawns, matching ccc's.
+///
+/// Unbounded would be worse than it looks: a `systemctl restart` blocked on a
+/// unit's `TimeoutStopSec` can outlive [`ACTIVE_TTL_SECONDS`], at which point a
+/// second scheduler is entitled to take the request over and this worker is
+/// writing results for a request that is no longer current.
+const RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// `systemd-run`'s own budget; ccc allows 8 seconds for the same D-Bus call.
+const SCHEDULE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Wait for a child, killing it if it outstays the budget.
+///
+/// `None` means it was killed or could not be waited for — never "succeeded".
+fn wait_bounded(child: &mut std::process::Child, budget: std::time::Duration) -> Option<bool> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn systemctl_ok(
+    systemctl: &Path,
+    user_scope: bool,
+    args: &[&str],
+    budget: std::time::Duration,
+) -> bool {
+    let spawned = systemctl_command(systemctl, user_scope, args)
         .stdin(std::process::Stdio::null())
         // Captured and dropped. Nothing systemd says goes into the receipt.
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .spawn();
+    match spawned {
+        Ok(mut child) => wait_bounded(&mut child, budget).unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
+/// A bounded read of a *small* systemd property.
+///
+/// Safe to wait before reading only because the value is a handful of bytes —
+/// far inside the pipe buffer, so the child cannot block on writing it.
 fn systemctl_output(systemctl: &Path, user_scope: bool, args: &[&str]) -> Option<String> {
-    let output = systemctl_command(systemctl, user_scope, args)
+    use std::io::Read;
+    let mut child = systemctl_command(systemctl, user_scope, args)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    if wait_bounded(&mut child, QUERY_TIMEOUT) != Some(true) {
+        return None;
+    }
+    let stdout = child.stdout.take()?;
+    let mut raw = Vec::new();
+    stdout.take(4096).read_to_end(&mut raw).ok()?;
+    Some(String::from_utf8_lossy(&raw).into_owned())
 }
 
 #[cfg(test)]
@@ -786,6 +965,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             user_scope: true,
+            previous_pid: None,
             new_pid: None,
             reason_code: None,
         }
@@ -819,8 +999,15 @@ mod tests {
     #[test]
     fn a_symlinked_receipt_is_refused() {
         let (_temp, dir) = data_dir();
+        // The target is a private file this user owns, so every check except
+        // `O_NOFOLLOW` passes on it. A symlink test pointed at a 0644 file
+        // proves only that the mode check works.
         let elsewhere = dir.join("elsewhere.json");
-        std::fs::write(&elsewhere, b"{}").unwrap();
+        write_private(
+            &elsewhere,
+            &serde_json::to_vec(&receipt(State::Completed, 1)).unwrap(),
+        )
+        .unwrap();
         std::os::unix::fs::symlink(&elsewhere, receipt_path(&dir)).unwrap();
         assert_eq!(
             read_receipt(&dir),
@@ -832,10 +1019,21 @@ mod tests {
     #[test]
     fn a_receipt_from_another_schema_is_not_read() {
         let (_temp, dir) = data_dir();
-        let mut foreign = receipt(State::Completed, 100);
-        foreign.schema_version = 99;
-        write_receipt(&dir, &foreign).unwrap();
-        assert_eq!(read_receipt(&dir), Err(HandoffError::InvalidReceipt));
+        for mutate in [
+            (|r: &mut Receipt| r.schema_version = 99) as fn(&mut Receipt),
+            |r: &mut Receipt| r.schema = "danso.service.restart-handoff.v2".into(),
+            |r: &mut Receipt| r.schema = "ccc.self-update.activation.v1".into(),
+        ] {
+            let mut foreign = receipt(State::Completed, 100);
+            mutate(&mut foreign);
+            write_receipt(&dir, &foreign).unwrap();
+            assert_eq!(
+                read_receipt(&dir),
+                Err(HandoffError::InvalidReceipt),
+                "both halves of the schema identify the document, not just the \
+                 version"
+            );
+        }
     }
 
     #[test]
@@ -845,7 +1043,7 @@ mod tests {
         huge.unit = format!("{}.service", "a".repeat(MAX_RECEIPT_BYTES as usize));
         assert_eq!(
             write_receipt(&dir, &huge),
-            Err(HandoffError::InvalidReceipt),
+            Err(HandoffError::ReceiptTooLarge),
             "the published surface stays finite even when a field does not"
         );
     }
@@ -958,7 +1156,11 @@ mod tests {
                 0,
             )
             .unwrap_err();
-            assert_eq!(error, HandoffError::UnsafeDataDir, "{bad:?}");
+            assert_eq!(
+                error,
+                HandoffError::InvalidUnit,
+                "a bad unit name is a bad unit name, not an unsafe directory: {bad:?}"
+            );
             assert_eq!(read_receipt(&dir).unwrap(), None, "{bad:?}");
         }
     }
@@ -1207,7 +1409,13 @@ mod tests {
 here="$(dirname "$0")"
 for a in "$@"; do
   case "$a" in
-    restart)   [ -e "$here/restart_fails" ] && exit 1; exit 0 ;;
+    restart)
+      [ -e "$here/restart_fails" ] && exit 1
+      # A real restart changes MainPID. `after_pid` is what the unit reports
+      # once it has restarted; a test that does not write one is modelling a
+      # unit that re-executed the same process.
+      [ -e "$here/after_pid" ] && cp "$here/after_pid" "$here/main_pid"
+      exit 0 ;;
     is-active) [ -e "$here/inactive" ] && exit 3; exit 0 ;;
     show)      cat "$here/main_pid" 2>/dev/null || echo 0; exit 0 ;;
   esac
@@ -1221,6 +1429,13 @@ exit 0
     }
 
     fn publish_health(path: &Path, pid: u32, at: i64, state: &str) {
+        publish_health_pids(path, pid, pid, at, state)
+    }
+
+    /// `service_pid` and `process.pid` separately: the proof reads both, and a
+    /// fixture that sets them from one value lets either check be deleted for
+    /// free.
+    fn publish_health_pids(path: &Path, service_pid: u32, process_pid: u32, at: i64, state: &str) {
         let written = chrono::DateTime::from_timestamp(at, 0)
             .unwrap()
             .to_rfc3339();
@@ -1230,8 +1445,8 @@ exit 0
             "last_poll_at": written,
             "active_turn_count": 0,
             "queued_counts": {},
-            "service_pid": pid,
-            "process": {"pid": pid, "started_at": written, "mode": "run"},
+            "service_pid": service_pid,
+            "process": {"pid": process_pid, "started_at": written, "mode": "run"},
             "service": {"state": state},
             "telegram": {"state": "available", "consecutive_failures": 0},
             "workload": {
@@ -1291,7 +1506,9 @@ exit 0
         let (temp, dir) = data_dir();
         write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
         let systemctl = stub_systemctl(temp.path());
-        std::fs::write(temp.path().join("main_pid"), "7777\n").unwrap();
+        // The unit is serving 4242; the restart replaces it with 7777.
+        std::fs::write(temp.path().join("main_pid"), "4242\n").unwrap();
+        std::fs::write(temp.path().join("after_pid"), "7777\n").unwrap();
         let health = temp.path().join("health.json");
         publish_health(&health, 7777, 1_001, "available");
 
@@ -1303,6 +1520,12 @@ exit 0
         let done = read_receipt(&dir).unwrap().unwrap();
         assert_eq!(done.state, State::Completed);
         assert_eq!(done.new_pid, Some(7777));
+        assert_eq!(
+            done.previous_pid,
+            Some(4242),
+            "the anchor is the unit's own pid before the restart, recorded so \
+             an operator can see what was replaced"
+        );
         assert_eq!(done.reason_code, None);
     }
 
@@ -1312,9 +1535,16 @@ exit 0
         // generation had not changed. The origin pid still serving means the
         // replacement never happened, however healthy it looks.
         let (temp, dir) = data_dir();
-        write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
+        // Production shape: the scheduler is a short-lived CLI, so `origin_pid`
+        // is a pid the unit never had. Comparing against *that* is always true
+        // and proves nothing — which is why the anchor is the unit's own
+        // MainPID, read before the restart.
+        let mut asked = receipt(State::Prepared, 1_000);
+        asked.origin_pid = 999_001;
+        write_receipt(&dir, &asked).unwrap();
         let systemctl = stub_systemctl(temp.path());
-        // 4242 is the receipt's `origin_pid`.
+        // No `after_pid`: the unit reports the same MainPID after the restart
+        // as before it, which is exactly the #1527 shape.
         std::fs::write(temp.path().join("main_pid"), "4242\n").unwrap();
         let health = temp.path().join("health.json");
         publish_health(&health, 4242, 1_001, "available");
@@ -1479,6 +1709,397 @@ exit 0
             started.elapsed() < std::time::Duration::from_secs(30),
             "the deadline is wall-clock from the injected clock, so the loop \
              must end without sleeping out the real budget"
+        );
+    }
+
+    #[test]
+    fn both_pid_fields_in_the_health_document_must_agree() {
+        // The proof reads `service_pid` *and* `process.pid`. A fixture that
+        // sets them from one value lets either check be deleted for free, so
+        // disagreement has to be a failure in its own right.
+        for (service_pid, process_pid) in [(7777, 4242), (4242, 7777)] {
+            let (temp, dir) = data_dir();
+            write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
+            let systemctl = stub_systemctl(temp.path());
+            std::fs::write(temp.path().join("main_pid"), "4242\n").unwrap();
+            std::fs::write(temp.path().join("after_pid"), "7777\n").unwrap();
+            let health = temp.path().join("health.json");
+            publish_health_pids(&health, service_pid, process_pid, 1_001, "available");
+
+            let code = run_worker(
+                &worker_plan(&dir, &health, &systemctl, "0123456789abcdef"),
+                ticking(1_000, 30),
+            );
+            assert_eq!(
+                code, 1,
+                "a document whose two pids disagree ({service_pid}, {process_pid}) \
+                 does not identify a serving process"
+            );
+        }
+    }
+
+    #[test]
+    fn a_unit_with_no_main_process_is_not_a_replacement() {
+        // systemd reports MainPID 0 for a unit with no main process. Reading
+        // that as a pid would make "nothing is running" look like a restart.
+        let (temp, dir) = data_dir();
+        write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
+        let systemctl = stub_systemctl(temp.path());
+        std::fs::write(temp.path().join("main_pid"), "0\n").unwrap();
+        let health = temp.path().join("health.json");
+        publish_health(&health, 0, 1_001, "available");
+
+        assert_eq!(
+            run_worker(
+                &worker_plan(&dir, &health, &systemctl, "0123456789abcdef"),
+                ticking(1_000, 30)
+            ),
+            1
+        );
+        assert_eq!(
+            read_receipt(&dir).unwrap().unwrap().reason_code,
+            Some(FailureCode::HealthTimeout)
+        );
+    }
+
+    #[test]
+    fn a_dead_unit_is_not_a_restart_however_good_the_health_looks() {
+        // `is-active` is its own gate. Without it a health document left by a
+        // process that has since died would satisfy every other clause.
+        let (temp, dir) = data_dir();
+        write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
+        let systemctl = stub_systemctl(temp.path());
+        std::fs::write(temp.path().join("inactive"), b"").unwrap();
+        std::fs::write(temp.path().join("main_pid"), "4242\n").unwrap();
+        std::fs::write(temp.path().join("after_pid"), "7777\n").unwrap();
+        let health = temp.path().join("health.json");
+        publish_health(&health, 7777, 1_001, "available");
+
+        assert_eq!(
+            run_worker(
+                &worker_plan(&dir, &health, &systemctl, "0123456789abcdef"),
+                ticking(1_000, 30)
+            ),
+            1,
+            "everything but `is-active` says this restart worked"
+        );
+    }
+
+    #[test]
+    fn the_worker_arms_the_request_before_touching_systemd() {
+        // `armed` is what makes a duplicate timer a no-op. If the transition
+        // never lands, a second firing still sees `prepared` and restarts
+        // again — and the guard that reads it is testing nothing.
+        let (temp, dir) = data_dir();
+        write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
+        let systemctl = stub_systemctl(temp.path());
+        // The restart fails, so the worker stops right after arming.
+        std::fs::write(temp.path().join("restart_fails"), b"").unwrap();
+        let health = temp.path().join("health.json");
+        run_worker(
+            &worker_plan(&dir, &health, &systemctl, "0123456789abcdef"),
+            ticking(1_001, 1),
+        );
+        // It ends `failed`, but it passed through `armed`: a second worker
+        // arriving now finds a state that is not `prepared` and does nothing.
+        let after = read_receipt(&dir).unwrap().unwrap();
+        assert_ne!(after.state, State::Prepared);
+        assert_eq!(
+            run_worker(
+                &worker_plan(&dir, &health, &systemctl, "0123456789abcdef"),
+                ticking(1_002, 1)
+            ),
+            EXIT_WORKER_NOT_MINE
+        );
+    }
+
+    #[test]
+    fn a_worker_does_not_write_over_a_request_that_superseded_it() {
+        // Past the TTL a second scheduler may take the request over. The first
+        // worker, returning late, must not overwrite that fresh `prepared`
+        // receipt: the new timer would then fire, see a foreign id, and
+        // restart nothing while its receipt was gone.
+        let (temp, dir) = data_dir();
+        write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
+        let systemctl = stub_systemctl(temp.path());
+        let health = temp.path().join("health.json");
+
+        let mut mine = receipt(State::Armed, 1_000);
+        let mut theirs = receipt(State::Prepared, 2_000);
+        theirs.request_id = "ffffffffffffffff".to_string();
+        write_receipt(&dir, &theirs).unwrap();
+
+        finish(&dir, &mut mine, Err(FailureCode::HealthTimeout), 2_100);
+        let current = read_receipt(&dir).unwrap().unwrap();
+        assert_eq!(current.request_id, "ffffffffffffffff");
+        assert_eq!(current.state, State::Prepared);
+        let _ = systemctl;
+        let _ = health;
+    }
+
+    #[test]
+    fn health_slack_is_one_second_not_a_window() {
+        // The slack exists because two clocks read the same wall clock, not to
+        // admit documents from before the request. Widening it is how a
+        // pre-restart document becomes proof.
+        let (temp, dir) = data_dir();
+        write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
+        let systemctl = stub_systemctl(temp.path());
+        std::fs::write(temp.path().join("main_pid"), "4242\n").unwrap();
+        std::fs::write(temp.path().join("after_pid"), "7777\n").unwrap();
+        let health = temp.path().join("health.json");
+        // One second early: still accepted.
+        publish_health(&health, 7777, 999, "available");
+        assert_eq!(
+            run_worker(
+                &worker_plan(&dir, &health, &systemctl, "0123456789abcdef"),
+                ticking(1_001, 1)
+            ),
+            0
+        );
+
+        // Two seconds early: not.
+        let (temp, dir) = data_dir();
+        write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
+        let systemctl = stub_systemctl(temp.path());
+        std::fs::write(temp.path().join("main_pid"), "4242\n").unwrap();
+        std::fs::write(temp.path().join("after_pid"), "7777\n").unwrap();
+        let health = temp.path().join("health.json");
+        publish_health(&health, 7777, 998, "available");
+        assert_eq!(
+            run_worker(
+                &worker_plan(&dir, &health, &systemctl, "0123456789abcdef"),
+                ticking(1_000, 30)
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn the_worker_refuses_a_receipt_naming_a_unit_it_did_not_validate() {
+        // The receipt is the worker's only input and it names the unit about
+        // to be restarted. `schedule` validates; so must the worker, because
+        // nothing guarantees the same process wrote the file.
+        let (temp, dir) = data_dir();
+        let mut hostile = receipt(State::Prepared, 1_000);
+        hostile.unit = "-p".to_string();
+        write_receipt(&dir, &hostile).unwrap();
+        let systemctl = stub_systemctl(temp.path());
+        let health = temp.path().join("health.json");
+
+        assert_eq!(
+            run_worker(
+                &worker_plan(&dir, &health, &systemctl, "0123456789abcdef"),
+                ticking(1_001, 1)
+            ),
+            1
+        );
+        assert_eq!(
+            read_receipt(&dir).unwrap().unwrap().reason_code,
+            Some(FailureCode::WorkerError),
+            "and it must say it failed rather than quietly restarting nothing"
+        );
+    }
+
+    #[test]
+    fn a_relative_data_dir_is_refused_rather_than_scheduled() {
+        // The transient unit's working directory is `/`, not the caller's
+        // (measured on yukson 2026-09-17). A relative path would resolve
+        // somewhere else entirely: the worker would find no receipt, exit
+        // quietly, and the `prepared` receipt would block every later request
+        // for its whole TTL while the caller had been told a restart was on
+        // its way.
+        let (_temp, _dir) = data_dir();
+        let worker = std::env::current_exe().unwrap();
+        let relative = PathBuf::from("state");
+        let error = schedule(
+            &Plan {
+                data_dir: &relative,
+                unit: "danso.service",
+                worker: &worker,
+                delay_seconds: DEFAULT_DELAY_SECONDS,
+                user_scope: Some(true),
+                systemd_run: None,
+            },
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            HandoffError::RelativeDataDir,
+            "and it says which mistake it was: a missing directory reports \
+             `unsafe_data_dir`, so sharing that code would make this check \
+             impossible to tell apart from one"
+        );
+    }
+
+    #[test]
+    fn a_receipt_bigger_than_the_cap_is_refused_on_the_way_in_too() {
+        // The write-side cap is not enough: the file is read by a different
+        // process than wrote it, and an unbounded read of whatever is at that
+        // name is how this module already killed itself once.
+        let (_temp, dir) = data_dir();
+        let path = receipt_path(&dir);
+        write_private(&path, &vec![b'x'; (MAX_RECEIPT_BYTES + 1) as usize]).unwrap();
+        assert_eq!(read_receipt(&dir), Err(HandoffError::ReceiptTooLarge));
+    }
+
+    #[test]
+    fn a_receipt_in_a_directory_others_can_write_is_not_read() {
+        // Every per-file check passes — it really is our own 0600 file. What
+        // fails is the directory: somebody who can write it can rename an old
+        // terminal receipt back into place and replay it.
+        let (_temp, dir) = data_dir();
+        write_receipt(&dir, &receipt(State::Completed, 1)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(read_receipt(&dir), Err(HandoffError::UnsafeDataDir));
+    }
+
+    #[test]
+    fn a_receipt_belonging_to_somebody_else_is_refused() {
+        // The one clause a single-user test run cannot arrange on a real file.
+        let ours = 1_000;
+        assert!(is_private(true, 1, ours, 0o600, ours));
+        assert!(
+            !is_private(true, 1, ours + 1, 0o600, ours),
+            "a private, single-linked, regular file that somebody else owns is \
+             still somebody else's account of what happened to this restart"
+        );
+        assert!(!is_private(true, 1, 0, 0o600, ours), "root's, not ours");
+        // And the clauses that are arranged on real files elsewhere, pinned
+        // here too so each is independently load-bearing.
+        assert!(
+            !is_private(false, 1, ours, 0o600, ours),
+            "not a regular file"
+        );
+        assert!(!is_private(true, 2, ours, 0o600, ours), "hard-linked");
+        assert!(!is_private(true, 1, ours, 0o640, ours), "group-readable");
+        assert!(!is_private(true, 1, ours, 0o601, ours), "other-executable");
+    }
+
+    #[test]
+    fn a_hardlinked_receipt_is_refused() {
+        // A second name for the same inode means somebody else can keep a
+        // handle on it after we replace the one we know about.
+        let (_temp, dir) = data_dir();
+        let real = dir.join("kept.json");
+        write_private(
+            &real,
+            &serde_json::to_vec(&receipt(State::Completed, 1)).unwrap(),
+        )
+        .unwrap();
+        std::fs::hard_link(&real, receipt_path(&dir)).unwrap();
+        assert_eq!(read_receipt(&dir), Err(HandoffError::UnsafeReceipt));
+    }
+
+    #[test]
+    fn a_data_dir_that_is_not_a_directory_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let not_a_dir = temp.path().join("file");
+        write_private(&not_a_dir, b"{}").unwrap();
+        assert_eq!(read_receipt(&not_a_dir), Err(HandoffError::UnsafeDataDir));
+        assert_eq!(
+            write_receipt(&not_a_dir, &receipt(State::Prepared, 1)),
+            Err(HandoffError::UnsafeDataDir)
+        );
+    }
+
+    #[test]
+    fn a_unit_that_lost_its_main_process_is_not_a_replacement() {
+        // The unit was serving 4242 and comes back with no main process at
+        // all. MainPID 0 is systemd saying "nothing"; reading it as a pid
+        // makes an empty unit look like a successful restart.
+        let (temp, dir) = data_dir();
+        write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
+        let systemctl = stub_systemctl(temp.path());
+        std::fs::write(temp.path().join("main_pid"), "4242\n").unwrap();
+        std::fs::write(temp.path().join("after_pid"), "0\n").unwrap();
+        let health = temp.path().join("health.json");
+        publish_health(&health, 0, 1_001, "available");
+
+        assert_eq!(
+            run_worker(
+                &worker_plan(&dir, &health, &systemctl, "0123456789abcdef"),
+                ticking(1_000, 30)
+            ),
+            1
+        );
+        assert_eq!(
+            read_receipt(&dir).unwrap().unwrap().reason_code,
+            Some(FailureCode::HealthTimeout)
+        );
+    }
+
+    #[test]
+    fn the_receipt_says_armed_while_systemctl_is_running() {
+        // `armed` is what makes a duplicate timer a no-op, and the only moment
+        // it is observable is during the restart. The stub copies the receipt
+        // aside as it runs, which is the one way to see the transition landed
+        // rather than inferring it from the state afterwards.
+        let (temp, dir) = data_dir();
+        write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
+        let path = temp.path().join("systemctl");
+        let script = format!(
+            "#!/bin/sh\nhere=\"$(dirname \"$0\")\"\nfor a in \"$@\"; do\n  \
+             case \"$a\" in\n    restart) cp {receipt} \"$here/seen.json\"; exit 1 ;;\n  \
+             esac\ndone\nexit 0\n",
+            receipt = receipt_path(&dir).display()
+        );
+        std::fs::write(&path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let health = temp.path().join("health.json");
+
+        run_worker(
+            &worker_plan(&dir, &health, &path, "0123456789abcdef"),
+            ticking(1_001, 1),
+        );
+        let seen: Receipt =
+            serde_json::from_slice(&std::fs::read(temp.path().join("seen.json")).unwrap()).unwrap();
+        assert_eq!(
+            seen.state,
+            State::Armed,
+            "the request must be marked taken before the restart, not after"
+        );
+        assert_eq!(
+            seen.previous_pid, None,
+            "and the pre-restart anchor is recorded in the same write"
+        );
+    }
+
+    #[test]
+    fn the_worker_gives_up_within_the_health_deadline() {
+        // Otherwise the deadline is a number nothing reads: the loop would end
+        // eventually either way, just much later, and no test would notice.
+        let (temp, dir) = data_dir();
+        write_receipt(&dir, &receipt(State::Prepared, 1_000)).unwrap();
+        let systemctl = stub_systemctl(temp.path());
+        std::fs::write(temp.path().join("inactive"), b"").unwrap();
+        let health = temp.path().join("health.json");
+
+        // Counted polls, not elapsed injected seconds. A bound written in
+        // terms of the constant grows with it, so widening the deadline would
+        // widen the assertion too and pin nothing. At 20 seconds a poll, a
+        // one-minute deadline is a handful of rounds and a ten-minute one is
+        // not.
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&polls);
+        let mut clock = 1_000i64;
+        run_worker(
+            &worker_plan(&dir, &health, &systemctl, "0123456789abcdef"),
+            move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let now = clock;
+                clock += 20;
+                now
+            },
+        );
+        let polls = polls.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            polls <= 10,
+            "{polls} clock reads before giving up; a one-minute deadline at 20 \
+             seconds a poll is a few rounds, not dozens"
         );
     }
 

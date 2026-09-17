@@ -238,8 +238,15 @@ fn main() {
                         scheduled.delay_seconds,
                     ));
                 while std::time::Instant::now() < deadline {
-                    match danso::service::restart_status(data_dir.clone(), user, false) {
-                        Ok(Some(receipt)) if receipt.state.is_terminal() => {
+                    match danso::service::restart_status(data_dir.clone(), user) {
+                        // This request's answer, not whatever answer is
+                        // current: a receipt from an earlier request would
+                        // otherwise be reported as this one's outcome and then
+                        // archived, losing both.
+                        Ok(Some(receipt))
+                            if receipt.request_id == scheduled.request_id
+                                && receipt.state.is_terminal() =>
+                        {
                             if json {
                                 println!(
                                     "{}",
@@ -252,9 +259,14 @@ fn main() {
                                 danso_ops::handoff::State::Completed => 0,
                                 _ => 1,
                             };
-                            // Waiting *is* reading it, so file it away; leaving
-                            // it would block the next restart forever.
-                            let _ = danso::service::restart_status(data_dir, user, true);
+                            // Delivered, so file it away — after printing, and
+                            // only this request's. Leaving it would block the
+                            // next restart forever.
+                            let _ = danso::service::acknowledge_restart(
+                                data_dir,
+                                user,
+                                &scheduled.request_id,
+                            );
                             std::process::exit(code);
                         }
                         _ => std::thread::sleep(Duration::from_secs(1)),
@@ -276,12 +288,24 @@ fn main() {
                 data_dir,
                 acknowledge,
                 json,
-            } => match danso::service::restart_status(data_dir, false, acknowledge) {
+            } => match danso::service::restart_status(data_dir.clone(), false) {
                 Ok(Some(receipt)) => {
                     if json {
                         println!("{}", serde_json::to_string(&receipt).expect("serializable"));
                     } else {
                         println!("{}", receipt.summary());
+                    }
+                    // Archive only after the answer has been delivered: doing
+                    // it first means a closed pipe destroys the only copy.
+                    if acknowledge
+                        && let Err(error) = danso::service::acknowledge_restart(
+                            data_dir,
+                            false,
+                            &receipt.request_id,
+                        )
+                    {
+                        eprintln!("service restart-status: not archived: {error}");
+                        std::process::exit(3);
                     }
                     std::process::exit(match receipt.state {
                         danso_ops::handoff::State::Failed => 1,

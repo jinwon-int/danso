@@ -152,10 +152,22 @@ unblocks the next one. Losing the answer to a restart is worse than refusing a
 second one, which is why the block has no timeout. A request still *in flight*
 blocks for five minutes, so a worker that died does not hold the door forever.
 
-A restart is only `completed` when a **different** pid is serving and has
-published `available` health that postdates the request. A unit that restarted
-into the same image reports success to systemd and changes nothing; that is
-ccc-node #1527, and it is why the unit's own exit status is not the evidence.
+A restart is only `completed` when the unit's MainPID **differs from what it
+was immediately before the restart**, and that new process has published
+`available` health postdating the request. A unit that restarted into the same
+image reports success to systemd and changes nothing; that is ccc-node #1527,
+and it is why the unit's own exit status is not the evidence.
+
+The anchor is the unit's own pid, read by the worker before it restarts
+anything — not the pid of whoever asked. ccc compares against the requester
+because there the requester *is* the service; here it is usually a short-lived
+CLI whose pid the unit never had, and comparing against that would be true
+every time.
+
+`danso service restart` refuses a relative `--data-dir` (`relative_data_dir`).
+The transient unit's working directory is `/`, so a relative path would resolve
+somewhere else, the worker would find no receipt, and the request would sit
+blocking for five minutes while the operator had been told it was scheduled.
 
 Failures are codes, never output: `restart_failed`, `health_timeout`,
 `worker_error`. The receipt is designed to be delivered verbatim into a chat,

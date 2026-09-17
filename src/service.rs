@@ -573,22 +573,24 @@ fn systemctl(scope: Scope, args: &[&str]) -> Result<()> {
 /// The text `install` prints where systemd is absent.
 /// The binary the transient unit should execute.
 ///
-/// Prefers the unit's own `ExecStart` target over `current_exe()`. They differ
-/// exactly when it matters: after `update apply` swaps the binary, the running
-/// process's `/proc/self/exe` points at the replaced inode and readlink renders
-/// it `… (deleted)`. A timer built from that path would fire into nothing. The
-/// installed path is also the one that will actually serve after the restart,
-/// which is the image the caller meant.
+/// `spec.exe` is this process's own `current_exe()` — the same value the unit
+/// renderer uses for `ExecStart`, resolved the same way. The check that matters
+/// is the `" (deleted)"` one: after `update apply` swaps the binary, a process
+/// still running the old image resolves `/proc/self/exe` to an unlinked inode
+/// and readlink renders the path with that suffix. A transient unit built from
+/// it would fire into nothing, minutes later, with no way to say so.
+///
+/// Reading `ExecStart` back out of the installed unit would be the stronger
+/// answer — it names the image that will actually serve — but nothing does
+/// that yet, and pretending otherwise in a comment is how the next reader
+/// stops checking.
 fn worker_binary(spec: &UnitSpec) -> Result<PathBuf> {
-    if spec.exe.is_file() && !spec.exe.to_string_lossy().ends_with(" (deleted)") {
-        return Ok(spec.exe.clone());
-    }
-    let exe = std::env::current_exe().context("could not resolve the running binary")?;
+    let exe = &spec.exe;
     anyhow::ensure!(
-        exe.is_file() && !exe.to_string_lossy().ends_with(" (deleted)"),
+        exe.is_absolute() && exe.is_file() && !exe.to_string_lossy().ends_with(" (deleted)"),
         "the running binary has been replaced; reinstall before restarting"
     );
-    Ok(exe)
+    Ok(exe.clone())
 }
 
 /// Arm a restart that runs outside this unit's cgroup.
@@ -636,20 +638,29 @@ pub fn restart_worker(data_dir: PathBuf, request_id: String, user_scope: bool) -
     )
 }
 
-/// Read the restart receipt, optionally filing it away.
+/// Read the restart receipt. Reading does not consume it.
 pub fn restart_status(
     data_dir: Option<PathBuf>,
     user: bool,
-    acknowledge: bool,
 ) -> Result<Option<danso_ops::handoff::Receipt>> {
     let spec = unit_spec(data_dir, user)?;
-    let receipt = danso_ops::handoff::read_receipt(&spec.data_dir)
-        .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
-    if acknowledge && let Some(receipt) = &receipt {
-        danso_ops::handoff::archive_receipt(&spec.data_dir, &receipt.request_id)
-            .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
-    }
-    Ok(receipt)
+    danso_ops::handoff::read_receipt(&spec.data_dir)
+        .map_err(|error| anyhow::anyhow!("{}", error.code()))
+}
+
+/// File a finished receipt away, which is what unblocks the next restart.
+///
+/// Separate from reading, and called **after** the caller has delivered it.
+/// Archiving first means a failed delivery — a closed pipe, a full terminal —
+/// destroys the only copy of an answer nobody has seen.
+pub fn acknowledge_restart(
+    data_dir: Option<PathBuf>,
+    user: bool,
+    request_id: &str,
+) -> Result<bool> {
+    let spec = unit_spec(data_dir, user)?;
+    danso_ops::handoff::archive_receipt(&spec.data_dir, request_id)
+        .map_err(|error| anyhow::anyhow!("{}", error.code()))
 }
 
 pub fn termux_guidance(spec: &UnitSpec) -> String {

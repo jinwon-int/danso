@@ -506,7 +506,14 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
     `ACTIVE_TTL_SECONDS`(300초)까지만 막아, 멈춘 워커가 문을 영원히 잡지 못한다.
   - **완료 판정은 §6.3과 같은 규칙**: "유닛이 재시작됐다"는 증거가 아니다
     (#1527). 요청보다 **뒤에** 쓰였고, `service.state=available`이고,
-    `MainPID`가 **요청한 pid와 다른** health 문서만 완료로 친다.
+    `MainPID`가 **재시작 직전 그 유닛의 MainPID와 다른** health 문서만 완료로
+    친다. 기준점은 워커가 재시작 전에 읽은 **유닛 자신의 pid**이지 요청자의
+    pid가 아니다 — ccc는 요청자가 곧 브리지라 둘이 일치하지만, 여기서는
+    요청자가 대개 짧게 사는 CLI라 그 pid를 유닛이 가진 적이 없고, 그걸 비교하면
+    **항상 참이 되어 증명이 공허해진다**(적대적 리뷰 F1).
+  - `--data-dir`는 **절대 경로만** 받는다(`relative_data_dir`). transient
+    유닛의 working directory는 `/`라 상대 경로는 다른 곳을 가리키고, 워커는
+    영수증을 못 찾고 조용히 끝나며, 운영자는 예약됐다고 들은 채 5분간 막힌다.
   - **`--timer-property=AccuracySec=1s`가 load-bearing.** systemd 기본
     `AccuracySec`은 **1분**이라 `--on-active=5s`는 하한일 뿐이다. yukson
     2026-09-17 실측: 5초로 요청한 핸드오프가 **18초** 뒤 발화했고
