@@ -478,6 +478,10 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
   남긴다(ccc `restart_handoff` 불변조건).
 - systemd가 없는 환경(Termux): `danso service run --supervise`가 포그라운드
   감시 루프를 제공한다. crash policy는 60초 내 5회 급속 크래시면 중단.
+  **시그널 사망은 그 자체로 정상 종료가 아니다** — SIGTERM·SIGINT·SIGHUP만
+  운영자 정지로 보고, SIGKILL·SIGSEGV 등은 재기동한다. `service stop`이
+  예산 초과로 SIGKILL까지 간 경우는 `stopping.json` 마커(pid·시각)로 구분하며,
+  마커 없이 죽은 것은 재기동한다(#118 실측: OOM 킬이 무감시로 남았다).
   `termux-wake-lock`이 있으면 호출. 부팅 자동 기동은 Termux:Boot 스크립트를
   문서화만 한다.
 - 종료: 예산은 **2단**이며 두 값은 같은 계층이 아니다(ccc `bridge/start.sh`

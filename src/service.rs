@@ -207,6 +207,10 @@ pub fn stop(data_dir: Option<PathBuf>, grace: Duration) -> Result<StopOutcome> {
     if !record.is_live() {
         return Ok(StopOutcome::NotRunning);
     }
+    // Announce the stop before signalling. A supervisor that reaps the child
+    // between the signal and the marker would read a kill as a crash and start
+    // a replacement on top of a teardown that never ran.
+    let _marker = danso_ops::stop::begin_stop(&data_dir, record.pid)?;
     Ok(danso_ops::stop::terminate_and_wait(record.pid, grace))
 }
 
@@ -247,17 +251,31 @@ pub fn supervise(data_dir: Option<PathBuf>) -> Result<i32> {
 
     let mut policy = danso_ops::CrashPolicy::new();
     loop {
-        let status = std::process::Command::new(&exe)
+        // `spawn`, not `status`: the child's pid is what ties a death to the
+        // stop marker, and `status` throws it away.
+        let mut child = std::process::Command::new(&exe)
             .arg("service")
             .arg("run")
             .arg("--data-dir")
             .arg(&data_dir)
-            .status()
+            .spawn()
             .context("could not start the supervised service")?;
-        // A signal-terminated child has no exit code. SIGTERM to the whole
-        // process group is how an operator stops a supervised service, so it
-        // counts as a clean exit rather than a crash to restart from.
-        let clean = status.success() || status.code().is_none();
+        let child_pid = child.id();
+        let status = child.wait().context("could not wait for the service")?;
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
+        // A signal alone does not say who sent it. `service stop` escalates to
+        // SIGKILL when the budget runs out, so the marker it leaves is what
+        // separates that from the service being killed — by the OOM killer
+        // above all, which is the likeliest death on the one platform where
+        // this loop *is* the restart policy.
+        let stopping = danso_ops::stop::stop_in_progress(&data_dir, child_pid, chrono::Utc::now());
+        let clean = danso_ops::supervise::is_operator_stop(status.success(), signal, stopping);
         match policy.record(clean, std::time::Instant::now()) {
             danso_ops::Decision::Stop => return Ok(0),
             danso_ops::Decision::Restart => {}

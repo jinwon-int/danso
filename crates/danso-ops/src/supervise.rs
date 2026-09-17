@@ -25,6 +25,36 @@ pub const CRASH_LOOP_EXIT: i32 = 75;
 /// The `health.json` reason published when supervision gives up.
 pub const CRASH_LOOP_REASON: &str = "crash-loop";
 
+/// Signals that mean an operator took the service down.
+///
+/// SIGTERM and SIGINT are how a stop reaches a process group; SIGHUP is how a
+/// closing session does. Everything else — SIGKILL, SIGSEGV, SIGABRT, and the
+/// OOM killer's SIGKILL above all — is the service dying, which is the whole
+/// reason supervision exists.
+pub const OPERATOR_SIGNALS: [i32; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
+
+/// Whether an exit was the service stopping rather than dying.
+///
+/// The original rule was "no exit code means a signal, and a signal means the
+/// operator", which is true of `SIGTERM` to the process group and false of
+/// every other way a process is signalled. Under it a `SIGKILL` — including the
+/// OOM killer's, the most likely death on the one platform where `--supervise`
+/// *is* the restart policy — read as a clean stop and supervision quietly
+/// ended. Measured on yukson 2026-09-17 (#118): `kill -9` on the child left no
+/// process, no restart and an empty log.
+///
+/// `stopping` is the other half. `service stop` escalates to `SIGKILL` when the
+/// grace budget runs out, and ccc-node's contract is explicit that a restart
+/// must not launch on top of a process whose teardown never ran. So an
+/// operator-initiated stop says so out of band, and that marker — not the
+/// signal number — is what makes a kill clean.
+pub fn is_operator_stop(success: bool, signal: Option<i32>, stopping: bool) -> bool {
+    if success || stopping {
+        return true;
+    }
+    signal.is_some_and(|signal| OPERATOR_SIGNALS.contains(&signal))
+}
+
 /// What supervision decided after an exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -72,6 +102,53 @@ impl CrashPolicy {
     /// Crashes currently inside the window.
     pub fn rapid_crashes(&self) -> usize {
         self.recent.len()
+    }
+}
+
+#[cfg(test)]
+mod operator_stop_tests {
+    use super::*;
+
+    #[test]
+    fn a_clean_exit_is_a_stop() {
+        assert!(is_operator_stop(true, None, false));
+    }
+
+    #[test]
+    fn the_signals_an_operator_sends_are_a_stop() {
+        for signal in OPERATOR_SIGNALS {
+            assert!(
+                is_operator_stop(false, Some(signal), false),
+                "signal {signal} reaches the process group when an operator \
+                 stops a supervised service"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kill_is_a_crash_unless_a_stop_is_under_way() {
+        // The OOM killer's signal, on the one platform where supervision is
+        // the restart policy. Reading it as a stop is how a service dies and
+        // nothing brings it back.
+        assert!(!is_operator_stop(false, Some(libc::SIGKILL), false));
+        // But `service stop` escalates to SIGKILL when the budget runs out,
+        // and restarting on top of a teardown that never ran is worse.
+        assert!(is_operator_stop(false, Some(libc::SIGKILL), true));
+    }
+
+    #[test]
+    fn the_other_ways_a_service_dies_are_crashes() {
+        for signal in [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGFPE] {
+            assert!(
+                !is_operator_stop(false, Some(signal), false),
+                "signal {signal} is the service dying"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_zero_exit_is_still_a_crash() {
+        assert!(!is_operator_stop(false, None, false));
     }
 }
 
