@@ -85,6 +85,9 @@ pub const ARCHIVE_MEMBER: &str = "danso";
 
 /// Default time the staged binary gets to answer `--version`.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to keep retrying a probe whose image is still held open for
+/// writing by a descriptor some other thread's child inherited.
+const SPAWN_RETRY_WINDOW: Duration = Duration::from_secs(5);
 /// Hard cap on what the probe may write, enforced with `RLIMIT_FSIZE` so the
 /// kernel stops the child at the limit instead of this module noticing
 /// afterwards that a disk was filled.
@@ -637,7 +640,7 @@ pub(crate) fn probe_version(
         .stdout(std::process::Stdio::from(file))
         .stderr(std::process::Stdio::null());
     limit_output(&mut command, PROBE_OUTPUT_LIMIT);
-    let mut child = command.spawn().context("run the staged binary")?;
+    let mut child = spawn_probe(&mut command)?;
 
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -677,6 +680,37 @@ pub(crate) fn probe_version(
         "the staged binary reported an unusable version"
     );
     Ok(version.to_string())
+}
+
+/// Spawn the probe, retrying while the image is still held open for writing.
+///
+/// `execve` fails with `ETXTBSY` while *any* process holds a write descriptor
+/// to the file. This module closes its own before probing, but a child forked
+/// by another thread inherits a copy of every open descriptor and keeps it
+/// until its own `exec` — the same fork window that makes the update lock need
+/// a retry. The descriptor is `CLOEXEC`, so the window is short and closes on
+/// its own; failing the whole update because of it would mean a busy host
+/// cannot install a release.
+///
+/// `EAGAIN` is retried for the same reason: a `fork` that could not get a
+/// process slot is a transient condition, not a bad artifact.
+fn spawn_probe(command: &mut std::process::Command) -> Result<std::process::Child> {
+    let deadline = Instant::now() + SPAWN_RETRY_WINDOW;
+    loop {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) => {
+                let transient = matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::ETXTBSY || code == libc::EAGAIN
+                );
+                if !transient || Instant::now() >= deadline {
+                    return Err(error).context("run the staged binary");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 /// Cap what a child may write, so a flooding probe is stopped by the kernel.
@@ -1789,7 +1823,7 @@ mod tests {
 
         STOP_AFTER_SNAPSHOT.with(|flag| flag.set(true));
         let error = rollback(&fixture.home, vec![]).unwrap_err();
-        assert!(error.to_string().contains("stopped between"), "{error}");
+        assert!(error.to_string().contains("stopped between"), "{error:#}");
 
         // What a crash in that window leaves behind. The record is the
         // contract, so it has to describe this exactly.
@@ -1881,6 +1915,49 @@ mod tests {
             release::hex_digest(b"#!/bin/sh\necho 'danso 0.0.1'\n"),
             "the known-good rollback target is untouched"
         );
+    }
+
+    /// `execve` returns `ETXTBSY` while any process holds the image open for
+    /// writing. This module closes its own descriptor first, but a child
+    /// forked by another thread carries a copy until its own `exec`, so on a
+    /// busy host the probe can hit a file nothing is really writing to. A
+    /// write handle held here reproduces that deterministically.
+    #[test]
+    fn a_probe_waits_out_a_write_handle_someone_else_still_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("probe-target");
+        write_new_executable(&binary, script("echo 'danso 4.5.6'").as_bytes()).unwrap();
+
+        let holder = fs::OpenOptions::new().write(true).open(&binary).unwrap();
+        // Without a retry the spawn fails immediately; with one it waits for
+        // the descriptor to go away, which is what the fork window does.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(holder);
+        });
+
+        let version = probe_version(&binary, &dir.path().join("capture"), Duration::from_secs(5))
+            .expect("a transient ETXTBSY must not fail the update");
+        release.join().unwrap();
+        assert_eq!(version, "4.5.6");
+    }
+
+    #[test]
+    fn a_probe_gives_up_on_a_write_handle_that_never_goes_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("probe-target");
+        write_new_executable(&binary, script("echo 'danso 4.5.6'").as_bytes()).unwrap();
+        let _holder = fs::OpenOptions::new().write(true).open(&binary).unwrap();
+
+        // Held for longer than the retry window: the retry is bounded, so a
+        // genuinely unusable image still fails rather than hanging the update.
+        let error = probe_version(
+            &binary,
+            &dir.path().join("capture"),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("staged binary"), "{error:#}");
     }
 
     #[test]
