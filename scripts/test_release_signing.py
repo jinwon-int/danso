@@ -25,6 +25,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PUBLIC_KEY = ROOT / "keys/danso-release.pub"
 WORKFLOW = ROOT / ".github/workflows/signing-selftest.yml"
+RELEASE = ROOT / ".github/workflows/release.yml"
 SECRET_NAME = "MINISIGN_SECRET_KEY"
 
 # The trust root, pinned. Rotating the release key is supposed to be a visible
@@ -83,6 +84,68 @@ def validate_public_key(text):
     # The comment is what a human reads; a mismatch means the file was swapped
     # without updating what it claims to be.
     assert KEY_ID in lines[0], "comment line must name the key id"
+
+
+# The producing workflow's own load-bearing lines. Each one fails invisibly:
+# without `-H` the release verifies here and is refused on every node; without
+# the layout check a bad archive is signed and only fails at install time;
+# without the ref and gate guards the signing key is reachable from an
+# unreviewed branch.
+RELEASE_VERIFY = 'minisign -V -H -p "${pubkey}" -m SHA256SUMS'
+RELEASE_REQUIRED_LINES = (
+    "          set -euo pipefail",
+    f"          {RELEASE_VERIFY}",
+    "          sha256sum -c SHA256SUMS",
+    '          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then',
+    '          if [ "${GATE}" != "configured" ]; then',
+    '            echo "release failed: a tampered manifest verified"',
+    """            echo "archive must contain exactly one member named 'danso', found:\"""",
+    '          sha256sum -- "${archives[@]}" > SHA256SUMS',
+    '          minisign -S -s "${key}" -m SHA256SUMS -t "danso ${VERSION} ${GITHUB_SHA}"',
+)
+
+
+def validate_release_workflow(text):
+    """The release workflow may not be reachable from an unreviewed ref."""
+    events = text.split("\non:\n", 1)[1].split("\npermissions:\n", 1)[0]
+    # A tag can be put on any commit and the workflow that runs is the one at
+    # that commit, so a tag trigger routes around the review rules on `main`
+    # that are part of the signing boundary.
+    assert not re.search(r"^  push", events, re.M), "must not run on push, including tags"
+    assert not re.search(r"^  pull_request", events, re.M), "must not run on pull_request"
+    assert not re.search(r"^  release", events, re.M), "must not run on release events"
+    assert re.search(r"^  workflow_dispatch:$", events, re.M), "manual dispatch only"
+
+    # Scoped to the whole file, not just the signing job: `|| true` in the
+    # build job would mask the archive-layout check, which is the one thing
+    # standing between a malformed archive and a signature over it.
+    for pattern, reason in FORBIDDEN:
+        assert not re.search(pattern, text, re.M), reason
+
+    sign = text.split("\n  sign:\n", 1)[1]
+    assert re.search(r"^    runs-on: ubuntu-24\.04$", sign, re.M), "minisign needs noble"
+    assert re.search(r"^    environment: release$", sign, re.M), "the secret belongs to an environment"
+    assert re.search(r"shred -u", sign), "must destroy the key file it wrote"
+
+    lines = text.splitlines()
+    for line in RELEASE_REQUIRED_LINES:
+        assert line in lines, f"missing exact line: {line.strip()}"
+
+    for line in sign.splitlines():
+        if SECRET_EXPANSION.search(line):
+            assert line in SECRET_LINES, f"unexpected use of the secret: {line.strip()}"
+    steps = re.split(r"^      - (?:name|uses):", sign, flags=re.M)
+    signing = [step for step in steps if SECRET_EXPANSION.search(step)]
+    assert len(signing) == 1, "exactly one step may read the signing secret"
+
+    # The build job must not be on the signing runner: its glibc is the
+    # floor every node has to clear, and noble's is higher than the fleet's.
+    build = text.split("\n  build:\n", 1)[1].split("\n  sign:\n", 1)[0]
+    assert re.search(r"^    runs-on: ubuntu-22\.04$", build, re.M), (
+        "the build job stays on the oldest supported runner; releasing from "
+        "noble raises the glibc floor for every node that installs it"
+    )
+    assert not SECRET_EXPANSION.search(build), "the build job must not see the secret"
 
 
 def validate_workflow(text):
@@ -239,6 +302,157 @@ class SelfTestWorkflow(unittest.TestCase):
                     "          umask 077\n", '          umask 077\n          cat "${key}"\n', 1
                 )
             )
+
+
+class ReleaseWorkflow(unittest.TestCase):
+    """The producing half. Every mutation here leaves a workflow that still
+    runs and still produces something — which is the point: none of these
+    failures announce themselves."""
+
+    def setUp(self):
+        self.text = RELEASE.read_text()
+
+    def rejects(self, text, fragment=""):
+        with self.assertRaises(AssertionError) as caught:
+            validate_release_workflow(text)
+        if fragment:
+            self.assertIn(fragment, str(caught.exception))
+
+    def test_live_workflow(self):
+        validate_release_workflow(self.text)
+
+    def test_tag_trigger_rejected(self):
+        # The whole reason this workflow is manual: a tag can be placed on any
+        # commit, and the workflow that runs is the one at that commit.
+        self.rejects(
+            self.text.replace(
+                "on:\n  workflow_dispatch:",
+                "on:\n  push:\n    tags: ['v*']\n  workflow_dispatch:",
+            ),
+            "must not run on push",
+        )
+
+    def test_pull_request_trigger_rejected(self):
+        self.rejects(
+            self.text.replace(
+                "on:\n  workflow_dispatch:", "on:\n  pull_request:\n  workflow_dispatch:"
+            ),
+            "pull_request",
+        )
+
+    def test_release_event_trigger_rejected(self):
+        self.rejects(
+            self.text.replace(
+                "on:\n  workflow_dispatch:",
+                "on:\n  release:\n    types: [published]\n  workflow_dispatch:",
+            ),
+            "release events",
+        )
+
+    def test_dropped_ref_guard_rejected(self):
+        self.rejects(
+            self.text.replace('          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then', "          if false; then"),
+        )
+
+    def test_dropped_environment_gate_rejected(self):
+        self.rejects(
+            self.text.replace('          if [ "${GATE}" != "configured" ]; then', "          if false; then"),
+        )
+
+    def test_dropped_environment_rejected(self):
+        # Without it the secret is a repository secret any job can read.
+        self.rejects(self.text.replace("    environment: release\n", ""), "environment")
+
+    def test_verification_without_prehash_flag_rejected(self):
+        # Green here, refused on every node: danso-ops rejects legacy
+        # signatures and `minisign -V` accepts them without `-H`.
+        self.rejects(self.text.replace(RELEASE_VERIFY, 'minisign -V -p "${pubkey}" -m SHA256SUMS'))
+
+    def test_dropped_digest_check_rejected(self):
+        # A signed manifest whose digests do not match the artifacts it names
+        # is a correctly signed lie.
+        self.rejects(self.text.replace("          sha256sum -c SHA256SUMS\n", ""))
+
+    def test_dropped_layout_check_rejected(self):
+        self.rejects(
+            self.text.replace(
+                """            echo "archive must contain exactly one member named 'danso', found:\"""",
+                '            echo "unexpected layout"',
+            )
+        )
+
+    def test_rewriting_the_manifest_with_sed_rejected(self):
+        # `sha256sum ./x` writes `<digest>  ./x`; rewriting the prefix away
+        # with sed eats one of the two spaces the format requires. Measured:
+        # the resulting manifest is not the one the parser reads.
+        self.rejects(
+            self.text.replace(
+                '          sha256sum -- "${archives[@]}" > SHA256SUMS',
+                "          sha256sum ./*.tar.gz | sed 's| \\./| |' > SHA256SUMS",
+            )
+        )
+
+    def test_disabled_negative_case_rejected(self):
+        self.rejects(
+            self.text.replace(
+                '            echo "release failed: a tampered manifest verified"',
+                '            echo "ok"',
+            )
+        )
+
+    def test_building_on_the_signing_runner_rejected(self):
+        # noble's glibc is higher than the fleet's; releasing from it would
+        # produce binaries that cannot start on the nodes they are for.
+        self.rejects(
+            self.text.replace("    runs-on: ubuntu-22.04", "    runs-on: ubuntu-24.04", 1),
+            "oldest supported runner",
+        )
+
+    def test_older_signing_runner_rejected(self):
+        sign = self.text.split("\n  sign:\n", 1)
+        self.rejects(
+            sign[0] + "\n  sign:\n" + sign[1].replace("    runs-on: ubuntu-24.04", "    runs-on: ubuntu-22.04", 1),
+            "noble",
+        )
+
+    def test_secret_in_the_build_job_rejected(self):
+        self.rejects(
+            self.text.replace(
+                "      - name: Install the toolchain",
+                "      - name: Leak\n        env:\n"
+                "          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}\n"
+                "        run: true\n"
+                "      - name: Install the toolchain",
+            ),
+            "build job must not see the secret",
+        )
+
+    def test_command_tracing_rejected(self):
+        self.rejects(self.text.replace("          set -euo pipefail", "          set -euxo pipefail", 1))
+
+    def test_ignored_verification_failure_rejected(self):
+        self.rejects(self.text.replace(RELEASE_VERIFY, f"{RELEASE_VERIFY} || true"))
+
+    def test_second_secret_reader_rejected(self):
+        self.rejects(
+            self.text.replace(
+                "      - name: Verify what was just signed, as the installer will",
+                "      - name: Also\n        env:\n"
+                "          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}\n"
+                "        run: true\n"
+                "      - name: Verify what was just signed, as the installer will",
+            ),
+            "exactly one step",
+        )
+
+    def test_dropped_shred_rejected(self):
+        self.rejects(
+            self.text.replace(
+                """          trap 'shred -u -z "${key}" 2>/dev/null || rm -f "${key}"' EXIT""",
+                """          trap 'rm -f "${key}"' EXIT""",
+            )
+        )
+
 
 
 if __name__ == "__main__":

@@ -1,0 +1,210 @@
+name: Release
+# The producing half of the signing contract (`docs/release-signing.md`).
+# `danso update apply` verifies a signature before it parses anything; this is
+# what makes one.
+#
+# Manual only. There is deliberately no `push: tags:` trigger: a tag can be
+# put on any commit, and the workflow that runs is the one *at that commit*,
+# so a tag trigger would let an unreviewed branch run a workflow holding the
+# signing key. `main` requires review, dismisses stale reviews and includes
+# admins (danso #125); those rules are part of the signing boundary, and a
+# trigger that routes around them removes it. `workflow_dispatch` can also
+# name a ref, so the ref is checked below as well.
+#
+# The version is read from `Cargo.toml`, never taken as an input: a release
+# labelled with a version the binary does not carry is a lie that survives in
+# the manifest everybody else trusts.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Not `ubuntu-latest`, and not the 24.04 the signing job needs: a binary
+    # built against glibc 2.39 will not start on a node with an older one, and
+    # the fleet is not uniform. The oldest supported runner gives the widest
+    # baseline, and the job records which it was so the claim is checkable
+    # rather than asserted.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.identify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Identify the release
+        id: identify
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ -z "${version}" ]; then
+            echo "could not read the version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "releasing ${version}"
+      - name: Install the toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Build
+        run: cargo +1.98.1 build --release --locked
+      - name: Stage the archive
+        id: stage
+        env:
+          VERSION: ${{ steps.identify.outputs.version }}
+        run: |
+          set -euo pipefail
+          target=x86_64-unknown-linux-gnu
+          name="danso-${VERSION}-${target}.tar.gz"
+          staging="$(mktemp -d)"
+          # Stored as `danso`, exactly once. `update apply` lists the archive
+          # first and refuses anything else: `tar -xzO -- danso` does not match
+          # a stored `./danso`, and GNU tar concatenates duplicate members onto
+          # stdout, which would install two binaries glued together.
+          cp target/release/danso "${staging}/danso"
+          chmod 0755 "${staging}/danso"
+          mkdir -p dist
+          tar -czf "dist/${name}" -C "${staging}" danso
+
+          # The check the installer will run, run here where it can still stop
+          # the release. A layout that only fails at install time fails on a
+          # node, days later, with the signature already published.
+          members="$(tar -tzf "dist/${name}")"
+          if [ "${members}" != "danso" ]; then
+            echo "archive must contain exactly one member named 'danso', found:"
+            printf '%s\n' "${members}"
+            exit 1
+          fi
+
+          # Recorded, not asserted: the baseline is whatever this runner's
+          # glibc actually was.
+          {
+            echo "archive=${name}"
+            echo "glibc=$(ldd --version | head -1)"
+            echo "runner=${ImageOS:-unknown}"
+          } >> dist/BUILD-INFO
+          cat dist/BUILD-INFO
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-archives
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  sign:
+    needs: build
+    # `minisign` is first packaged in Ubuntu 24.04 (noble); on 22.04 the
+    # install step fails with "Unable to locate package", so the runner image
+    # is part of the contract. The build job stays on 22.04 for the opposite
+    # reason — see there.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # The signing key is meant to live here as an *environment* secret with a
+    # deployment-branch rule, so that a job running from any other ref cannot
+    # start at all. Until that is configured the line below is inert, which is
+    # why the first step refuses to run without a variable only the configured
+    # environment provides — an unprotected environment must fail, not pass
+    # quietly.
+    environment: release
+    steps:
+      - name: Refuse to sign outside the reviewed branch
+        env:
+          GATE: ${{ vars.RELEASE_GATE }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "releases are cut from main; this run is on ${GITHUB_REF}"
+            exit 1
+          fi
+          if [ "${GATE}" != "configured" ]; then
+            echo "the 'release' environment has no RELEASE_GATE=configured variable."
+            echo "GitHub creates a referenced environment implicitly and without"
+            echo "protection rules, so an unconfigured one would otherwise look"
+            echo "exactly like a protected one. Configure the environment"
+            echo "(deployment branch: main, required reviewers) and set the"
+            echo "variable; see docs/release-signing.md."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-archives
+          # Outside the checkout, deliberately. Downloading into it would leave
+          # untracked files, and the `git status --porcelain` check at the end
+          # — the one that catches a key written next to the source by mistake
+          # — would then be red on every run and get deleted for being noisy.
+          path: ${{ runner.temp }}/dist
+      - name: Install minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y minisign
+          minisign -v
+      - name: Sign the manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Command tracing stays off here: the key must not reach the log.
+          # scripts/test_release_signing.py fails the build if it is turned on.
+          if [ -z "${MINISIGN_SECRET_KEY}" ]; then
+            echo "MINISIGN_SECRET_KEY is not set for this repository"
+            exit 1
+          fi
+          umask 077
+          key="${RUNNER_TEMP}/danso.key"
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > "${key}"
+          trap 'shred -u -z "${key}" 2>/dev/null || rm -f "${key}"' EXIT
+
+          cd "${RUNNER_TEMP}/dist"
+          # Bare names, so `sha256sum` writes `<digest>  <name>` and not
+          # `<digest>  ./<name>`: the manifest lists artifact *names*, and a
+          # `./` prefix is a different name to the parser. Rewriting it
+          # afterwards with `sed` is how the two-space separator the format
+          # requires quietly becomes one.
+          shopt -s nullglob
+          archives=(*.tar.gz)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "no archives to sign"
+            exit 1
+          fi
+          sha256sum -- "${archives[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          minisign -S -s "${key}" -m SHA256SUMS -t "danso ${VERSION} ${GITHUB_SHA}"
+      - name: Verify what was just signed, as the installer will
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/dist"
+          pubkey="${GITHUB_WORKSPACE}/keys/danso-release.pub"
+          # `-H` is not optional. Without it the CLI accepts legacy
+          # (non-prehashed) signatures, which `danso-ops` rejects — the release
+          # would verify here and be refused on every node.
+          echo "GREEN: the signature must verify under the committed public key"
+          minisign -V -H -p "${pubkey}" -m SHA256SUMS
+
+          echo "GREEN: every digest in the manifest must match its artifact"
+          sha256sum -c SHA256SUMS
+
+          echo "RED: a tampered manifest must be refused"
+          cp SHA256SUMS "${RUNNER_TEMP}/tampered"
+          cp SHA256SUMS.minisig "${RUNNER_TEMP}/tampered.minisig"
+          printf '0000000000000000000000000000000000000000000000000000000000000000  evil\n' \
+            >> "${RUNNER_TEMP}/tampered"
+          if minisign -V -H -p "${pubkey}" -m "${RUNNER_TEMP}/tampered"; then
+            echo "release failed: a tampered manifest verified"
+            exit 1
+          fi
+          echo "release signing verified"
+      - name: Confirm the key file did not leak into the workspace
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            echo "release failed: the signing step left files in the checkout"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-release
+          path: ${{ runner.temp }}/dist/
+          retention-days: 7
+          if-no-files-found: error

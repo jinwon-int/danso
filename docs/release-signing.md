@@ -5,13 +5,13 @@
 it is handled. It contains **no key material and no secret values** — only
 locations and rules.
 
-**Status.** `danso update apply --artifact-dir <dir> --artifact <name>`
-verifies and installs a signed release that is already on disk, exiting 13 with
-no bypass if it does not verify; `danso update activate` decides whether the
-replacement is actually serving, and `danso update rollback` puts the previous
-binary back. What is still missing is the other end: there is no `release.yml`,
-so nothing **produces** a signed release yet, and `apply` has no fetch step —
-it is pointed at a directory, not a URL.
+**Status.** Both ends exist. `.github/workflows/release.yml` builds, signs and
+verifies a release; `danso update apply --artifact-dir <dir> --artifact <name>`
+verifies and installs one, exiting 13 with no bypass if it does not verify;
+`danso update activate` decides whether the replacement is actually serving,
+and `danso update rollback` puts the previous binary back. What is still
+missing is the middle: `apply` has no fetch step, so the artifacts have to
+reach the node some other way — it is pointed at a directory, not a URL.
 
 ## The key
 
@@ -68,9 +68,63 @@ copy was already gone.
 gh workflow run "Release signing self-test" --repo jinwon-int/danso
 ```
 
+## Cutting a release
+
+`release.yml` is **manual only** — `gh workflow run Release --repo
+jinwon-int/danso --ref main`. There is deliberately no tag trigger: a tag can
+be put on any commit and the workflow that runs is the one *at that commit*, so
+a tag trigger would let an unreviewed branch run a job holding the signing key.
+The rules on `main` are what protect the key, and a trigger that routes around
+them removes the protection. The job checks its own ref for the same reason,
+because `workflow_dispatch` can also name one.
+
+The version comes from `Cargo.toml`, never from an input: a release labelled
+with a version its binary does not carry is a lie that then lives in the signed
+manifest.
+
+Two runners, for two reasons that pull in opposite directions:
+
+| Job | Runner | Why |
+|---|---|---|
+| `build` | `ubuntu-22.04` | its glibc is the floor every node has to clear; noble's is higher than the fleet's |
+| `sign` | `ubuntu-24.04` | `minisign` is not packaged before noble |
+
+The build records the glibc it actually linked against into `BUILD-INFO`, so
+the baseline is checkable rather than asserted.
+
+The signing job verifies what it just produced, the way a node will: `minisign
+-V -H` against the committed public key, `sha256sum -c` against the artifacts,
+and a tampered copy that must be refused. A release our own installer would
+reject must not leave the runner.
+
+### The environment gate — not yet configured
+
+The job declares `environment: release`. That is where the signing secret
+*should* live, as an environment secret with a deployment-branch rule, so that
+a job running from any other ref cannot start at all.
+
+**It is not configured yet, and GitHub creates a referenced environment
+implicitly and without protection rules** — so the declaration alone would look
+exactly like a protected one while protecting nothing. The job therefore
+refuses to run unless the environment supplies `RELEASE_GATE=configured`, a
+variable only a deliberately configured environment has. Until an operator sets
+it up, `release.yml` fails closed on its first step.
+
+Configuring it is a repository-settings and secret change:
+
+1. Create the `release` environment; set its deployment branch rule to `main`.
+2. Add required reviewers.
+3. Add `RELEASE_GATE=configured` as an environment **variable**.
+4. Move `MINISIGN_SECRET_KEY` to an environment **secret** and remove the
+   repository-level one — while a repository secret exists, any job can read it
+   without declaring the environment at all.
+
+`signing-selftest.yml` reads the repository secret today, so step 4 has to move
+it too or that workflow stops proving anything.
+
 ## Archive layout
 
-`release.yml` must produce, for each target, a gzip tar containing the binary
+`release.yml` produces, for each target, a gzip tar containing the binary
 **exactly once, stored as `danso`** — not `./danso`, not `bin/danso`, and not
 twice:
 
@@ -78,6 +132,8 @@ twice:
 tar -czf danso-<ver>-<target>.tar.gz -C <staging-dir> danso
 ```
 
+`release.yml` checks this itself before signing — a layout that only fails at
+install time fails on a node, days later, with the signature already published.
 `danso update apply` lists the archive before unpacking it and refuses anything
 else. This is not pedantry: `tar -xzO -- danso` does not match a stored
 `./danso` (the ordinary `tar -czf x.tar.gz ./danso` idiom), and GNU tar
