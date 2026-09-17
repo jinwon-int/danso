@@ -118,6 +118,53 @@ Removing a unit from under a live process leaves something nothing supervises
 and no unit explains. Stop first, then uninstall; it removes both the unit and
 its `multi-user.target.wants` symlink.
 
+## Restarting
+
+`systemctl restart danso` is the right command **from a shell**. It is the
+wrong one from inside the service: systemd stops the whole cgroup, and the
+`systemctl` process issuing the restart is in it. So anything running as part
+of the service — a `/restart` command, an update that wants to activate a new
+binary — goes through the handoff instead:
+
+```
+$ danso service restart --data-dir <state-root>
+Restart 953f9d3a scheduled in 5s
+```
+
+That returns immediately, because the process asking is usually the one about
+to be replaced. `systemd-run` creates a one-shot transient unit — its own
+cgroup — which restarts the service and writes the answer down:
+
+```
+$ danso service restart-status --data-dir <state-root>
+restart 953f9d3a: completed, now pid 7777
+```
+
+A finished result blocks the next restart until somebody reads it:
+
+```
+$ danso service restart --data-dir <state-root>
+service restart not scheduled: restart_result_pending (the service is still running)
+```
+
+`restart-status --acknowledge` files it away as `restart-handoff.last.json` and
+unblocks the next one. Losing the answer to a restart is worse than refusing a
+second one, which is why the block has no timeout. A request still *in flight*
+blocks for five minutes, so a worker that died does not hold the door forever.
+
+A restart is only `completed` when a **different** pid is serving and has
+published `available` health that postdates the request. A unit that restarted
+into the same image reports success to systemd and changes nothing; that is
+ccc-node #1527, and it is why the unit's own exit status is not the evidence.
+
+Failures are codes, never output: `restart_failed`, `health_timeout`,
+`worker_error`. The receipt is designed to be delivered verbatim into a chat,
+so nothing from `systemctl` goes into it.
+
+On a host with no systemd the restart is simply not scheduled
+(`systemd_run_unavailable`) and the service keeps running. There is no fallback
+— Termux restarts through `service run --supervise`.
+
 ## Hosts without a user session
 
 `systemctl --user` needs `$XDG_RUNTIME_DIR` and a session bus. On a headless

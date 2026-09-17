@@ -495,7 +495,25 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
 - `danso bridge` 프로세스는 **자기 유닛을 직접 재시작하지 않는다**.
   `/restart`·update는 `systemd-run --on-active=<delay>`로 별도 cgroup의 일회성
   유닛을 만들어 그 유닛이 `systemctl restart`를 수행하고 본문 없는 영수증을
-  남긴다(ccc `restart_handoff` 불변조건).
+  남긴다(ccc `restart_handoff` 불변조건). 구현은 `danso-ops::handoff`,
+  진입점은 `danso service restart` / `restart-status`(+ 숨김 `restart-worker`).
+  - **fail-closed 양방향**(유휴 게이트와 반대): 영수증을 못 쓰면 타이머를 만들지
+    않고, 타이머를 못 만들면 영수증을 지운다. `systemctl restart`·`kill`·재exec
+    폴백은 없다 — 그 셋이 이 모듈이 막으려는 버그 그 자체다. systemd가 없으면
+    (Termux) 예약이 그냥 실패하고, 그 플랫폼은 `run --supervise`로 재시작한다.
+  - **영수증이 곧 뮤텍스**: 아직 읽히지 않은 종료 영수증은 새 요청을 **무기한**
+    막는다(답을 잃는 쪽이 재시작을 거절하는 쪽보다 나쁘다). 진행 중인 것은
+    `ACTIVE_TTL_SECONDS`(300초)까지만 막아, 멈춘 워커가 문을 영원히 잡지 못한다.
+  - **완료 판정은 §6.3과 같은 규칙**: "유닛이 재시작됐다"는 증거가 아니다
+    (#1527). 요청보다 **뒤에** 쓰였고, `service.state=available`이고,
+    `MainPID`가 **요청한 pid와 다른** health 문서만 완료로 친다.
+  - **`--timer-property=AccuracySec=1s`가 load-bearing.** systemd 기본
+    `AccuracySec`은 **1분**이라 `--on-active=5s`는 하한일 뿐이다. yukson
+    2026-09-17 실측: 5초로 요청한 핸드오프가 **18초** 뒤 발화했고
+    `systemctl show -p AccuracyUSec`가 `1min`을 보고했다. 수정 후 3회 연속
+    5~6초. 대기 예산은 `delay + accuracy + health deadline + 여유`로 계산한다
+    (`handoff::wait_budget_seconds`) — delay만으로 예산을 짜면 재시작이 오는
+    도중에 포기한다.
 - systemd가 없는 환경(Termux): `danso service run --supervise`가 포그라운드
   감시 루프를 제공한다. crash policy는 60초 내 5회 급속 크래시면 중단.
   **시그널 사망은 그 자체로 정상 종료가 아니다** — SIGTERM·SIGINT·SIGHUP만

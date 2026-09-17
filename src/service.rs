@@ -91,6 +91,47 @@ pub enum ServiceCommand {
               value_parser = grace_secs)]
         grace_secs: u64,
     },
+    /// Restart the unit from outside it, through a transient systemd unit.
+    ///
+    /// Returns as soon as the restart is armed, because the process that asks
+    /// is usually the one being replaced. The answer is left in
+    /// `restart-handoff.json` for whoever comes next.
+    Restart {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        user: bool,
+        /// Seconds to wait before restarting, clamped to 5..=30.
+        #[arg(long, default_value_t = danso_ops::handoff::DEFAULT_DELAY_SECONDS)]
+        delay_secs: u64,
+        /// Stay and report the outcome. Only safe for a caller that is not
+        /// itself inside the unit being restarted.
+        #[arg(long)]
+        wait: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Perform a scheduled restart. Run by the transient unit, not by hand.
+    #[command(hide = true)]
+    RestartWorker {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        user_scope: bool,
+    },
+    /// Report a finished restart and file it away.
+    RestartStatus {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Move a finished receipt to `restart-handoff.last.json`, which is
+        /// what unblocks the next restart request.
+        #[arg(long)]
+        acknowledge: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Reject an out-of-range budget during argument parsing, which runs before
@@ -530,6 +571,87 @@ fn systemctl(scope: Scope, args: &[&str]) -> Result<()> {
 }
 
 /// The text `install` prints where systemd is absent.
+/// The binary the transient unit should execute.
+///
+/// Prefers the unit's own `ExecStart` target over `current_exe()`. They differ
+/// exactly when it matters: after `update apply` swaps the binary, the running
+/// process's `/proc/self/exe` points at the replaced inode and readlink renders
+/// it `… (deleted)`. A timer built from that path would fire into nothing. The
+/// installed path is also the one that will actually serve after the restart,
+/// which is the image the caller meant.
+fn worker_binary(spec: &UnitSpec) -> Result<PathBuf> {
+    if spec.exe.is_file() && !spec.exe.to_string_lossy().ends_with(" (deleted)") {
+        return Ok(spec.exe.clone());
+    }
+    let exe = std::env::current_exe().context("could not resolve the running binary")?;
+    anyhow::ensure!(
+        exe.is_file() && !exe.to_string_lossy().ends_with(" (deleted)"),
+        "the running binary has been replaced; reinstall before restarting"
+    );
+    Ok(exe)
+}
+
+/// Arm a restart that runs outside this unit's cgroup.
+pub fn restart(
+    data_dir: Option<PathBuf>,
+    user: bool,
+    delay_secs: u64,
+) -> Result<danso_ops::handoff::Scheduled, danso_ops::handoff::HandoffError> {
+    let spec =
+        unit_spec(data_dir, user).map_err(|_| danso_ops::handoff::HandoffError::UnsafeDataDir)?;
+    let worker =
+        worker_binary(&spec).map_err(|_| danso_ops::handoff::HandoffError::UnusableWorker)?;
+    danso_ops::handoff::schedule(
+        &danso_ops::handoff::Plan {
+            data_dir: &spec.data_dir,
+            unit: danso_ops::unit::UNIT_NAME,
+            worker: &worker,
+            delay_seconds: delay_secs,
+            // The scope comes from the unit that was installed, not from the
+            // effective uid: a root process may perfectly well be asked to
+            // restart a unit it installed under `--user`.
+            user_scope: Some(matches!(spec.scope, Scope::User)),
+            // Absolute locations only; this creates a unit that restarts a
+            // system service.
+            systemd_run: None,
+        },
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+/// Run the scheduled restart. The transient unit's entry point.
+pub fn restart_worker(data_dir: PathBuf, request_id: String, user_scope: bool) -> i32 {
+    let health = data_dir.join(danso_ops::health::HEALTH_FILE_NAME);
+    danso_ops::handoff::run_worker(
+        &danso_ops::handoff::WorkerPlan {
+            data_dir: &data_dir,
+            request_id: &request_id,
+            user_scope,
+            health_path: &health,
+            // Resolved from absolute locations, never `PATH`: this launches a
+            // restart of a system service.
+            systemctl: None,
+        },
+        || chrono::Utc::now().timestamp(),
+    )
+}
+
+/// Read the restart receipt, optionally filing it away.
+pub fn restart_status(
+    data_dir: Option<PathBuf>,
+    user: bool,
+    acknowledge: bool,
+) -> Result<Option<danso_ops::handoff::Receipt>> {
+    let spec = unit_spec(data_dir, user)?;
+    let receipt = danso_ops::handoff::read_receipt(&spec.data_dir)
+        .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
+    if acknowledge && let Some(receipt) = &receipt {
+        danso_ops::handoff::archive_receipt(&spec.data_dir, &receipt.request_id)
+            .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
+    }
+    Ok(receipt)
+}
+
 pub fn termux_guidance(spec: &UnitSpec) -> String {
     let path = danso_ops::unit::termux_boot_path(&spec.home);
     format!(
