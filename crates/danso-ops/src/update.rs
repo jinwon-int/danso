@@ -61,6 +61,17 @@ pub struct InstalledGeneration {
     pub binary_sha256: String,
     pub installed_at: String,
     pub source: Source,
+    /// The signed archive this generation came out of.
+    ///
+    /// Recorded so `update check` can compare like with like: the manifest
+    /// lists *archive* digests, `binary_sha256` is the digest of the binary
+    /// inside one, and the two are never equal. Absent on a record written
+    /// before this field existed, which `check` reports as "cannot tell"
+    /// rather than guessing — and which the next apply fills in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_sha256: Option<String>,
 }
 
 impl InstalledGeneration {
@@ -71,7 +82,16 @@ impl InstalledGeneration {
             binary_sha256,
             installed_at: chrono::Utc::now().to_rfc3339(),
             source,
+            artifact_name: None,
+            artifact_sha256: None,
         }
+    }
+
+    /// Name the archive this generation was unpacked from.
+    pub fn from_artifact(mut self, name: &str, sha256: String) -> Self {
+        self.artifact_name = Some(name.to_string());
+        self.artifact_sha256 = Some(sha256);
+        self
     }
 }
 

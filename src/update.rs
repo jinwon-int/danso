@@ -28,6 +28,14 @@ pub struct UpdateArgs {
 
 #[derive(Subcommand)]
 pub enum UpdateCommand {
+    /// Ask the configured release source what it offers for this target.
+    ///
+    /// Fetches the signed manifest and nothing else — no archive, no writes,
+    /// no lock. Exits 10 when a different release is available.
+    Check {
+        #[arg(long)]
+        json: bool,
+    },
     /// Report the installed generation and any outstanding activation.
     Status {
         /// Emit the machine-readable report instead of the text rendering.
@@ -77,6 +85,147 @@ pub enum UpdateCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Exit code for "a different release is available".
+///
+/// Its own code so a cron wrapper can branch without parsing output, and not
+/// `1`, which `update status` already uses for an unresolved activation.
+pub const EXIT_UPDATE_AVAILABLE: i32 = 10;
+
+/// What the release source offers, against what is installed.
+///
+/// **This does not compare versions, and deliberately says nothing about
+/// newer or older.** The manifest carries digests and names; an ordering would
+/// have to be parsed out of a file name, and a release source that has been
+/// rolled back would then read as "up to date" while serving something else.
+/// Different is different — deciding whether to take it is `apply`'s caller's
+/// job, which is why this command installs nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum Available {
+    /// The offered archive is the one this generation was installed from.
+    UpToDate { artifact: String },
+    /// A different archive. Not necessarily a newer one.
+    Different {
+        artifact: String,
+        artifact_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        installed_sha256: Option<String>,
+    },
+    /// The release verifies but names nothing for this target.
+    NothingForThisTarget {
+        target: String,
+        offered: Vec<String>,
+    },
+    /// Nothing recorded the archive this node was installed from, so there is
+    /// nothing to compare against. The next `apply` records it.
+    Unknown {
+        artifact: String,
+        artifact_sha256: String,
+    },
+}
+
+impl Available {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Available::UpToDate { .. } => 0,
+            Available::Different { .. } => EXIT_UPDATE_AVAILABLE,
+            // Not a failure and not an update: a release that carries no
+            // artifact for this machine is a fact about the release.
+            Available::NothingForThisTarget { .. } => 0,
+            Available::Unknown { .. } => EXIT_UPDATE_AVAILABLE,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        match self {
+            Available::UpToDate { artifact } => format!("up to date ({artifact})"),
+            Available::Different { artifact, .. } => {
+                format!("a different release is available: {artifact}")
+            }
+            Available::NothingForThisTarget { target, offered } => format!(
+                "the release carries nothing for {target}; it offers {}",
+                match offered.is_empty() {
+                    true => "nothing".to_string(),
+                    false => offered.join(", "),
+                }
+            ),
+            Available::Unknown { artifact, .. } => format!(
+                "{artifact} is available; this installation does not record \
+                 which archive it came from, so it cannot be compared"
+            ),
+        }
+    }
+}
+
+/// The target triple this binary was built for.
+///
+/// Used to pick an artifact out of a manifest that may name several. It is a
+/// build-time fact, not a runtime guess: asking the running system would let a
+/// misconfigured node install a binary it cannot execute.
+pub const TARGET: &str = env!("DANSO_TARGET");
+
+/// Ask the configured release source what it has, and compare.
+///
+/// Read-only and offline-safe in the sense that matters: it fetches the
+/// manifest and its signature and **nothing else** — no archive is downloaded,
+/// nothing on disk is written, no lock is taken. A `check` that installed
+/// something as a side effect would be the worst possible surprise in a cron
+/// job.
+pub fn check() -> Result<Available> {
+    let home = crate::config::home().context("DANSO_HOME")?;
+    let key = configured_public_key(&home)?;
+    let source = configured_source(&home)?;
+
+    let (manifest_bytes, signature) = crate::fetch::manifest(&source)?;
+    // Verified before a single name inside it is read.
+    let manifest = danso_ops::release::verify_manifest(&manifest_bytes, &signature, &key)?;
+
+    let suffix = format!("-{TARGET}.tar.gz");
+    let Some(artifact) = manifest
+        .names()
+        .find(|name| name.ends_with(&suffix))
+        .map(str::to_string)
+    else {
+        return Ok(Available::NothingForThisTarget {
+            target: TARGET.to_string(),
+            offered: manifest.names().map(str::to_string).collect(),
+        });
+    };
+    let artifact_sha256 = manifest
+        .digest(&artifact)
+        .context("the manifest names an artifact it does not list")?
+        .to_string();
+
+    let installed = update::read_installed(&update::state_dir(&home))
+        .ok()
+        .flatten();
+    match installed.and_then(|generation| generation.artifact_sha256) {
+        Some(previous) if previous == artifact_sha256 => Ok(Available::UpToDate { artifact }),
+        Some(previous) => Ok(Available::Different {
+            artifact,
+            artifact_sha256,
+            installed_sha256: Some(previous),
+        }),
+        None => Ok(Available::Unknown {
+            artifact,
+            artifact_sha256,
+        }),
+    }
+}
+
+/// Where releases come from, from `config.toml`.
+fn configured_source(home: &Path) -> Result<String> {
+    let path = home.join(crate::config::FILE_NAME);
+    let source = match path.exists() {
+        true => crate::config::Config::load(&path)?.update.source,
+        false => None,
+    };
+    source.context(
+        "no release source is configured; set [update] source in config.toml, \
+         or point `apply` at a directory with --artifact-dir",
+    )
 }
 
 /// What `apply` did, or declined to do.

@@ -269,6 +269,10 @@ fn apply_verified(plan: &ApplyPlan<'_>, artifact: &[u8]) -> Result<ApplyReport> 
         .to_path_buf();
     fs::create_dir_all(&bin_dir).context("create bin directory")?;
     let state = update::state_dir(plan.danso_home);
+    // The archive's own digest — the one the signed manifest lists. Recorded
+    // alongside the binary's so `update check` can compare a release against
+    // what is installed without unpacking it.
+    let artifact_sha256 = release::hex_digest(artifact);
 
     let staged_bytes = extract_member(&bin_dir, artifact)?;
     let target_sha256 = release::hex_digest(&staged_bytes);
@@ -319,7 +323,8 @@ fn apply_verified(plan: &ApplyPlan<'_>, artifact: &[u8]) -> Result<ApplyReport> 
         // state `status` cannot describe.
         update::write_installed(
             &state,
-            &InstalledGeneration::new(version.clone(), target_sha256.clone(), Source::Release),
+            &InstalledGeneration::new(version.clone(), target_sha256.clone(), Source::Release)
+                .from_artifact(plan.artifact_name, artifact_sha256.clone()),
         )
         .context("record the installed generation")?;
         return Ok(ApplyReport {
@@ -382,7 +387,8 @@ fn apply_verified(plan: &ApplyPlan<'_>, artifact: &[u8]) -> Result<ApplyReport> 
             report.version.clone(),
             report.target_sha256.clone(),
             Source::Release,
-        ),
+        )
+        .from_artifact(plan.artifact_name, artifact_sha256.clone()),
     ) {
         // The binary is already replaced. Losing the generation record here
         // must not also lose which generation it was, so log the identified

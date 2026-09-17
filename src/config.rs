@@ -141,6 +141,14 @@ pub struct Update {
     /// Overrides the key embedded in the binary, which is how a key is
     /// rotated without shipping a new binary first.
     pub public_key: Option<String>,
+    /// Base URL a release is fetched from. `danso update check` and
+    /// `danso update apply --fetch` read `<source>/SHA256SUMS`, its signature
+    /// and the artifact the manifest names.
+    ///
+    /// Unset means this node does not fetch; `apply --artifact-dir` still
+    /// works. There is no default, because guessing where a node should take
+    /// binaries from is the one guess an updater must not make.
+    pub source: Option<String>,
     pub channel: Option<String>,
     /// Accepted only as `true`. Kept so a config that states the
     /// expectation stays valid; there is no way to turn verification off.
@@ -365,6 +373,15 @@ impl Config {
             danso_ops::release::check_public_key(key)
                 .context("update.public_key must be a minisign public key line")?;
         }
+        if let Some(source) = &self.update.source {
+            // Checked here so a bad source is a configuration error at
+            // startup, not a surprise the first time a cron tick tries to
+            // update. Same reason `public_key` is parsed here.
+            ensure!(
+                crate::fetch::is_allowed(source),
+                "update.source must be an https URL (or http to loopback)"
+            );
+        }
         if let Some(channel) = &self.update.channel {
             ensure!(!channel.is_empty(), "update.channel must not be empty");
         }
@@ -436,6 +453,7 @@ impl Config {
             ("service.unit", c.service.unit.is_some()),
             ("service.scope", c.service.scope.is_some()),
             ("update.public_key", c.update.public_key.is_some()),
+            ("update.source", c.update.source.is_some()),
             ("update.channel", c.update.channel.is_some()),
             (
                 "update.enforce_signature",

@@ -5,13 +5,17 @@
 it is handled. It contains **no key material and no secret values** — only
 locations and rules.
 
-**Status.** Both ends exist. `.github/workflows/release.yml` builds, signs and
-verifies a release; `danso update apply --artifact-dir <dir> --artifact <name>`
-verifies and installs one, exiting 13 with no bypass if it does not verify;
-`danso update activate` decides whether the replacement is actually serving,
-and `danso update rollback` puts the previous binary back. What is still
-missing is the middle: `apply` has no fetch step, so the artifacts have to
-reach the node some other way — it is pointed at a directory, not a URL.
+**Status.** Both ends exist and a node can now ask what is available.
+`.github/workflows/release.yml` builds, signs and verifies a release;
+`danso update check` asks a configured source what it offers for this target;
+`danso update apply --artifact-dir <dir> --artifact <name>` verifies and
+installs one, exiting 13 with no bypass if it does not verify; `danso update
+activate` decides whether the replacement is actually serving, and `danso
+update rollback` puts the previous binary back.
+
+What is still missing is the hand-off between the two: `release.yml` uploads
+workflow artifacts, which expire and need authentication, and `apply` takes a
+directory rather than a URL. Somebody still moves the files.
 
 ## The key
 
@@ -121,6 +125,51 @@ Configuring it is a repository-settings and secret change:
 
 `signing-selftest.yml` reads the repository secret today, so step 4 has to move
 it too or that workflow stops proving anything.
+
+## Asking what is available
+
+```
+$ danso update check
+a different release is available: danso-0.2.0-x86_64-unknown-linux-gnu.tar.gz
+```
+
+`[update] source` in `config.toml` is the base URL. `check` fetches
+`<source>/SHA256SUMS` and its signature, **verifies them**, and then reads the
+artifact named for this build's target triple. It downloads no archive, writes
+nothing and takes no lock — a `check` that installed something as a side effect
+would be the worst surprise a cron job could hold.
+
+| exit | meaning |
+|---|---|
+| 0 | the offered archive is the one this generation was installed from, or the release carries nothing for this target |
+| 10 | a **different** archive is available, or nothing recorded what this node was installed from |
+| 2 | no source configured, source unreachable, or the manifest did not verify |
+
+**It says nothing about newer or older.** An ordering would have to be parsed
+out of a file name, and a source that has been rolled back would then read as
+"up to date" while serving something else. Different is different; deciding
+whether to take it is why `apply` is a separate command.
+
+The comparison is archive digest against archive digest. `installed-generation.json`
+records `artifact_sha256` for this — the binary's digest is not the archive's,
+and comparing those two would never match. A record written before that field
+existed reports exit 10 with `"result": "unknown"`, and the next `apply` fills
+it in.
+
+### What the transport is and is not
+
+The signature is the boundary. Whoever controls the connection can serve
+anything; `verify_manifest` refuses it, because the manifest is checked against
+the release key before one name inside it is read. `https` is required (and
+plain `http` allowed only to loopback, which is not a network hop and is how
+the tests exercise this at all) for confidentiality and to stop a casual
+tamper-and-DoS — **not** because it is what makes an update safe.
+
+What the fetcher is responsible for is the part a signature cannot cover: a
+bounded download (the manifest declares digests, never sizes), a bounded
+redirect chain with every hop re-checked against the same scheme rule, a
+timeout, and an owner-only staging directory. Failures name a reason and never
+the URL: a release source can carry a token in a query string.
 
 ## Archive layout
 
