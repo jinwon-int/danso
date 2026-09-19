@@ -141,6 +141,8 @@ fn client(timeout: Duration) -> Result<reqwest::blocking::Client> {
 pub fn get(url: &str, limit: u64, timeout: Duration) -> Result<Vec<u8>> {
     use std::io::Read;
     check_url(url)?;
+    // Loopback http is intentional (tests + local mirrors). Non-loopback http
+    // is refused by check_url. codeql[rust/cleartext-transmission]
     let response = client(timeout)?
         .get(url)
         .send()
