@@ -342,6 +342,26 @@ fn main() {
             }
         };
         match args.command {
+            UpdateCommand::Check { json } => match danso::update::check() {
+                Ok(available) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&available).expect("serializable")
+                        );
+                    } else {
+                        println!("{}", available.summary());
+                    }
+                    std::process::exit(available.exit_code());
+                }
+                Err(error) => {
+                    // The reason is safe to print: `fetch` keeps URLs out of
+                    // its errors, and a configuration problem has to name
+                    // itself or nobody can fix it.
+                    eprintln!("update check failed: {error}");
+                    std::process::exit(2);
+                }
+            },
             UpdateCommand::Status { json } => match danso::update::status() {
                 Ok(report) => {
                     if json {

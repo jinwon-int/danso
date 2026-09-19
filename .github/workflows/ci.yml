@@ -9,6 +9,10 @@ permissions:
   contents: read
 jobs:
   contracts:
+    # jammy: image_decode_process bubblewrap contracts fail on noble (24.04)
+    # in this PR (9 tests). minisign is not in jammy apt; pin the official
+    # linux x86_64 binary instead of moving the whole job to 24.04.
+    # release.yml stays on 22.04 for the glibc floor.
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
@@ -25,6 +29,12 @@ jobs:
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
           sudo apt-get update -qq
           sudo apt-get install -y bubblewrap
+          # minisign 0.12 linux tarball (jedisct1). sha256 pinned.
+          curl -fsSL -o /tmp/minisign.tgz https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz
+          echo "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73  /tmp/minisign.tgz" | sha256sum -c
+          tar -xzf /tmp/minisign.tgz -C /tmp
+          sudo install -m 0755 /tmp/minisign-linux/x86_64/minisign /usr/local/bin/minisign
+          minisign -v
       - name: Format, lint and test
         run: |
           cargo +1.98.1 fmt --check
@@ -36,6 +46,11 @@ jobs:
           cargo +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
           cargo +1.98.1 test --locked --workspace
           cargo +1.98.1 build --locked
+          # The CLI-only build is a supported configuration (Cargo.toml), and
+          # nothing else here compiles it: a `crate::` path added under the
+          # `ops` gate builds fine by default and breaks only this. Measured —
+          # that is exactly how it broke once.
+          cargo +1.98.1 check --locked --no-default-features
           cargo +1.98.1 build --release --locked
           python3 scripts/test_e2e.py
           # The documented install builds --release; run the CLI contract

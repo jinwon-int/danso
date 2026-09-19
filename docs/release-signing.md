@@ -5,13 +5,17 @@
 it is handled. It contains **no key material and no secret values** — only
 locations and rules.
 
-**Status.** Both ends exist. `.github/workflows/release.yml` builds, signs and
-verifies a release; `danso update apply --artifact-dir <dir> --artifact <name>`
-verifies and installs one, exiting 13 with no bypass if it does not verify;
-`danso update activate` decides whether the replacement is actually serving,
-and `danso update rollback` puts the previous binary back. What is still
-missing is the middle: `apply` has no fetch step, so the artifacts have to
-reach the node some other way — it is pointed at a directory, not a URL.
+**Status.** Both ends exist and a node can now ask what is available.
+`.github/workflows/release.yml` builds, signs and verifies a release;
+`danso update check` asks a configured source what it offers for this target;
+`danso update apply --artifact-dir <dir> --artifact <name>` verifies and
+installs one, exiting 13 with no bypass if it does not verify; `danso update
+activate` decides whether the replacement is actually serving, and `danso
+update rollback` puts the previous binary back.
+
+What is still missing is the hand-off between the two: `release.yml` uploads
+workflow artifacts, which expire and need authentication, and `apply` takes a
+directory rather than a URL. Somebody still moves the files.
 
 ## The key
 
@@ -121,6 +125,71 @@ Configuring it is a repository-settings and secret change:
 
 `signing-selftest.yml` reads the repository secret today, so step 4 has to move
 it too or that workflow stops proving anything.
+
+## Asking what is available
+
+```
+$ danso update check
+a different release is available: danso-0.2.0-x86_64-unknown-linux-gnu.tar.gz
+```
+
+`[update] source` in `config.toml` is the base URL. `check` fetches
+`<source>/SHA256SUMS` and its signature, **verifies them**, and then reads the
+artifact named for this build's target triple. It downloads no archive, writes
+nothing and takes no lock — a `check` that installed something as a side effect
+would be the worst surprise a cron job could hold.
+
+| exit | meaning |
+|---|---|
+| 0 | the offered archive is the one this generation was installed from; the release carries nothing for this target; or nothing recorded which archive this node came from |
+| 10 | a **different** archive is available, or nothing is installed at all |
+| 2 | no source configured, unreachable, the manifest did not verify, the record is corrupt, or the release names more than one artifact for this target |
+
+**"Cannot tell" exits 0, not 10.** `update rollback` writes a record without
+the archive fields, so a wrapper that re-applies on 10 would immediately
+reinstall the release the operator had just rolled away from. The next `apply`
+records the archive and the comparison starts working again.
+
+**Two signed artifacts for one target is exit 2, not a choice.** The manifest
+is a sorted map, so "take the first" means lexicographic order — a release
+carrying both `…-0.1.0-…` and `…-0.2.0-…` would read as "up to date" on the
+former while the latter sat in the same signed manifest.
+
+**It says nothing about newer or older.** An ordering would have to be parsed
+out of a file name, and a source that has been rolled back would then read as
+"up to date" while serving something else. Different is different; deciding
+whether to take it is why `apply` is a separate command.
+
+The comparison is archive digest against archive digest. `installed-generation.json`
+records `artifact_sha256` for this — the binary's digest is not the archive's,
+and comparing those two would never match. A record written before that field
+existed reports exit 10 with `"result": "unknown"`, and the next `apply` fills
+it in.
+
+### What the transport is and is not
+
+The signature is the boundary. Whoever controls the connection can serve
+anything; `verify_manifest` refuses it, because the manifest is checked against
+the release key before one name inside it is read. `https` is required (and
+plain `http` allowed only to loopback, which is not a network hop and is how
+the tests exercise this at all) for confidentiality and to stop a casual
+tamper-and-DoS — **not** because it is what makes an update safe.
+
+What the fetcher is responsible for is the part a signature cannot cover: a
+bounded download (the manifest declares digests, never sizes), a bounded
+redirect chain with every hop re-checked against the same scheme rule, and a
+wall-clock deadline.
+
+That deadline is this updater's own. `reqwest::blocking`'s `timeout` re-arms on
+every read, so it bounds a *stall* and not a transfer — measured, a source
+sending one byte every five seconds against a 30-second budget was still being
+read at 150 seconds.
+
+Failures name a reason and never the URL: a release source is operator
+configuration and a cron log is not where it belongs. A source may not carry a
+query string or fragment, because the sub-paths are joined onto the end —
+`…/rel?token=X` would become `…/rel?token=X/SHA256SUMS`, and the failure would
+arrive as a signature error pointing at the wrong thing.
 
 ## Archive layout
 
