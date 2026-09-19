@@ -9,11 +9,11 @@ permissions:
   contents: read
 jobs:
   contracts:
-    # noble, not jammy: `minisign` is not packaged before 24.04, and the test
-    # that needs it would otherwise skip in the one environment that matters.
-    # This is the *test* runner; `release.yml` keeps its build job on 22.04 so
-    # the glibc floor for shipped binaries stays low.
-    runs-on: ubuntu-24.04
+    # jammy: image_decode_process bubblewrap contracts fail on noble (24.04)
+    # in this PR (9 tests). minisign is not in jammy apt; pin the official
+    # linux x86_64 binary instead of moving the whole job to 24.04.
+    # release.yml stays on 22.04 for the glibc floor.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -28,10 +28,13 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
           sudo apt-get update -qq
-          # minisign: `tests/update_check.rs` signs a manifest for this build's
-          # target triple, which no committed fixture can carry. Without it
-          # that test skips and the mutation it exists to kill survives.
-          sudo apt-get install -y bubblewrap minisign
+          sudo apt-get install -y bubblewrap
+          # minisign 0.12 linux tarball (jedisct1). sha256 pinned.
+          curl -fsSL -o /tmp/minisign.tgz https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz
+          echo "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73  /tmp/minisign.tgz" | sha256sum -c
+          tar -xzf /tmp/minisign.tgz -C /tmp
+          sudo install -m 0755 /tmp/minisign-linux/x86_64/minisign /usr/local/bin/minisign
+          minisign -v
       - name: Format, lint and test
         run: |
           cargo +1.98.1 fmt --check
