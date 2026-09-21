@@ -50,10 +50,11 @@ pub fn execution_context_with_capabilities(cwd: &Path, capabilities: &str) -> St
     context
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ContextFiles {
     pub prompt: String,
     pub readable: Vec<PathBuf>,
+    compact_prompt: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +73,21 @@ fn xml(s: &str) -> String {
 }
 
 impl ContextFiles {
+    /// Keep instructions and caller memory intact; only skill descriptions may
+    /// be omitted. Both catalog forms retain every eligible name and location.
+    pub fn with_suffix(&self, suffix: &str) -> Result<String> {
+        let fits = |prefix: &str| prefix.len().saturating_add(suffix.len()) <= CONTEXT_LIMIT;
+        let prefix = if fits(&self.prompt) {
+            &self.prompt
+        } else {
+            self.compact_prompt
+                .as_ref()
+                .filter(|p| fits(p))
+                .context("instructions, skill names/locations and memory exceed 65536 bytes")?
+        };
+        Ok(format!("{prefix}{suffix}"))
+    }
+
     fn add(&mut self, text: &str) -> Result<()> {
         ensure!(
             self.prompt.len() + text.len() <= CONTEXT_LIMIT,
@@ -170,7 +186,14 @@ pub fn discover(cwd: &Path, home: &Path, trusted: bool) -> Result<ContextFiles> 
         skills(&root, root_md, &mut visited, &mut files, 0)?;
     }
     let mut names = HashSet::new();
-    out.add("\n<available_skills>\n")?;
+    const OPEN: &str = "\n<available_skills>\n";
+    const CLOSE: &str = "</available_skills>\nRead the skill file before using its instructions.\n";
+    const NOTICE: &str =
+        "Skill descriptions omitted to fit the context budget; all names and locations retained.\n";
+    let mut compact = out.prompt.clone();
+    compact.push_str(OPEN);
+    let mut compact_available = true;
+    let mut full = Some(format!("{}{OPEN}", out.prompt));
     for path in files {
         if !seen.insert(path.clone()) {
             continue;
@@ -202,15 +225,50 @@ pub fn discover(cwd: &Path, home: &Path, trusted: bool) -> Result<ContextFiles> 
             eprintln!("duplicate skill name ignored: {name}");
             continue;
         }
-        out.add(&format!(
-            "<skill><name>{}</name><description>{}</description><location>{}</location></skill>\n",
-            xml(&name),
-            xml(&meta.description),
-            xml(&path.display().to_string())
-        ))?;
+        let name = xml(&name);
+        let location = xml(&path.display().to_string());
+        if compact_available {
+            compact.push_str(&format!(
+                "<skill><name>{name}</name><location>{location}</location></skill>\n"
+            ));
+            if compact.len() + CLOSE.len() + NOTICE.len() > CONTEXT_LIMIT {
+                compact_available = false;
+                compact.clear();
+            }
+        }
+        if let Some(prompt) = &mut full {
+            let entry = format!(
+                "<skill><name>{name}</name><description>{}</description><location>{location}</location></skill>\n",
+                xml(&meta.description),
+            );
+            if prompt.len() + entry.len() + CLOSE.len() <= CONTEXT_LIMIT {
+                prompt.push_str(&entry);
+            } else {
+                full = None;
+            }
+        }
         out.readable.push(path);
     }
-    out.add("</available_skills>\nRead the skill file before using its instructions.\n")?;
+    if compact_available {
+        compact.push_str(CLOSE);
+        compact.push_str(NOTICE);
+        compact_available = compact.len() <= CONTEXT_LIMIT;
+    }
+    if let Some(mut prompt) = full {
+        prompt.push_str(CLOSE);
+        ensure!(
+            prompt.len() <= CONTEXT_LIMIT,
+            "bootstrap/skills context exceeds 65536 bytes"
+        );
+        out.prompt = prompt;
+    } else {
+        ensure!(
+            compact_available,
+            "instructions and skill names/locations exceed 65536 bytes"
+        );
+        out.prompt = compact.clone();
+    }
+    out.compact_prompt = compact_available.then_some(compact);
     Ok(out)
 }
 

@@ -206,3 +206,78 @@ fn skill_frontmatter_semantics_are_parser_independent() {
     // Skill bodies never enter the prompt.
     assert!(!ctx.prompt.contains("body"));
 }
+
+#[test]
+fn context_budget_preserves_all_skills_and_caller_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    put(&home.join(".pi/agent/AGENTS.md"), "KEEP-INSTRUCTIONS");
+    let mut originals = Vec::new();
+    for i in 0..97 {
+        let path = home.join(format!(".pi/agent/skills/skill-{i:03}/SKILL.md"));
+        let body = format!(
+            "---\nname: skill-{i:03}\ndescription: {}\n---\nORIGINAL-BODY",
+            "설명&<>".repeat(30)
+        );
+        put(&path, &body);
+        originals.push((path, body));
+    }
+    let ctx = context::discover(&repo, &home, false).unwrap();
+    let suffix = "기억".repeat(4300);
+    let combined = ctx.with_suffix(&suffix).unwrap();
+    assert!(combined.len() <= context::CONTEXT_LIMIT);
+    assert!(combined.contains("KEEP-INSTRUCTIONS"));
+    assert!(combined.ends_with(&suffix));
+    assert!(combined.contains("descriptions omitted"));
+    assert!(!combined.contains("<description>"));
+    for (path, body) in originals {
+        assert!(combined.contains(path.to_str().unwrap()));
+        assert!(ctx.readable.contains(&path));
+        assert_eq!(fs::read_to_string(path).unwrap(), body);
+    }
+    assert_eq!(combined.matches("<skill>").count(), 97);
+    assert!(
+        ctx.with_suffix(&"x".repeat(context::CONTEXT_LIMIT))
+            .is_err()
+    );
+}
+
+#[test]
+fn context_budget_keeps_full_catalog_when_it_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    put(
+        &home.join(".pi/agent/skills/one/SKILL.md"),
+        "---\nname: one\ndescription: '한글 & <example>'\n---\nbody",
+    );
+    let ctx = context::discover(&repo, &home, false).unwrap();
+    assert!(ctx.prompt.contains("한글 &amp; &lt;example&gt;"));
+    assert_eq!(
+        ctx.with_suffix("memory").unwrap(),
+        format!("{}memory", ctx.prompt)
+    );
+    let suffix = "x".repeat(context::CONTEXT_LIMIT - ctx.prompt.len());
+    assert_eq!(
+        ctx.with_suffix(&suffix).unwrap().len(),
+        context::CONTEXT_LIMIT
+    );
+}
+
+#[test]
+fn context_budget_does_not_drop_instruction_only_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let agents = home.join(".pi/agent/AGENTS.md");
+    put(&agents, "x");
+    let overhead = context::discover(&repo, &home, false).unwrap().prompt.len() - 1;
+    put(&agents, &"x".repeat(context::CONTEXT_LIMIT - overhead));
+    let ctx = context::discover(&repo, &home, false).unwrap();
+    assert_eq!(ctx.with_suffix("").unwrap().len(), context::CONTEXT_LIMIT);
+    assert!(ctx.with_suffix("x").is_err());
+}

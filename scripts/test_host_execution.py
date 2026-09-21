@@ -194,6 +194,45 @@ class Host(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertFalse(self.session.exists())
 
+    def test_combined_context_budget_retains_memory_and_every_skill(self):
+        context = self.root / 'memory.md'
+        memory = 'MEMORY_UNCHANGED_' + 'm' * 25826
+        context.write_text(memory)
+        context.chmod(0o600)
+        skills = []
+        for i in range(97):
+            path = self.home / '.pi' / 'agent' / 'skills' / f'skill-{i:03}' / 'SKILL.md'
+            path.parent.mkdir(parents=True)
+            body = f'---\nname: skill-{i:03}\ndescription: {"d" * 320}\n---\nSTORED_SKILL_BODY'
+            path.write_text(body)
+            skills.append((path, body))
+        self.final()
+        result = self.run_cli('--system-context-file', str(context), '--no-tools')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        system = system_text(self.requests[0])
+        self.assertIn(memory, system)
+        self.assertIn('descriptions omitted', system)
+        self.assertNotIn('<description>', system)
+        for path, body in skills:
+            self.assertIn(str(path), system)
+            self.assertEqual(path.read_text(), body)
+        self.assertEqual(system.count('<skill>'), 97)
+        self.assertEqual(context.read_text(), memory)
+        self.assertNotIn(memory, self.session.read_text() + result.stdout + result.stderr)
+
+    def test_combined_context_cannot_discard_instructions_to_fit_memory(self):
+        agents = self.home / '.pi' / 'agent' / 'AGENTS.md'
+        agents.parent.mkdir(parents=True)
+        agents.write_text('i' * 40000)
+        context = self.root / 'memory.md'
+        context.write_text('m' * 30000)
+        context.chmod(0o600)
+        result = self.run_cli('--system-context-file', str(context), '--no-tools')
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.session.exists())
+        self.assertIn('exceed 65536 bytes', result.stderr)
+
     def detached(self, tail):
         # setsid escapes a process-group-only implementation. PIDs and a delayed
         # marker prove termination and actual reaping, not merely closed pipes.
