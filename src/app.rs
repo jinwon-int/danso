@@ -278,12 +278,12 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         "session must live outside writable workspace"
     );
     let mut ctx = context::discover(&cwd, &home, args.trust_project)?;
-    let discovered = ctx.prompt.clone();
+    let catalog = ctx.clone();
     // Memory injection (issue #52 §5): the managed block lands before any
     // caller context, and the combined context is validated against the
     // 65536-byte limit. With memory OFF the context is byte-identical to a
     // non-memory build.
-    let mut ctx_prompt = discovered.clone();
+    let mut ctx_prompt = String::new();
     if args.memory.mode != memory::MemoryMode::Off {
         args.memory.validate().map_err(at(Kind::Configuration))?;
         memory::snapshot::inject_into_context(
@@ -313,11 +313,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     } else {
         None
     };
-    ensure!(
-        ctx_prompt.len() <= context::CONTEXT_LIMIT,
-        "combined context exceeds 65536 bytes"
-    );
-    ctx.prompt = ctx_prompt;
+    ctx.prompt = catalog.with_suffix(&ctx_prompt)?;
     // Per-request refresh (§5.3): the hook re-assembles the memory block and
     // re-composes the context right after a compaction.
     let cwd_for_refresh = cwd.clone();
@@ -326,10 +322,10 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
         && args.memory.refresh == memory::RefreshMode::PerRequest
     {
         let memory_config = args.memory.clone();
-        let discovered = discovered.clone();
+        let catalog = catalog.clone();
         let caller = caller_context.clone();
         Some(Box::new(move || {
-            let mut fresh = discovered.clone();
+            let mut fresh = String::new();
             memory::snapshot::inject_into_context(
                 &mut fresh,
                 &memory_config,
@@ -340,11 +336,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
             if let Some(caller) = &caller {
                 fresh.push_str(caller);
             }
-            ensure!(
-                fresh.len() <= context::CONTEXT_LIMIT,
-                "combined context exceeds 65536 bytes"
-            );
-            Ok(fresh)
+            catalog.with_suffix(&fresh)
         }))
     } else {
         None

@@ -438,6 +438,13 @@ selected by project/skill discovery, are rejected. Invalid input fails
 before journal creation or provider dispatch. The caller controls audience
 routing and refreshes the file before each invocation; no new dependency is
 introduced. Combined discovered and explicit context retains the 65536-byte cap.
+When skill descriptions would exceed that combined budget, discovery falls back
+to a complete names-and-locations catalog with an explicit omission notice.
+Instructions, caller memory, skill files and stored memories are never truncated
+or changed by this fallback. Small catalogs retain their original descriptions.
+The same composition rule runs after native memory refresh; if instructions,
+all skill names/locations and memory still cannot fit, startup fails before
+journal creation or provider dispatch.
 
 The snapshot is reference data in the run-local system context. It remains
 present after compaction and is reread on resume; it is not appended to user
