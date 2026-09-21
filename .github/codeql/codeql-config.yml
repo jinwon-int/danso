@@ -1,0 +1,5 @@
+name: danso
+# Nothing is excluded on purpose. The three alerts that were open when GHAS
+# default setup was switched off (danso#141) were judged individually and
+# dismissed with reasons; test fixtures stay in scope so a real secret in a
+# test still gets flagged. Add paths-ignore here only with a reason.
