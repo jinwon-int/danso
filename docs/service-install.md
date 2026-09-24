@@ -77,7 +77,8 @@ The drop-in file holds a token: `chmod 600` it. The unit file itself is
 world-readable, which is why the token must not go in it.
 
 `install` reads the unit it is about to write **and any drop-ins already
-present**, and refuses when the result could not start — naming the variables
+present** — including the files their `EnvironmentFile=` lines name, when it
+can read them — and refuses when the result could not start — naming the variables
 that are missing, never their values. `--dry-run` changes nothing, so it
 reports the same problems as warnings on stderr and still prints the unit on
 stdout.

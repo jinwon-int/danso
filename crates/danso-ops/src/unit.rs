@@ -99,6 +99,36 @@ pub fn declared_environment(unit_text: &str, drop_in_dir: &Path) -> BTreeMap<Str
     let mut absorb = |text: &str| {
         for line in text.lines() {
             let line = line.trim();
+            if let Some(path) = line.strip_prefix("EnvironmentFile=") {
+                // `EnvironmentFile=[-]/abs/path`: the safer place for a
+                // token, since systemd does not expose the file's contents
+                // through `systemctl show` the way it does `Environment=`.
+                // A leading `-` tells systemd a missing file is fine; here a
+                // file that cannot be read declares nothing either way —
+                // preflight then reports the name as unset, which is the
+                // honest answer when install cannot see it.
+                let path = path.trim().trim_start_matches('-').trim_matches('"');
+                if let Ok(contents) = std::fs::read_to_string(path) {
+                    for entry in contents.lines() {
+                        let entry = entry.trim();
+                        if entry.is_empty() || entry.starts_with('#') || entry.starts_with(';') {
+                            continue;
+                        }
+                        let entry = entry.strip_prefix("export ").unwrap_or(entry);
+                        if let Some((name, value)) = entry.split_once('=') {
+                            declared.insert(
+                                name.trim().to_string(),
+                                value
+                                    .trim()
+                                    .trim_matches('"')
+                                    .trim_matches('\'')
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             let Some(assignment) = line.strip_prefix("Environment=") else {
                 continue;
             };
@@ -445,6 +475,44 @@ mod tests {
         );
         assert_eq!(declared.get("B").map(String::as_str), Some("keep"));
         assert!(!declared.contains_key("C"), "only *.conf is a drop-in");
+    }
+
+    /// `EnvironmentFile=` is where a token belongs; preflight must read it
+    /// or it refuses exactly the units that were set up correctly.
+    #[test]
+    fn declared_environment_reads_environment_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let drop_ins = dir.path().join("danso.service.d");
+        std::fs::create_dir_all(&drop_ins).unwrap();
+        let env_file = dir.path().join("danso.env");
+        std::fs::write(
+            &env_file,
+            "# comment\nexport DANSO_TELEGRAM_BOT_TOKEN=\"from-file\"\nDANSO_TELEGRAM_MODEL='m'\n\n",
+        )
+        .unwrap();
+        std::fs::write(
+            drop_ins.join("10-secrets.conf"),
+            format!("[Service]\nEnvironmentFile=-{}\n", env_file.display()),
+        )
+        .unwrap();
+        let declared = declared_environment("Environment=HOME=/root\n", &drop_ins);
+        assert_eq!(
+            declared.get("DANSO_TELEGRAM_BOT_TOKEN").map(String::as_str),
+            Some("from-file")
+        );
+        assert_eq!(
+            declared.get("DANSO_TELEGRAM_MODEL").map(String::as_str),
+            Some("m")
+        );
+        assert_eq!(declared.get("HOME").map(String::as_str), Some("/root"));
+
+        // A file install cannot read declares nothing: no error, no names.
+        let declared = declared_environment(
+            "EnvironmentFile=/nonexistent/danso.env\nEnvironment=A=1\n",
+            &drop_ins,
+        );
+        assert!(!declared.contains_key("B"));
+        assert_eq!(declared.get("A").map(String::as_str), Some("1"));
     }
 
     #[test]
