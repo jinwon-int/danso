@@ -23,7 +23,7 @@ pub const MANIFEST_STATES: [&str; 6] = [
     "superseded",
 ];
 pub const ABSENT_HASH: &str = "44cda575e8e5f8e97091d9a207368dc972c6d2fdd48a9c43a81e8d4cd5c7b93c";
-const MAX_TARGET_BYTES: u64 = 8 << 20;
+pub const MAX_TARGET_BYTES: u64 = 8 << 20;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_LEDGER_BYTES: u64 = 1024 * 1024;
 const ABSENT: &str = "ccc-node:absent:v1";
