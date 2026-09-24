@@ -22,13 +22,14 @@ directory rather than a URL. Somebody still moves the files.
 | | |
 |---|---|
 | Format | minisign (ed25519) |
-| Key id | `3F1414BCF1F7514C` |
+| Key id | `E59BCBCB0600807C` (rotated 2026-09-25 KST; `3F1414BCF1F7514C` retired, never used for a release) |
 | Public half | `keys/danso-release.pub`, checked in, embedded at compile time |
-| Private half | `MINISIGN_SECRET_KEY`, an Actions secret on `jinwon-int/danso` |
+| Private half | `MINISIGN_SECRET_KEY`, an **environment** secret on the `release` and `release-selftest` environments of `jinwon-int/danso` (deployment branch: `main`); no repository-level copy |
 | Passphrase | none (`minisign -G -W`) |
 
 The private half exists only inside the GitHub secret store. It was generated
-on a node, registered, and the local copy destroyed; there is no escrow copy.
+on a node (`gongyung`, `minisign -G -W`), registered into both environments, and
+the local copy shredded; there is no escrow copy.
 GitHub secrets cannot be read back, so **the private key cannot be recovered** —
 a lost or compromised key is replaced by rotation, not by restore.
 
@@ -52,7 +53,9 @@ holds the secret must not be editable by the same unreviewed branch that runs it
 
 `.github/workflows/signing-selftest.yml` signs a fixture with the stored secret
 and verifies it against `keys/danso-release.pub`, on every push to `main` and on
-demand. It also checks that a tampered manifest is refused, so a green run means
+demand. The job declares `environment: release-selftest` — that environment
+holds the secret, admits only `main`, and has no reviewers, so the check runs
+unattended on every push. It also checks that a tampered manifest is refused, so a green run means
 signing works, not merely that `minisign` is installed.
 
 Two details of that job are load-bearing:
@@ -101,30 +104,35 @@ The signing job verifies what it just produced, the way a node will: `minisign
 and a tampered copy that must be refused. A release our own installer would
 reject must not leave the runner.
 
-### The environment gate — not yet configured
+### The environment gate
 
 The job declares `environment: release`. That is where the signing secret
-*should* live, as an environment secret with a deployment-branch rule, so that
-a job running from any other ref cannot start at all.
+lives, as an environment secret with a deployment-branch rule, so that a job
+running from any other ref cannot start at all.
 
-**It is not configured yet, and GitHub creates a referenced environment
-implicitly and without protection rules** — so the declaration alone would look
-exactly like a protected one while protecting nothing. The job therefore
-refuses to run unless the environment supplies `RELEASE_GATE=configured`, a
-variable only a deliberately configured environment has. Until an operator sets
-it up, `release.yml` fails closed on its first step.
+**GitHub creates a referenced environment implicitly and without protection
+rules** — so the declaration alone would look exactly like a protected one
+while protecting nothing. The job therefore refuses to run unless the
+environment supplies `RELEASE_GATE=configured`, a variable only a deliberately
+configured environment has.
 
-Configuring it is a repository-settings and secret change:
+Configured 2026-09-24/25 KST (`release`: deployment branch `main`, required
+reviewer `jinon86`, `RELEASE_GATE=configured`; `release-selftest`: deployment
+branch `main`, no reviewers). The steps, for the next rotation:
 
 1. Create the `release` environment; set its deployment branch rule to `main`.
 2. Add required reviewers.
 3. Add `RELEASE_GATE=configured` as an environment **variable**.
-4. Move `MINISIGN_SECRET_KEY` to an environment **secret** and remove the
-   repository-level one — while a repository secret exists, any job can read it
-   without declaring the environment at all.
+4. Put `MINISIGN_SECRET_KEY` in as an environment **secret** — on `release`
+   and on `release-selftest`, which `signing-selftest.yml` declares — and
+   remove any repository-level one. While a repository secret exists, any job
+   can read it without declaring the environment at all.
 
-`signing-selftest.yml` reads the repository secret today, so step 4 has to move
-it too or that workflow stops proving anything.
+A secret cannot be read back, so "move" means **rotate**: generate a new pair
+(`minisign -G -W`), register the private half in both environments, shred it,
+commit the new `keys/danso-release.pub` with the pinned `KEY_ID` in
+`scripts/test_release_signing.py`, and delete the repository secret once the
+self-test on `main` is green under the new key.
 
 ## Asking what is available
 

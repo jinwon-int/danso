@@ -98,10 +98,11 @@ jobs:
     # reason — see there.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # The signing key is meant to live here as an *environment* secret with a
-    # deployment-branch rule, so that a job running from any other ref cannot
-    # start at all. Until that is configured the line below is inert, which is
-    # why the first step refuses to run without a variable only the configured
+    # The signing key lives here as an *environment* secret with a
+    # deployment-branch rule (`main`) and a required reviewer, so that a job
+    # running from any other ref cannot start at all. GitHub creates a
+    # referenced environment implicitly and without rules, which is why the
+    # first step still refuses to run without a variable only the configured
     # environment provides — an unprotected environment must fail, not pass
     # quietly.
     environment: release
