@@ -1212,6 +1212,8 @@ impl TelegramService {
             .poller(saved_offset, self.inner.poll_timeout_seconds)?;
         let mut committed_offset = saved_offset;
         let mut reconnect_attempt = 0_u32;
+        // (update_id, attempts so far) for the update currently failing.
+        let mut failed_update: Option<(i64, u32)> = None;
         loop {
             let polled = match &shutdown {
                 Some(shutdown) => {
@@ -1251,9 +1253,39 @@ impl TelegramService {
             };
             for update in updates {
                 if self.handle_update(update.clone()).await.is_err() {
-                    eprintln!("telegram update handling failed");
-                    poller.set_offset(committed_offset);
-                    break;
+                    // Retrying is right for a transient fault, but a
+                    // permanent one (a corrupt record file, say) must not
+                    // pin the loop on this update: every chat behind it
+                    // would wait forever while the Bot API is polled at
+                    // full speed (#152). Retry with backoff a bounded number
+                    // of times, then skip past it and say so.
+                    let attempts = match failed_update {
+                        Some((id, count)) if id == update.update_id => count + 1,
+                        _ => 1,
+                    };
+                    failed_update = Some((update.update_id, attempts));
+                    if attempts < MAX_UPDATE_ATTEMPTS {
+                        eprintln!("telegram update handling failed (attempt {attempts}); retrying");
+                        poller.set_offset(committed_offset);
+                        let delay = poll_retry_delay(attempts - 1);
+                        match &shutdown {
+                            Some(shutdown) => {
+                                tokio::select! {
+                                    _ = shutdown.notified() => return Ok(()),
+                                    _ = tokio::time::sleep(delay) => {}
+                                }
+                            }
+                            None => tokio::time::sleep(delay).await,
+                        }
+                        break;
+                    }
+                    eprintln!(
+                        "telegram update {} failed {attempts} times; skipping it",
+                        update.update_id
+                    );
+                    failed_update = None;
+                } else {
+                    failed_update = None;
                 }
                 let next = update
                     .update_id
@@ -2578,6 +2610,12 @@ async fn wait_for_heartbeat(interval: &mut Option<tokio::time::Interval>) {
         None => std::future::pending::<()>().await,
     }
 }
+
+/// How many times one update is retried before the loop skips past it.
+/// Three attempts span the first two backoff steps (100ms, 250ms): enough
+/// for a transient record-file fault, short enough that the chats queued
+/// behind a permanent one are not held for long.
+const MAX_UPDATE_ATTEMPTS: u32 = 3;
 
 fn poll_retry_delay(attempt: u32) -> Duration {
     const SCHEDULE_MS: [u64; 5] = [100, 250, 500, 1_000, 2_000];
