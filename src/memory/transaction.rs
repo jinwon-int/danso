@@ -710,10 +710,14 @@ impl Transaction {
         }
         self.with_lock(timeout_ms, |tx| {
             tx.recover()?;
+            // A target that cannot be read is not an absent target. Treating
+            // the error as `None` would let the transform rebuild the file
+            // from nothing, record `before_exists=false`, and make rollback
+            // delete it (#150). Refuse the commit instead.
             let befores: Targets = TARGETS
                 .iter()
-                .map(|name| (name.to_string(), tx.read_target(name).unwrap_or(None)))
-                .collect();
+                .map(|name| Ok((name.to_string(), tx.read_target(name)?)))
+                .collect::<Result<_>>()?;
             let targets = transform(&befores)?;
             if targets == befores {
                 // Nothing changed: no action, no file touched.
