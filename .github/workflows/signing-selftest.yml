@@ -21,6 +21,10 @@ jobs:
   signing-selftest:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # The secret lives in this environment (deployment branch: `main`, no
+    # reviewers — the job runs on every push and only proves the key), not in
+    # the repository. A job that does not declare it sees nothing.
+    environment: release-selftest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install minisign

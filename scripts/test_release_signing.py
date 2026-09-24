@@ -31,7 +31,7 @@ SECRET_NAME = "MINISIGN_SECRET_KEY"
 # The trust root, pinned. Rotating the release key is supposed to be a visible
 # edit here: without this, swapping the file for any other valid minisign key
 # passes every structural check.
-KEY_ID = "3F1414BCF1F7514C"
+KEY_ID = "E59BCBCB0600807C"
 
 # `minisign -V` accepts legacy (non-prehashed) signatures unless `-H` is given,
 # while danso-ops rejects them. Without `-H` the job can be green for a
@@ -158,6 +158,9 @@ def validate_workflow(text):
     # minisign is not packaged before Ubuntu 24.04; an older image can never
     # install it, so the job would fail for a reason unrelated to the key.
     assert re.search(r"^    runs-on: ubuntu-24\.04$", job, re.M), "needs a noble-or-newer runner"
+    # The secret is an environment secret with a deployment-branch rule; a job
+    # that does not declare the environment cannot see it at all.
+    assert re.search(r"^    environment: release-selftest$", job, re.M), "the secret belongs to an environment"
     for pattern, reason in FORBIDDEN:
         assert not re.search(pattern, job, re.M), reason
     for line in REQUIRED_LINES:
