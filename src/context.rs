@@ -291,21 +291,21 @@ pub fn private_system_context(path: &Path, cwd: &Path) -> Result<String> {
             && parts[1..].iter().all(|p| matches!(p, Component::Normal(_))),
         "invalid system context path"
     );
-    let mut file = fs::File::open("/")?;
+    let mut file = crate::memory::paths::open_root()?;
     for (i, part) in parts[1..].iter().enumerate() {
         let name = CString::new(part.as_os_str().as_bytes())?;
         let final_part = i == parts.len() - 2;
-        let flags = libc::O_RDONLY
-            | libc::O_NOFOLLOW
-            | libc::O_CLOEXEC
-            | if final_part {
-                libc::O_NONBLOCK
-            } else {
-                libc::O_DIRECTORY
-            };
+        let flags = if final_part {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+        } else {
+            crate::memory::paths::intermediate_dir_flags()
+        };
         let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
         ensure!(fd >= 0, "system context unavailable");
         file = unsafe { fs::File::from_raw_fd(fd) };
+        if !final_part {
+            crate::memory::paths::require_real_dir(&file, "system context")?;
+        }
     }
     let info = file.metadata()?;
     ensure!(

@@ -51,6 +51,25 @@ jobs:
           # `ops` gate builds fine by default and breaks only this. Measured —
           # that is exactly how it broke once.
           cargo +1.98.1 check --locked --no-default-features
+      - name: Type-check for Android (Termux is a supported host, #157)
+        # `check`, not `build`: no device runs here, but the libc surface
+        # differs (renameat2 flags are u32 on android, c_int on linux) and a
+        # build that only ever sees linux drifts until someone on a phone
+        # finds out. `ring` compiles C for the target during its build script,
+        # so the NDK the runner image ships is wired in as the cross compiler.
+        run: |
+          set -euo pipefail
+          rustup +1.98.1 target add aarch64-linux-android
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$ndk" ] || [ ! -d "$ndk" ]; then
+            echo "no Android NDK on this runner image; ANDROID_NDK_LATEST_HOME=${ANDROID_NDK_LATEST_HOME:-unset}"
+            exit 1
+          fi
+          bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$bin/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$bin/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$bin/aarch64-linux-android24-clang"
+          cargo +1.98.1 check --locked --workspace --all-targets --target aarch64-linux-android
           cargo +1.98.1 build --release --locked
           python3 scripts/test_e2e.py
           # The documented install builds --release; run the CLI contract

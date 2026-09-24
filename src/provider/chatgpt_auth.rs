@@ -21,7 +21,7 @@ struct Credentials {
 }
 pub(super) fn private_file(path: &Path) -> Result<File> {
     ensure!(path.is_absolute(), "ChatGPT auth path must be absolute");
-    let mut dir = File::open("/")?;
+    let mut dir = crate::memory::paths::open_root()?;
     let parts: Vec<_> = path.components().collect();
     ensure!(parts.len() > 2, "invalid ChatGPT auth path");
     for (index, part) in parts.iter().enumerate().skip(1) {
@@ -31,15 +31,18 @@ pub(super) fn private_file(path: &Path) -> Result<File> {
         let name = CString::new(name.as_bytes())
             .map_err(|_| anyhow::anyhow!("invalid ChatGPT auth path"))?;
         let last = index == parts.len() - 1;
-        let flags = libc::O_RDONLY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | if last { 0 } else { libc::O_DIRECTORY };
+        let flags = if last {
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
+        } else {
+            crate::memory::paths::intermediate_dir_flags()
+        };
         // Walk relative to pinned directory descriptors; no path component follows symlinks.
         let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
         ensure!(fd >= 0, "cannot open ChatGPT auth path safely");
         let next = unsafe { File::from_raw_fd(fd) };
+        if !last {
+            crate::memory::paths::require_real_dir(&next, "ChatGPT auth")?;
+        }
         let meta = next.metadata()?;
         if last || index == parts.len() - 2 {
             ensure!(
@@ -123,21 +126,27 @@ struct Directory(File);
 impl Directory {
     fn open(path: &Path) -> Result<Self> {
         ensure!(path.is_absolute(), "auth directory must be absolute");
-        let mut dir = File::open("/")?;
-        for part in path.components().skip(1) {
+        let mut dir = crate::memory::paths::open_root()?;
+        let parts: Vec<_> = path.components().skip(1).collect();
+        for (index, part) in parts.iter().enumerate() {
             let Component::Normal(name) = part else {
                 bail!("auth directory must be normalized")
             };
             let name = CString::new(name.as_bytes())?;
-            let fd = unsafe {
-                libc::openat(
-                    dir.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-                )
+            // The final directory is ours and stays O_RDONLY: it is later
+            // fsynced, which an O_PATH descriptor cannot be. Ancestors only
+            // need to be pinned and traversed.
+            let flags = if index == parts.len() - 1 {
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY
+            } else {
+                crate::memory::paths::intermediate_dir_flags()
             };
+            let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
             ensure!(fd >= 0, "cannot open auth directory safely");
             dir = unsafe { File::from_raw_fd(fd) };
+            if index != parts.len() - 1 {
+                crate::memory::paths::require_real_dir(&dir, "auth directory")?;
+            }
         }
         let m = dir.metadata()?;
         ensure!(
