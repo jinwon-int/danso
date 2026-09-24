@@ -57,6 +57,7 @@ jobs:
           # against that artifact too. Release disables the overflow checks
           # and debug assertions every other suite runs with.
           DANSO_BIN=target/release/danso python3 scripts/test_e2e.py
+          python3 scripts/test_memory.py
           python3 scripts/test_compaction.py
           python3 scripts/test_providers.py
           python3 scripts/test_live_acceptance.py
