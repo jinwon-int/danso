@@ -196,8 +196,8 @@ Run the full existing gates after changing a contract:
 
 ```sh
 cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
 cargo build --locked
 cargo build --release --locked
 python3 scripts/test_e2e.py

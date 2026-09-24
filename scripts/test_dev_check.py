@@ -168,6 +168,15 @@ class PlanOutput(unittest.TestCase):
                           for command in dev_check.commands('host')])
         self.assertTrue(any(command['argv'][0] == 'cargo' for command in manifest['commands']))
 
+    def test_host_cargo_commands_cover_the_workspace(self):
+        # Without --workspace the root package alone is checked and every
+        # unit test in crates/* is skipped while the gate stays green (#154).
+        cargo = [command for command in dev_check.commands('host') if command[0] == 'cargo']
+        for verb in ('clippy', 'test'):
+            command = next(command for command in cargo if command[1] == verb)
+            self.assertIn('--workspace', command, command)
+        self.assertIn(['cargo', 'check', '--locked', '--no-default-features'], cargo)
+
     def test_list_emits_single_json_object_without_banner_or_pass(self):
         output = io.StringIO()
         with patch.object(dev_check.subprocess, 'run') as run, contextlib.redirect_stdout(output):

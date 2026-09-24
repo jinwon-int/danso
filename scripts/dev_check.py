@@ -8,6 +8,11 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKER_TESTS = ('test_live_acceptance.Safety', 'test_live_acceptance.FailureReporting', 'test_dev_check', 'test_worker_checks')
+# The Python suites every host gate runs. `test_merge_queue.py` asserts that
+# `.github/workflows/ci.yml` runs exactly this set, so a suite added here
+# cannot silently stay out of CI (#154).
+HOST_SUITES = ('test_e2e.py', 'test_memory.py', 'test_compaction.py', 'test_providers.py',
+               'test_live_acceptance.py', 'test_dev_check.py', 'test_worker_checks.py', 'test_dev_check_host.py', 'test_ccc_node.py', 'test_progress.py', 'test_harness_eval.py', 'test_eval_case.py', 'test_eval_dispatch.py', 'test_host_execution.py', 'test_chatgpt.py', 'test_chatgpt_refresh.py')
 
 
 def commands(profile):
@@ -15,13 +20,15 @@ def commands(profile):
         return [[sys.executable, 'worker_checks.py', *WORKER_TESTS]]
     if profile != 'host':
         raise ValueError('unknown development check profile')
+    # --workspace: the root manifest is itself a package, so without it
+    # clippy and test resolve to the root only and every unit test in
+    # crates/* is skipped while the gate reports green (#154).
     return [['cargo', 'fmt', '--check'],
-            ['cargo', 'clippy', '--locked', '--all-targets', '--', '-D', 'warnings'],
-            ['cargo', 'test', '--locked'], ['cargo', 'build', '--locked'],
+            ['cargo', 'clippy', '--locked', '--workspace', '--all-targets', '--', '-D', 'warnings'],
+            ['cargo', 'test', '--locked', '--workspace'], ['cargo', 'build', '--locked'],
+            ['cargo', 'check', '--locked', '--no-default-features'],
             ['cargo', 'build', '--release', '--locked'],
-            *[[sys.executable, f'scripts/{name}'] for name in
-              ('test_e2e.py', 'test_memory.py', 'test_compaction.py', 'test_providers.py',
-               'test_live_acceptance.py', 'test_dev_check.py', 'test_worker_checks.py', 'test_dev_check_host.py', 'test_ccc_node.py', 'test_progress.py', 'test_harness_eval.py', 'test_eval_case.py', 'test_eval_dispatch.py', 'test_host_execution.py', 'test_chatgpt.py', 'test_chatgpt_refresh.py')]]
+            *[[sys.executable, f'scripts/{name}'] for name in HOST_SUITES]]
 
 
 def main(argv=None):

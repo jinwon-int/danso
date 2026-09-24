@@ -1,9 +1,12 @@
 """Offline guard for the always-required contracts workflow; no providers."""
 import pathlib
 import re
+import sys
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+import dev_check  # noqa: E402
 
 
 def validate(text):
@@ -22,6 +25,14 @@ def validate(text):
     assert "cargo +1.98.1 test --locked --workspace" in job
     assert "cargo +1.98.1 clippy --locked --workspace --all-targets" in job
     assert "DANSO_BIN=target/release/danso python3 scripts/test_e2e.py" in job
+    assert "cargo +1.98.1 fmt --check" in job
+    assert "clippy --locked --workspace --all-targets -- -D warnings" in job
+    # The host gate and CI must run the same Python suites: a suite added to
+    # one and forgotten in the other stayed unnoticed for weeks (#154).
+    ci_suites = set(re.findall(r"^\s*(?:\S+=\S+ )?python3 scripts/(test_\w+\.py)\s*$", job, re.M))
+    ci_suites.discard("test_merge_queue.py")
+    missing = set(dev_check.HOST_SUITES) - ci_suites
+    assert not missing, f"host suites absent from ci.yml: {sorted(missing)}"
 
 
 class MergeQueue(unittest.TestCase):
@@ -59,6 +70,18 @@ class MergeQueue(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate(self.text.replace(
                 "clippy --locked --workspace --all-targets", "clippy --locked --all-targets"))
+
+    def test_host_suite_missing_from_ci_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate(self.text.replace("          python3 scripts/test_memory.py\n", ""))
+
+    def test_clippy_without_deny_warnings_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate(self.text.replace(" -- -D warnings", ""))
+
+    def test_fmt_check_removed_rejected(self):
+        with self.assertRaises(AssertionError):
+            validate(self.text.replace("cargo +1.98.1 fmt --check", "true"))
 
     def test_commands_moved_to_another_job_rejected(self):
         with self.assertRaises(AssertionError):
