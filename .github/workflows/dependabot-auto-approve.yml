@@ -1,0 +1,56 @@
+name: Dependabot auto-approve (cargo only)
+# `main` requires one approving review and the repository has one human
+# maintainer, so a Dependabot pull request has nobody to approve it and sits
+# BLOCKED for good (danso #125). This job supplies that review — for cargo
+# bumps only.
+#
+# Why not GitHub Actions bumps: a workflow file change is part of the signing
+# boundary (docs/release-signing.md — whoever can change a workflow can sign
+# with the release key). Those stay with a human, and this job never approves
+# a pull request that touches anything outside the cargo manifests and lockfile.
+#
+# Why `pull_request_target` and no checkout: the job needs a token that can
+# review, and it must not execute anything from the pull request's branch. It
+# only reads pull-request metadata through `gh`.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: pull request number to (re)consider
+        required: true
+        type: number
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  approve:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Approve when the change is confined to cargo manifests and the lockfile
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || inputs.pr }}
+        run: |
+          set -euo pipefail
+          author="$(gh pr view "$PR" --repo "$REPO" --json author --jq .author.login)"
+          if [ "$author" != "dependabot[bot]" ] && [ "$author" != "app/dependabot" ]; then
+            echo "#$PR is by $author, not Dependabot; nothing to do"
+            exit 0
+          fi
+          files="$(gh pr view "$PR" --repo "$REPO" --json files --jq '.files[].path')"
+          echo "changed files:"; echo "$files"
+          bad="$(printf '%s\n' "$files" | grep -Ev '^(Cargo\.lock|Cargo\.toml|crates/[^/]+/Cargo\.toml)$' || true)"
+          if [ -n "$bad" ]; then
+            echo "not a cargo-only change; leaving the review to a human:"
+            echo "$bad"
+            exit 0
+          fi
+          gh pr review "$PR" --repo "$REPO" --approve \
+            --body "Approved automatically: Dependabot change confined to cargo manifests and the lockfile. Merge still waits for the required \`contracts\` check and the merge queue."
+          # Enqueue once checks pass; a failing check leaves it open, unmerged.
+          gh pr merge "$PR" --repo "$REPO" --auto --squash || echo "auto-merge could not be enabled; the approval stands"
