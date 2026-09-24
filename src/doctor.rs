@@ -128,10 +128,11 @@ pub fn inspect_at(
 ) -> DoctorReport {
     let config_path = home.join(config::FILE_NAME);
     let (config_check, parsed_config) = inspect_config(&config_path);
-    let memory_dir = parsed_config
-        .as_ref()
-        .and_then(|config| config.memory.dir.clone())
-        .unwrap_or_else(memory::MemoryConfig::default_root);
+    let memory_dir = memory::MemoryConfig::resolve_root(
+        parsed_config
+            .as_ref()
+            .and_then(|config| config.memory.dir.clone()),
+    );
 
     // The nine checks are emitted in this documented order (docs/doctor.md).
     let checks = vec![

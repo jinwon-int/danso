@@ -399,24 +399,40 @@ pub enum InstallOutcome {
 /// the service, and the working directory and state root are both in the spec.
 ///
 /// Only names are reported, never values — one of them is a bot token.
-pub fn install_problems(spec: &UnitSpec, unit: &str, unit_path: &Path) -> Vec<String> {
+pub fn install_problems(
+    spec: &UnitSpec,
+    unit: &str,
+    unit_path: &Path,
+    config: Option<&crate::config::Config>,
+) -> Vec<String> {
     let declared =
         danso_ops::unit::declared_environment(unit, &danso_ops::unit::drop_in_dir(unit_path));
     let mut problems = Vec::new();
 
-    if !declared.contains_key(crate::telegram::BOT_TOKEN_ENV) {
+    // What the service will resolve is the unit's environment over the same
+    // config.toml it reads (#136); preflight must judge by the same rule or
+    // it refuses units the service would start.
+    let token_in_file = config.is_some_and(|c| c.telegram.token_file.is_some());
+    if !declared.contains_key(crate::telegram::BOT_TOKEN_ENV) && !token_in_file {
         problems.push(format!(
-            "{} is not set for the unit",
+            "{} is not set for the unit and config.toml names no telegram.token_file",
             crate::telegram::BOT_TOKEN_ENV
         ));
     }
-    // The model can arrive under any of the names the service accepts; naming
-    // only the canonical one in the error would send an operator to change a
-    // variable that was already fine.
-    let model_names = [crate::telegram::MODEL_ENV, "DANSO_MODEL"];
-    if !model_names.iter().any(|name| declared.contains_key(*name)) {
+    // The model can arrive under any of the names the service accepts for the
+    // provider it will use; naming only the canonical one in the error would
+    // send an operator to change a variable that was already fine.
+    let provider = declared
+        .get(crate::telegram::PROVIDER_ENV)
+        .or_else(|| declared.get("DANSO_PROVIDER"))
+        .cloned()
+        .or_else(|| config.and_then(|c| c.provider.name.clone()))
+        .unwrap_or_else(|| "anthropic".to_string());
+    let model_names = crate::telegram::model_env_names(&provider);
+    let model_in_file = config.is_some_and(|c| c.provider.model.is_some());
+    if !model_names.iter().any(|name| declared.contains_key(*name)) && !model_in_file {
         problems.push(format!(
-            "none of {} is set for the unit",
+            "none of {} is set for the unit and config.toml names no provider.model",
             model_names.join(", ")
         ));
     }
@@ -452,7 +468,8 @@ fn drop_in_hint(unit_path: &Path) -> String {
 pub fn install(spec: &UnitSpec, dry_run: bool) -> Result<InstallOutcome> {
     let path = spec.scope.unit_path(&spec.home);
     let unit = spec.render();
-    let problems = install_problems(spec, &unit, &path);
+    let layered = crate::settings::Layered::load()?;
+    let problems = install_problems(spec, &unit, &path, layered.config());
     if dry_run {
         // A dry run changes nothing, so it reports rather than refuses — the
         // rendered unit on stdout stays usable as `--dry-run > danso.service`.
@@ -700,6 +717,49 @@ mod install_preflight_tests {
         }
     }
 
+    /// What config.toml supplies, preflight must credit (#136): a unit that
+    /// declares no token and no model still starts when the file names
+    /// `telegram.token_file` and `provider.model`, so it must not be refused
+    /// for those. A provider-specific model variable counts too.
+    #[test]
+    fn preflight_credits_the_config_file_and_provider_specific_model_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let spec = spec(home, &home.join("state"));
+        let unit_path = home.join("danso.service");
+        let config = crate::config::Config::parse(
+            "[telegram]\ntoken_file = \"/srv/danso/telegram.token\"\n[provider]\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        let problems = install_problems(&spec, &spec.render(), &unit_path, Some(&config));
+        assert!(
+            !problems
+                .iter()
+                .any(|p| p.contains("BOT_TOKEN") || p.starts_with("none of")),
+            "{problems:?}"
+        );
+        let without = install_problems(&spec, &spec.render(), &unit_path, None);
+        assert!(
+            without.iter().any(|p| p.contains("BOT_TOKEN")),
+            "{without:?}"
+        );
+        assert!(
+            without.iter().any(|p| p.starts_with("none of")),
+            "{without:?}"
+        );
+
+        // DANSO_GLM_MODEL is a name the service accepts for provider glm.
+        let unit = format!(
+            "{}\nEnvironment=DANSO_TELEGRAM_BOT_TOKEN=x\nEnvironment=DANSO_PROVIDER=glm\nEnvironment=DANSO_GLM_MODEL=glm-x\n",
+            spec.render()
+        );
+        let problems = install_problems(&spec, &unit, &unit_path, None);
+        assert!(
+            !problems.iter().any(|p| p.starts_with("none of")),
+            "{problems:?}"
+        );
+    }
+
     /// The state the acceptance run found: nothing supplied, and a state root
     /// inside the working directory the unit sets.
     #[test]
@@ -708,7 +768,7 @@ mod install_preflight_tests {
         let home = dir.path();
         let spec = spec(home, &home.join(".danso/telegram"));
         let unit = spec.render();
-        let problems = install_problems(&spec, &unit, &home.join("danso.service"));
+        let problems = install_problems(&spec, &unit, &home.join("danso.service"), None);
 
         assert_eq!(problems.len(), 3, "{problems:?}");
         assert!(
@@ -742,7 +802,7 @@ mod install_preflight_tests {
         .unwrap();
 
         assert!(
-            install_problems(&spec, &spec.render(), &unit_path).is_empty(),
+            install_problems(&spec, &spec.render(), &unit_path, None).is_empty(),
             "a unit a drop-in completes is installable; refusing it would break \
              the ordinary way an operator supplies a secret"
         );
@@ -766,7 +826,7 @@ mod install_preflight_tests {
             ),
         )
         .unwrap();
-        let problems = install_problems(&spec, &spec.render(), &unit_path);
+        let problems = install_problems(&spec, &spec.render(), &unit_path, None);
         assert!(
             !problems.iter().any(|p| p.contains("MODEL")),
             "naming only the canonical variable would send an operator to \
@@ -794,7 +854,7 @@ mod install_preflight_tests {
             ),
         )
         .unwrap();
-        let problems = install_problems(&spec, &spec.render(), &unit_path);
+        let problems = install_problems(&spec, &spec.render(), &unit_path, None);
         assert!(
             problems.iter().any(|p| p.contains("inside the workspace")),
             "{problems:?}"
@@ -817,7 +877,7 @@ mod install_preflight_tests {
             ),
         )
         .unwrap();
-        for problem in install_problems(&spec, &spec.render(), &unit_path) {
+        for problem in install_problems(&spec, &spec.render(), &unit_path, None) {
             assert!(
                 !problem.contains("SECRET-TOKEN-VALUE"),
                 "the report names variables, never their values: {problem}"

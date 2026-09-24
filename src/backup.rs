@@ -343,10 +343,11 @@ pub fn create_at(
                 .map_err(|_| CommandError::failed(CATEGORY_CONFIG_INVALID))?,
         ),
     };
-    let memory_root = parsed_config
-        .as_ref()
-        .and_then(|value| value.memory.dir.clone())
-        .unwrap_or_else(memory::MemoryConfig::default_root);
+    let memory_root = memory::MemoryConfig::resolve_root(
+        parsed_config
+            .as_ref()
+            .and_then(|value| value.memory.dir.clone()),
+    );
     let token_path = parsed_config
         .as_ref()
         .and_then(|value| value.telegram.token_file.clone());

@@ -103,8 +103,8 @@ pub struct Args {
     pub repeat_limit: Option<u32>,
     /// Bounded provider wire retries for 429/5xx and pre-header transport
     /// failures (0..=5, default 3; issue #67 B).
-    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=5), default_value_t = 3)]
-    pub provider_retries: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=5))]
+    pub provider_retries: Option<u32>,
     /// Continue a text-only output-cap stop up to N times (0..=2, default
     /// 0; issue #69 B). Unavailable in long-task mode.
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=2), default_value_t = 0, conflicts_with_all = ["long_task", "resume_task"])]
@@ -233,7 +233,10 @@ impl Args {
             glm_thinking: self.glm_thinking.clone(),
             glm_endpoint: self.glm_endpoint.clone(),
             repeat_limit: self.repeat_limit.unwrap_or(0),
-            provider_retries: self.provider_retries,
+            // The environment fallback needs a Result; main resolves it.
+            provider_retries: self
+                .provider_retries
+                .unwrap_or(danso::provider::PROVIDER_RETRIES_DEFAULT),
             continuation_limit: self.continue_on_length,
             stream_requests: self.stream_requests,
             report_progress: self.progress_jsonl,
