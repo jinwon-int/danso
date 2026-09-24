@@ -233,7 +233,7 @@ impl Directory {
                     old.as_ptr(),
                     self.0.as_raw_fd(),
                     new.as_ptr(),
-                    libc::RENAME_NOREPLACE,
+                    libc::RENAME_NOREPLACE as _,
                 )
             } == 0,
             "cannot move auth recovery artifact"
