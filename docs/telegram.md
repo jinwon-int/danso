@@ -10,7 +10,9 @@ Configuration is resolved in one order — **environment, then
 reads (docs/unified-design.md §6.1). A key the file declares is a key the
 service honours; a variable that is set always wins over the file. A
 `config.toml` that exists but does not parse or validate stops the service
-from starting, the same as `update` and `backup`.
+from starting, the same as `update` and `backup`. `danso config check` says
+which layer is supplying each key (`sources`: `env:<NAME>`, `file` or
+`default`) without printing any value; see [doctor.md](doctor.md).
 
 - `DANSO_TELEGRAM_BOT_TOKEN`, or `telegram.token_file` in `config.toml`: an
   owner-only (`0600`) regular file holding the token, read with every path

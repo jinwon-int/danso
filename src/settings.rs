@@ -10,9 +10,181 @@
 //!
 //! The CLI (`danso run`) stays flag-driven; it is not routed through here.
 use crate::config::{self, Config};
+use crate::telegram::{
+    ALLOWED_USER_IDS_ENV, BOT_TOKEN_ENV, EFFORT_ENV, MODEL_ENV, PROVIDER_ENV, WORKSPACE_ENV,
+};
 use anyhow::{Context, Result, bail, ensure};
+use serde_json::{Map, Value};
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+/// The provider the service assumes when neither source names one.
+pub const DEFAULT_PROVIDER: &str = "anthropic";
+
+/// A `config.toml` key some command reads, with the environment aliases
+/// that outrank it; the first one set wins. Readers take their alias lists
+/// from here (`aliases`) and `config check` reports from the same rows, so a
+/// name the service accepts and a name the report claims cannot drift apart.
+#[derive(Debug)]
+pub struct KeySource {
+    pub key: &'static str,
+    pub env: &'static [&'static str],
+}
+
+/// Every declared key that is read, in the order the file declares them.
+/// A key with no alias (`update.*`) is file-or-default only. The three
+/// keys the resolution layer does not route through `resolve_*` still
+/// belong here: the token and allowlist (`telegram::TelegramConfig`) and the
+/// memory root (`memory::MemoryConfig::resolve_root`) read the same names.
+pub const KEY_SOURCES: &[KeySource] = &[
+    KeySource {
+        key: "core.workspace",
+        env: &[WORKSPACE_ENV, "DANSO_WORKSPACE"],
+    },
+    KeySource {
+        key: "core.timeout_seconds",
+        env: &["DANSO_TELEGRAM_TIMEOUT_SECONDS", "DANSO_TIMEOUT_SECONDS"],
+    },
+    KeySource {
+        key: "core.max_turns",
+        env: &["DANSO_TELEGRAM_MAX_TURNS", "DANSO_MAX_TURNS"],
+    },
+    KeySource {
+        key: "core.tool_timeout_seconds",
+        env: &[
+            "DANSO_TELEGRAM_TOOL_TIMEOUT_SECONDS",
+            "DANSO_TOOL_TIMEOUT_SECONDS",
+        ],
+    },
+    KeySource {
+        key: "provider.name",
+        env: &[PROVIDER_ENV, "DANSO_PROVIDER"],
+    },
+    // Plus the provider-specific alias `model_env_names` appends once the
+    // provider is known.
+    KeySource {
+        key: "provider.model",
+        env: &[MODEL_ENV, "DANSO_MODEL"],
+    },
+    KeySource {
+        key: "provider.reasoning_effort",
+        env: &[EFFORT_ENV, "DANSO_REASONING_EFFORT"],
+    },
+    KeySource {
+        key: "provider.retries",
+        env: &["DANSO_TELEGRAM_PROVIDER_RETRIES", "DANSO_PROVIDER_RETRIES"],
+    },
+    KeySource {
+        key: "provider.timeout_seconds",
+        env: &[
+            "DANSO_TELEGRAM_PROVIDER_TIMEOUT_SECONDS",
+            "DANSO_PROVIDER_TIMEOUT_SECONDS",
+        ],
+    },
+    KeySource {
+        key: "provider.max_output_tokens",
+        env: &[
+            "DANSO_TELEGRAM_MAX_OUTPUT_TOKENS",
+            "DANSO_MAX_OUTPUT_TOKENS",
+        ],
+    },
+    KeySource {
+        key: "memory.dir",
+        env: &[crate::memory::DIR_ENV],
+    },
+    KeySource {
+        key: "memory.scope",
+        env: &["DANSO_TELEGRAM_MEMORY_SCOPE"],
+    },
+    // The variable carries the token itself, the key names a file holding
+    // it; either way it is where the token came from.
+    KeySource {
+        key: "telegram.token_file",
+        env: &[BOT_TOKEN_ENV],
+    },
+    KeySource {
+        key: "telegram.allowed_user_ids",
+        env: &[ALLOWED_USER_IDS_ENV],
+    },
+    KeySource {
+        key: "telegram.heartbeat_seconds",
+        env: &["DANSO_TELEGRAM_HEARTBEAT_SECONDS"],
+    },
+    KeySource {
+        key: "update.public_key",
+        env: &[],
+    },
+    KeySource {
+        key: "update.source",
+        env: &[],
+    },
+    KeySource {
+        key: "update.enforce_signature",
+        env: &[],
+    },
+];
+
+/// The aliases a reader consults for `key`. A key outside the table is a
+/// programming error, and the first test that resolves it says so.
+pub fn aliases(key: &str) -> &'static [&'static str] {
+    KEY_SOURCES
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.env)
+        .unwrap_or_else(|| panic!("{key} is not in settings::KEY_SOURCES"))
+}
+
+/// Every environment name the service accepts a model under, most specific
+/// first. `install` preflight uses the same list so it never refuses a unit
+/// the service would start.
+pub fn model_env_names(provider: &str) -> Vec<&'static str> {
+    let mut names = aliases("provider.model").to_vec();
+    match provider {
+        "anthropic" => names.push("DANSO_ANTHROPIC_MODEL"),
+        "openai" => names.push("DANSO_OPENAI_MODEL"),
+        "openai-codex" => {
+            names.push("DANSO_OPENAI_CODEX_MODEL");
+            names.push("DANSO_OPENAI_MODEL");
+        }
+        "glm" => names.push("DANSO_GLM_MODEL"),
+        _ => {}
+    }
+    names
+}
+
+/// `config check`'s `sources` (#136): for every key in [`KEY_SOURCES`],
+/// `env:<NAME>` when an alias is set (its name, never what it holds), `file`
+/// when only the file names the key, else `default`. Presence is what
+/// `env_first` tests, so a set-but-empty variable reports `env` exactly as
+/// it resolves; a required key with neither reports `default` and the
+/// service refuses to start, which is the same fact seen from two sides.
+pub fn sources(config: &Config) -> Map<String, Value> {
+    let declared = config.declared();
+    // The provider-specific model alias depends on which provider the
+    // service will resolve; deciding it here the same way is what keeps
+    // `env:DANSO_GLM_MODEL` from being claimed on an Anthropic node.
+    let provider = aliases("provider.name")
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .or_else(|| config.provider.name.clone())
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+    KEY_SOURCES
+        .iter()
+        .map(|entry| {
+            let names = match entry.key {
+                "provider.model" => model_env_names(&provider),
+                _ => entry.env.to_vec(),
+            };
+            let in_file = declared.iter().any(|(key, set)| *key == entry.key && *set);
+            let source = match names.iter().find(|name| std::env::var_os(name).is_some()) {
+                Some(name) => format!("env:{name}"),
+                None if in_file => "file".to_string(),
+                None => "default".to_string(),
+            };
+            (entry.key.to_string(), Value::String(source))
+        })
+        .collect()
+}
 
 /// `config.toml`, if present, beneath the process environment.
 #[derive(Debug)]
@@ -374,6 +546,38 @@ pub(crate) mod tests {
             assert_eq!(value, "env-model");
             assert_eq!(source, Source::Env("DANSO_MODEL".into()));
         });
+    }
+
+    /// The table is the read keys, no more and no fewer: a key read through
+    /// an alias the table does not know reports the wrong source, and a key
+    /// in the table that `UNREAD_KEYS` also lists claims a reader it lacks.
+    #[test]
+    fn key_sources_are_exactly_the_read_keys() {
+        let declared = Config::default().declared();
+        let read: Vec<&str> = declared
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|key| !config::UNREAD_KEYS.contains(key))
+            .collect();
+        let table: Vec<&str> = KEY_SOURCES.iter().map(|entry| entry.key).collect();
+        for key in &read {
+            assert!(
+                table.contains(key),
+                "{key} is read but has no KEY_SOURCES row"
+            );
+        }
+        for key in &table {
+            assert!(
+                read.contains(key),
+                "{key} is in KEY_SOURCES but not a read key"
+            );
+        }
+        let unique: std::collections::BTreeSet<&str> = table.iter().copied().collect();
+        assert_eq!(unique.len(), table.len(), "a key twice: {table:?}");
+        for alias in KEY_SOURCES.iter().flat_map(|entry| entry.env) {
+            assert!(alias.starts_with("DANSO_"), "{alias}");
+        }
+        assert!(model_env_names("glm").starts_with(aliases("provider.model")));
     }
 
     #[test]

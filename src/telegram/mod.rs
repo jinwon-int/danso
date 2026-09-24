@@ -7,7 +7,7 @@ mod access;
 mod client;
 mod lock;
 mod service;
-pub use service::model_env_names;
+pub use crate::settings::model_env_names;
 mod store;
 
 pub use access::{AccessControl, Allowlist};

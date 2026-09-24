@@ -420,19 +420,12 @@ impl Config {
         Ok(())
     }
 
-    /// Body-free projection for `danso config check`: which keys are set,
-    /// never their values. Secrets cannot leak because values are not
-    /// rendered at all.
-    pub fn report(&self, path: &Path) -> Value {
-        fn present<'a>(pairs: &[(&'a str, bool)]) -> Vec<&'a str> {
-            pairs
-                .iter()
-                .filter(|(_, set)| *set)
-                .map(|(name, _)| *name)
-                .collect()
-        }
+    /// Every declared key, with whether this file sets it. The one list
+    /// `report`, `UNREAD_KEYS` and `settings::KEY_SOURCES` are checked
+    /// against, so a key added to the schema without a row here is caught.
+    pub fn declared(&self) -> Vec<(&'static str, bool)> {
         let c = self;
-        let keys = [
+        vec![
             ("core.workspace", c.core.workspace.is_some()),
             ("core.sandbox", c.core.sandbox.is_some()),
             ("core.timeout_seconds", c.core.timeout_seconds.is_some()),
@@ -491,8 +484,19 @@ impl Config {
                 "update.enforce_signature",
                 c.update.enforce_signature.is_some(),
             ),
-        ];
-        let set_keys = present(&keys);
+        ]
+    }
+
+    /// Body-free projection for `danso config check`: which keys are set
+    /// and where each read key's value comes from, never the values. Secrets
+    /// cannot leak because values are not rendered at all.
+    pub fn report(&self, path: &Path) -> Value {
+        let keys = self.declared();
+        let set_keys: Vec<&str> = keys
+            .iter()
+            .filter(|(_, set)| *set)
+            .map(|(name, _)| *name)
+            .collect();
         // Declared and validated, read by nothing yet. Saying so beats the
         // silent alternative: a key an operator fills in and then waits on.
         // They stay parseable so a file written for the design does not
@@ -509,7 +513,10 @@ impl Config {
             "valid": true,
             "set_keys": set_keys,
             "unread_keys": unread_keys,
-            "allowed_user_count": c.telegram.allowed_user_ids.len(),
+            // Which of environment, file or default supplies each read key
+            // (#136): the name of the alias that is set, not what it holds.
+            "sources": crate::settings::sources(self),
+            "allowed_user_count": self.telegram.allowed_user_ids.len(),
         })
     }
 }
@@ -621,17 +628,69 @@ public_key = "RWQbf5jrBubDWDWgYNOyi1nYm+uTycGKIGfh+oOVB09ocmmx8o4mAj8w"
     /// drifts from the schema without anyone noticing.
     #[test]
     fn unread_keys_are_all_declared_keys() {
-        let rendered = Config::parse(FULL)
-            .unwrap()
-            .report(Path::new("/x/config.toml"));
-        let _ = rendered;
-        let source = include_str!("config.rs");
+        let declared = Config::default().declared();
         for key in UNREAD_KEYS {
             assert!(
-                source.contains(&format!("(\"{key}\"")),
+                declared.iter().any(|(name, _)| name == key),
                 "{key} is not in the report's key table"
             );
         }
+    }
+
+    /// `sources` names the alias that is set — the second one when only it
+    /// is — and never the value; unread keys claim no source at all.
+    #[test]
+    fn sources_say_where_each_read_key_comes_from_without_the_value() {
+        use crate::settings::{KEY_SOURCES, tests::with_env};
+        let config = Config::parse(
+            "[core]\nmax_turns = 4\nsandbox = \"host\"\n[provider]\nmodel = \"file-model\"\n",
+        )
+        .unwrap();
+        with_env(
+            &[
+                ("DANSO_TELEGRAM_MAX_TURNS", None),
+                ("DANSO_MAX_TURNS", Some("9")),
+                ("DANSO_TELEGRAM_WORKSPACE", Some("/tmp/path-canary")),
+                ("DANSO_WORKSPACE", None),
+                ("DANSO_TELEGRAM_TIMEOUT_SECONDS", None),
+                ("DANSO_TIMEOUT_SECONDS", None),
+                ("DANSO_TELEGRAM_PROVIDER", None),
+                ("DANSO_PROVIDER", None),
+                ("DANSO_TELEGRAM_MODEL", None),
+                ("DANSO_MODEL", None),
+                ("DANSO_ANTHROPIC_MODEL", None),
+                ("DANSO_GLM_MODEL", Some("model-canary")),
+            ],
+            || {
+                let report = config.report(Path::new("/x/config.toml"));
+                let sources = report["sources"].as_object().unwrap();
+                assert_eq!(sources.len(), KEY_SOURCES.len());
+                assert_eq!(sources["core.max_turns"], "env:DANSO_MAX_TURNS");
+                assert_eq!(sources["core.workspace"], "env:DANSO_TELEGRAM_WORKSPACE");
+                assert_eq!(sources["core.timeout_seconds"], "default");
+                assert_eq!(sources["provider.name"], "default");
+                // Provider is anthropic, so DANSO_GLM_MODEL is not consulted.
+                assert_eq!(sources["provider.model"], "file");
+                assert!(!sources.contains_key("core.sandbox"), "unread: {sources:?}");
+                let rendered = report.to_string();
+                assert!(!rendered.contains("canary"), "{rendered}");
+                assert!(!rendered.contains("file-model"), "{rendered}");
+            },
+        );
+        with_env(
+            &[
+                ("DANSO_TELEGRAM_PROVIDER", None),
+                ("DANSO_PROVIDER", Some("glm")),
+                ("DANSO_TELEGRAM_MODEL", None),
+                ("DANSO_MODEL", None),
+                ("DANSO_GLM_MODEL", Some("model-canary")),
+            ],
+            || {
+                let sources = config.report(Path::new("/x/config.toml"))["sources"].clone();
+                assert_eq!(sources["provider.name"], "env:DANSO_PROVIDER");
+                assert_eq!(sources["provider.model"], "env:DANSO_GLM_MODEL");
+            },
+        );
     }
 
     #[test]
