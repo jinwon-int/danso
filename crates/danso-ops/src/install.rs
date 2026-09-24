@@ -1548,13 +1548,19 @@ mod tests {
 
     /// Stage a script and probe it, without going through a signed release.
     fn probe_script(dir: &Path, body: &str) -> Result<String> {
+        // 400 ms flaked on shared CI runners: a fork-heavy pipeline can take
+        // longer than that merely to get scheduled, and the probe then
+        // reports a timeout although the kernel cap worked (#171). 5 s gives
+        // contention headroom without slowing a broken case down.
+        probe_script_with_timeout(dir, body, Duration::from_secs(5))
+    }
+
+    /// `probe_script` with an explicit probe deadline, for tests that pin
+    /// the deadline behavior itself or need more or less than the default.
+    fn probe_script_with_timeout(dir: &Path, body: &str, timeout: Duration) -> Result<String> {
         let bin = dir.join(format!("probe-target-{}", body.len()));
         write_new_executable(&bin, script(body).as_bytes()).unwrap();
-        probe_version(
-            &bin,
-            &bin.with_file_name("capture"),
-            Duration::from_millis(400),
-        )
+        probe_version(&bin, &bin.with_file_name("capture"), timeout)
     }
 
     #[test]
@@ -1590,7 +1596,14 @@ mod tests {
     #[test]
     fn a_probe_that_never_exits_is_killed() {
         let dir = tempfile::tempdir().unwrap();
-        let error = probe_script(dir.path(), "echo 'danso 1.0.0'; sleep 30").unwrap_err();
+        // This one pins the deadline behavior itself, so it wants a short
+        // deadline and would only pass more slowly with the shared default.
+        let error = probe_script_with_timeout(
+            dir.path(),
+            "echo 'danso 1.0.0'; sleep 30",
+            Duration::from_millis(400),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("in time"), "{error}");
     }
 
@@ -1599,10 +1612,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // 4 MiB is well past PROBE_OUTPUT_LIMIT. With RLIMIT_FSIZE the child
         // dies on SIGXFSZ; without it the bytes land first and the size check
-        // only notices afterwards.
-        let error = probe_script(
+        // only notices afterwards. The deadline is generous because the
+        // pipeline needs two forks and a reap before the kernel cap fires,
+        // and a loaded runner schedules those slowly (#171). A regression
+        // that drops the cap fails fast instead: `head` then exits 0 within
+        // its 4 MiB write and the assertion below sees a success.
+        let error = probe_script_with_timeout(
             dir.path(),
             "yes 0123456789012345678901234567890123456789 | head -c 4000000",
+            Duration::from_secs(15),
         )
         .unwrap_err();
         assert!(error.to_string().contains("non-zero"), "{error}");
