@@ -22,6 +22,9 @@ use std::{
 };
 use tokio::sync::Notify;
 
+/// Updates a redelivering Bot API fixture keeps returning until acknowledged.
+type Redeliver = Arc<Mutex<Vec<(i64, String)>>>;
+
 #[derive(Clone, Debug)]
 struct Request {
     path: String,
@@ -35,7 +38,7 @@ enum ServerMode {
         /// Telegram semantics: every update whose id is at or past the
         /// requested `offset` is delivered again on each poll until the
         /// client acknowledges it by polling with a higher offset.
-        redeliver: Arc<Mutex<Vec<(i64, String)>>>,
+        redeliver: Redeliver,
     },
     Anthropic {
         release: Option<Arc<AtomicBool>>,
@@ -49,7 +52,7 @@ struct LoopbackServer {
     requests: Arc<Mutex<Vec<Request>>>,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
-    redeliver: Option<Arc<Mutex<Vec<(i64, String)>>>>,
+    redeliver: Option<Redeliver>,
 }
 
 impl LoopbackServer {
