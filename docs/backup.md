@@ -26,7 +26,12 @@ backup-<timestamp>/
 ```
 
 `memory/` is assembled from the configured `[memory] dir`, falling back to
-the existing Danso memory default. Only valid scope directories and their
+the existing Danso memory default. A `config.toml` that is present but does
+not parse or validate refuses the backup with the fixed `config_invalid`
+category: running without it would silently drop the `telegram.token_file`
+exclusion and the configured memory root. (A missing `config.toml` was
+already refused as `config_unreadable`, since the config component is
+required.) Only valid scope directories and their
 `state/` and `memories/` trees are captured. `conversations/` is present when
 `DANSO_TELEGRAM_DATA_DIR` (or the Telegram resolver's $HOME/.danso/telegram
 default) resolves; it contains that directory's `conversations` tree.
