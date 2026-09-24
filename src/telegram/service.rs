@@ -894,6 +894,20 @@ impl ChatState {
             active: Mutex::new(None),
         }
     }
+
+    /// Release the active-turn slot if it still holds `turn`. Every path
+    /// that ends or abandons a turn must reach this regardless of whether
+    /// the chat's record could be read or written: a slot that outlives its
+    /// turn queues every later prompt forever and refuses `/new` (#151).
+    fn release_if_current(&self, turn: &Arc<ActiveTurn>) {
+        let mut active = self.active.lock().expect("Telegram active-turn lock");
+        if active
+            .as_ref()
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, turn))
+        {
+            *active = None;
+        }
+    }
 }
 
 /// The outcome of the most recent poll, so the health document can report
@@ -1608,6 +1622,12 @@ impl TelegramService {
                         if let Some(active) = &active {
                             active.clear_pause_request();
                             active.interrupt();
+                            // A finished turn still in the slot is the
+                            // stuck state #151 describes; /stop is the
+                            // operator's way out of it.
+                            if !active.is_running() {
+                                state.release_if_current(active);
+                            }
                         }
                         record.follow_up_queue.clear();
                         Some(
@@ -2040,7 +2060,19 @@ impl TelegramService {
             .set_progress_message(progress_message.message_id);
         {
             let _record = state.record.lock().expect("Telegram record lock");
-            let mut record = self.load_record(chat_id)?;
+            let mut record = match self.load_record(chat_id) {
+                Ok(record) => record,
+                Err(error) => {
+                    drop(_record);
+                    self.abort_prepared_turn(
+                        chat_id,
+                        &state,
+                        &prepared.active,
+                        requeue_on_failure.clone(),
+                    )?;
+                    return Err(error);
+                }
+            };
             if let Err(error) = record.set_progress_message(progress_message.message_id) {
                 drop(_record);
                 self.abort_prepared_turn(
@@ -2120,7 +2152,6 @@ impl TelegramService {
         requeue: Option<String>,
     ) -> Result<()> {
         let _record = state.record.lock().expect("Telegram record lock");
-        let mut record = self.load_record(chat_id)?;
         let is_current = state
             .active
             .lock()
@@ -2128,7 +2159,10 @@ impl TelegramService {
             .as_ref()
             .is_some_and(|candidate| Arc::ptr_eq(candidate, active));
         if is_current {
-            *state.active.lock().expect("Telegram active-turn lock") = None;
+            // Release first: the record bookkeeping below can fail, and a
+            // turn that will never run must not keep the slot (#151).
+            state.release_if_current(active);
+            let mut record = self.load_record(chat_id)?;
             record.clear_turn_active();
             if active.long_task
                 && record
@@ -2337,7 +2371,13 @@ impl TelegramService {
                 let _record = state.record.lock().expect("Telegram record lock");
                 let mut record = match self.load_record(chat_id) {
                     Ok(record) => record,
-                    Err(_) => return,
+                    Err(_) => {
+                        // The turn is over either way. The queue stays in
+                        // the record for the next prompt or restart to pick
+                        // up; what must not stay is the slot.
+                        state.release_if_current(&active);
+                        return;
+                    }
                 };
                 let current = state
                     .active
@@ -2361,10 +2401,13 @@ impl TelegramService {
                         if self.save_record(&record).is_ok() {
                             Some(prepared)
                         } else {
+                            // The prepared turn never starts and the
+                            // finished one is over: the slot belongs to
+                            // neither. The unsaved record still holds the
+                            // prompt at the head of its queue on disk.
                             record.clear_turn_active();
                             record.follow_up_queue.insert(0, prepared.prompt);
-                            *state.active.lock().expect("Telegram active-turn lock") =
-                                Some(Arc::clone(&active));
+                            *state.active.lock().expect("Telegram active-turn lock") = None;
                             let _ = self.save_record(&record);
                             None
                         }

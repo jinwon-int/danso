@@ -1484,3 +1484,61 @@ async fn a_permanently_failing_update_is_skipped_and_the_next_chat_is_answered()
     assert_eq!(provider.request_count(), 2);
     drop(environment);
 }
+
+/// A turn whose record cannot be read or written when it finishes must still
+/// release the process-local active-turn slot (#151). Before, the slot kept
+/// the finished turn, every later prompt was queued behind it, and only a
+/// restart could free the chat.
+#[tokio::test]
+async fn a_finished_turn_releases_the_slot_even_when_its_record_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = environment_lock().await;
+    let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
+    let bot = LoopbackServer::bot(None);
+    let release = Arc::new(AtomicBool::new(false));
+    let provider = LoopbackServer::anthropic(Some(Arc::clone(&release)));
+    let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
+    environment.set_provider_base("anthropic", &provider);
+    let service = TelegramService::from_env().expect("Telegram service config");
+
+    service
+        .handle_update(update(1, 42, "first"))
+        .await
+        .expect("first prompt");
+    wait_for(Duration::from_secs(5), || provider.request_count() >= 1).await;
+    // While the turn is in flight, make its record unreadable: the store
+    // refuses any mode but 0600, so both load and save fail from here on.
+    let record = root.path().join("conversations/42.json");
+    wait_for(Duration::from_secs(5), || record.is_file()).await;
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o644)).expect("loosen record");
+    release.store(true, Ordering::Release);
+    wait_for_message(&bot, "fixture answer").await;
+    // The finish path has passed once the progress message is finalised.
+    wait_for_edit(&bot, "✅ Turn complete.").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).expect("restore record");
+
+    // The chat must be free: this prompt starts a turn instead of queueing.
+    service
+        .handle_update(update(2, 42, "second"))
+        .await
+        .expect("second prompt");
+    wait_for(Duration::from_secs(5), || provider.request_count() >= 2).await;
+    wait_for(Duration::from_secs(5), || {
+        bot.sent_texts()
+            .iter()
+            .filter(|text| text.as_str() == "fixture answer")
+            .count()
+            >= 2
+    })
+    .await;
+    assert!(
+        !bot.sent_texts()
+            .iter()
+            .any(|text| text.starts_with("Follow-up queued")),
+        "the second prompt was queued behind a finished turn: {:?}",
+        bot.sent_texts()
+    );
+    drop(environment);
+}
