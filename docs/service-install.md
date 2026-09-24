@@ -22,10 +22,12 @@ Three more have defaults that are usually wrong for a service:
 | `DANSO_TELEGRAM_ALLOWED_USER_IDS` | empty | an empty allowlist answers nobody |
 
 `config.toml` declares most of these too, under `[telegram]` and `[provider]`.
-**The service does not read it.** The Telegram loop is environment-only; the
-config file is consumed by `doctor`, `backup` and `update`. Setting
-`telegram.token_file` in `config.toml` will not start a service. This is a
-known gap, tracked separately.
+**The service reads only `telegram.allowed_user_ids` from it**, and only as
+the fallback while `DANSO_TELEGRAM_ALLOWED_USER_IDS` is unset; a set env var
+always wins, including when it is empty. Everything else stays
+environment-only: the config file is otherwise consumed by `doctor`,
+`backup` and `update`. Setting `telegram.token_file` in `config.toml` will
+not start a service. The remaining gaps are known, tracked separately.
 
 ## The workspace trap
 

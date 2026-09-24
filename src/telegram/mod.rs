@@ -56,6 +56,20 @@ pub fn data_dir_from_env() -> Result<PathBuf> {
     Ok(home.join(DEFAULT_DATA_DIR_SUFFIX))
 }
 
+/// `telegram.allowed_user_ids` from `$DANSO_HOME/config.toml`. This is the
+/// allowlist fallback only while `DANSO_TELEGRAM_ALLOWED_USER_IDS` is absent;
+/// a set env var always wins, including when it parses to an empty
+/// (deny-all) allowlist. A missing, unreadable, or invalid config file
+/// contributes no ids, which keeps the allowlist fail-closed (deny-all)
+/// instead of blocking startup on an unrelated config problem.
+fn config_allowed_user_ids_fallback() -> Vec<i64> {
+    crate::config::default_path()
+        .ok()
+        .and_then(|path| crate::config::Config::load(&path).ok())
+        .map(|config| config.telegram.allowed_user_ids)
+        .unwrap_or_default()
+}
+
 /// Make a private, owner-only directory and fail closed on an unsafe existing
 /// directory. This is kept here so the lock and store share one filesystem
 /// boundary without coupling Telegram to the memory module.
@@ -142,7 +156,7 @@ impl TelegramConfig {
         let retries = parse_u32_env(client::RETRIES_ENV, client::RETRIES_DEFAULT, 5)?;
         Ok(Self {
             bot_token,
-            allowed_user_ids: Allowlist::from_env()?,
+            allowed_user_ids: Allowlist::from_env_or_ids(config_allowed_user_ids_fallback())?,
             data_dir: data_dir_from_env()?,
             api_base_url,
             poll_timeout_seconds,

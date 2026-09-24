@@ -374,6 +374,10 @@ impl Environment {
         unsafe { env::set_var(name, value) };
     }
 
+    fn remove(&self, name: &str) {
+        unsafe { env::remove_var(name) };
+    }
+
     fn set_provider_base(&self, provider: &str, server: &LoopbackServer) {
         unsafe {
             match provider {
@@ -1066,6 +1070,49 @@ async fn unauthorized_users_are_not_answered() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(bot.request_count(), 0);
     assert!(!root.path().join("conversations").join("42.json").exists());
+    drop(environment);
+}
+
+/// Issue #136: with the env var absent, `telegram.allowed_user_ids` from
+/// `config.toml` authorizes the service loop; the pre-set env value must not
+/// leak in once it is removed.
+#[tokio::test]
+async fn env_absent_allowlist_falls_back_to_config_file() {
+    let _lock = environment_lock().await;
+    let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
+    let message = update(1, 7, "hello from a config-authorized user");
+    let bot = LoopbackServer::bot(Some(message));
+    let provider = LoopbackServer::anthropic(None);
+    let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
+    environment.set_provider_base("anthropic", &provider);
+    let config_dir = root.path().join("workspace").join(".danso");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    fs::write(
+        config_dir.join("config.toml"),
+        "[telegram]\nallowed_user_ids = [7, 3]\n",
+    )
+    .expect("write config.toml");
+    environment.remove("DANSO_TELEGRAM_ALLOWED_USER_IDS");
+    let service = TelegramService::from_env().expect("Telegram service config");
+    let shutdown = Arc::new(Notify::new());
+    let task = tokio::spawn(service.run_until(Arc::clone(&shutdown)));
+
+    wait_for_message(&bot, "fixture answer").await;
+    shutdown.notify_one();
+    task.await
+        .expect("service task join")
+        .expect("service loop");
+
+    let store = ConversationStore::new(root.path()).expect("conversation store");
+    // The fixture chat id is 42; the record exists because *user 7* was
+    // authorized through the config.toml fallback while the env var was
+    // absent.
+    let record = store
+        .load(42)
+        .expect("load conversation")
+        .expect("config-authorized conversation");
+    assert_eq!(record.last_update_id, 1);
     drop(environment);
 }
 

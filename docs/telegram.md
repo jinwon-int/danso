@@ -5,11 +5,13 @@ process as every agent turn. It never starts a Danso CLI subprocess per
 message. The normal bounded tool workers remain the only subprocesses a turn
 may use.
 
-Configuration is environment-only:
+Configuration is environment-driven, with one file-backed fallback:
 
 - `DANSO_TELEGRAM_BOT_TOKEN` is required.
 - `DANSO_TELEGRAM_ALLOWED_USER_IDS` is a comma-separated numeric allowlist.
-  Missing or empty means every update is denied.
+  When it is unset, `telegram.allowed_user_ids` in `config.toml` is the
+  fallback allowlist; a set env var always wins, and missing or empty (in
+  either source) means every update is denied.
 - `DANSO_TELEGRAM_DATA_DIR` selects an absolute state directory. The default
   is `$HOME/.danso/telegram`.
 - `DANSO_TELEGRAM_API_BASE_URL` is optional and is intended for a controlled
@@ -55,6 +57,8 @@ Example:
 
 ```sh
 export DANSO_TELEGRAM_BOT_TOKEN='...'
+# Or leave this unset and declare `telegram.allowed_user_ids` in
+# `$HOME/.danso/config.toml`; the env var always wins when it is set.
 export DANSO_TELEGRAM_ALLOWED_USER_IDS='123456789'
 export DANSO_TELEGRAM_DATA_DIR='/var/lib/danso/telegram'
 export DANSO_TELEGRAM_WORKSPACE='/srv/project'
