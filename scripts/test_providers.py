@@ -192,6 +192,11 @@ class Fixture(unittest.TestCase):
         # request started" also accepts "some other request started" — which
         # for a cancelled request means a handler that is still winding down.
         self.stream_started = set()
+        # When set to an Event, a streamed response is held open after its
+        # first frame until the Event fires. A test that cancels mid-stream
+        # needs the stream to still be mid-stream when the signal lands;
+        # a fixed inter-frame delay only made that likely (#127).
+        self.stream_hold = None
         self.fixture_lock = threading.Lock()
         owner = self
 
@@ -205,12 +210,13 @@ class Fixture(unittest.TestCase):
                     index = len(owner.requests) - 1
                     owner.headers.append(dict(self.headers))
                     owner.paths.append(self.path)
-                status, body = owner.responses.pop(0) if owner.responses else (500, {})
+                    status, body = owner.responses.pop(0) if owner.responses else (500, {})
+                    hold = owner.stream_hold
                 if callable(body):
-                    body = body(owner.requests[-1])
+                    body = body(payload)
                 data = body if isinstance(body, bytes) else json.dumps(body).encode()
                 stream = (status == 200 and not isinstance(body, bytes)
-                          and owner.requests[-1].get('stream') is True
+                          and payload.get('stream') is True
                           and streamed_body(self.path, body))
                 if stream:
                     data = stream
@@ -226,13 +232,13 @@ class Fixture(unittest.TestCase):
                 if status != 200:
                     time.sleep(owner.error_body_delay)
                 try:
-                    if stream and owner.stream_delay:
-                        for part in data.split(b'\n\n'):
-                            if not part:
-                                continue
+                    if stream and (owner.stream_delay or hold is not None):
+                        for position, part in enumerate(p for p in data.split(b'\n\n') if p):
                             self.wfile.write(part + b'\n\n')
                             self.wfile.flush()
                             owner.stream_started.add(index)
+                            if position == 0 and hold is not None:
+                                hold.wait(10)
                             time.sleep(owner.stream_delay)
                     else:
                         self.wfile.write(data)
@@ -358,26 +364,38 @@ class Providers(Fixture):
         self.assertTrue(self.wait_for_stream(7, 0.3))
 
     def test_mid_stream_cancellation_does_not_retry_or_journal_partial_response(self):
-        self.stream_delay = 0.1
         for provider in ('anthropic', 'openai', 'glm'):
             with self.subTest(provider=provider):
                 self.session = self.root / f'cancel-{provider}.jsonl'
                 before_requests = len(self.requests)
                 self.responses.append((200, response(provider, text='cancel-after-first-delta')))
+                # Hold the stream open after its first frame. Waiting for the
+                # stream to start and then racing SIGTERM against the remaining
+                # frames left a ~0.4s window on a loaded runner in which the
+                # run completed first (#127). Held, it cannot complete until
+                # the test lets it.
+                self.stream_hold = threading.Event()
                 command = [str(BIN), *self.execution_args, '--cwd', str(self.repo), '--session', str(self.session),
                            '--provider', provider, '--model', 'fixture', '--provider-retries', '3', '--no-tools',
                            '-p', 'do task']
                 process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                            text=True, env=self.streaming_env(provider))
-                # Wait for THIS request's stream, not for any stream. The two
-                # assertions below both depend on this run having got as far as
-                # sending its request and receiving a delta; cancelling before
-                # that leaves no request to count and can arrive before the
-                # signal handler is installed.
-                self.assertTrue(self.wait_for_stream(before_requests, 5),
-                                'fixture did not start the SSE response for this request')
-                process.terminate()
-                stdout, stderr = process.communicate(timeout=5)
+                try:
+                    # Wait for THIS request's stream, not for any stream. The
+                    # assertions below depend on this run having got as far as
+                    # sending its request and receiving a delta; cancelling
+                    # before that leaves no request to count and can arrive
+                    # before the signal handler is installed.
+                    self.assertTrue(self.wait_for_stream(before_requests, 5),
+                                    'fixture did not start the SSE response for this request')
+                    process.terminate()
+                    stdout, stderr = process.communicate(timeout=5)
+                finally:
+                    self.stream_hold.set()
+                    self.stream_hold = None
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate()
                 self.assertEqual(process.returncode, 143, stderr)
                 # Any cancelled text may only ever appear inside a live
                 # delta frame — never as final output or a journal entry.
