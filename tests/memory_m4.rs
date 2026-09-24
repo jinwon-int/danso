@@ -1490,3 +1490,66 @@ fn a_crash_between_commit_and_complete_replays_without_duplicating_facts() {
     );
     let _ = job_id;
 }
+
+/// A target that cannot be read is not an absent target (#150). An
+/// oversized `memory-facts.jsonl` used to be read as `None`, so the
+/// transform rebuilt it from nothing, the manifest recorded
+/// `before_exists=false`, and rollback deleted the file. The commit must
+/// refuse instead, touching neither the target nor the action ledger.
+#[test]
+fn unreadable_target_refuses_commit_instead_of_treating_it_as_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = setup_route(dir.path());
+    let oversized = vec![b'x'; transaction::MAX_TARGET_BYTES as usize + 1];
+    write_private(&route.facts_file(), &oversized);
+    let before_hash = sha2::Sha256::digest(&oversized);
+    let actions_dir = route.state_dir().join("memory-rollback/actions");
+    let actions_before = std::fs::read_dir(&actions_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+
+    let transaction = Transaction::new(&route.state_dir());
+    let mut transform_ran = false;
+    let result = transaction.commit(
+        1000,
+        &meta("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+        |targets| {
+            transform_ran = true;
+            // The shape every real caller has: append to whatever is there.
+            // With the old `unwrap_or(None)` this saw `None`, so "whatever
+            // is there" was nothing and the 8 MiB file became this one line.
+            let mut next = targets.clone();
+            for (name, content) in next.iter_mut() {
+                if name == "memory-facts.jsonl" {
+                    let mut combined = content.clone().unwrap_or_default();
+                    combined.extend_from_slice(
+                        b"{\"id\":\"f1\",\"kind\":\"preference\",\"text\":\"fact\"}\n",
+                    );
+                    *content = Some(combined);
+                }
+            }
+            Ok(next)
+        },
+    );
+
+    let error = result.expect_err("an unreadable target must refuse the commit");
+    assert!(
+        error.to_string().contains("exceeds its safe read bound"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !transform_ran,
+        "the transform must not see a fabricated empty state"
+    );
+    let after = std::fs::read(route.facts_file()).unwrap();
+    assert_eq!(after.len(), oversized.len(), "target length changed");
+    assert_eq!(
+        sha2::Sha256::digest(&after),
+        before_hash,
+        "target bytes changed"
+    );
+    let actions_after = std::fs::read_dir(&actions_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(actions_before, actions_after, "no action may be recorded");
+}
