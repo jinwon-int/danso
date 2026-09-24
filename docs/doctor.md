@@ -26,8 +26,10 @@ The report is versioned and body-free:
 where a check has a count or age, the suffix uses fixed `key=value` fields.
 The existing body-free `config check` projection is carried in the
 `config.parse` detail on success (`version`, `kind`, `path`, `valid`,
-`set_keys`, and `allowed_user_count`). Absolute inspected paths may therefore
-appear, but values from the files do not.
+`set_keys`, `unread_keys`, and `allowed_user_count`). `unread_keys` lists the
+set keys that no command reads yet, so a value an operator filled in and is
+waiting on is visible rather than silently inert. Absolute inspected paths
+may therefore appear, but values from the files do not.
 
 The nine checks are emitted in this order:
 

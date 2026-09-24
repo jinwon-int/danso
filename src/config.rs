@@ -18,6 +18,37 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "config.toml";
+
+/// Keys the file declares that no command reads yet (#136). Each is either
+/// waiting on its feature (`cron.*` on #120, `memory.mode/refresh/distill`
+/// and `telegram.memory_mode` on the native-memory switch, `core.sandbox`,
+/// `core.tool_home`, `core.long_task`, `provider.base_url/endpoint/thinking/
+/// auth_file` on `danso run` consuming the file) or has no reader planned
+/// (`service.unit/scope`: the unit name is a constant; `update.channel`;
+/// `telegram.session_scope`, `telegram.stall_seconds`). `config check` and
+/// `doctor` report the ones that are set as `unread_keys`. Remove an entry
+/// here in the same change that starts reading the key.
+pub const UNREAD_KEYS: &[&str] = &[
+    "core.sandbox",
+    "core.tool_home",
+    "core.long_task",
+    "provider.base_url",
+    "provider.endpoint",
+    "provider.thinking",
+    "provider.auth_file",
+    "memory.mode",
+    "memory.max_bytes",
+    "memory.refresh",
+    "memory.distill",
+    "telegram.session_scope",
+    "telegram.memory_mode",
+    "telegram.stall_seconds",
+    "cron.store",
+    "cron.enabled",
+    "service.unit",
+    "service.scope",
+    "update.channel",
+];
 /// Upper bound on the file size; a configuration is small by construction.
 pub const MAX_BYTES: u64 = 64 * 1024;
 
@@ -461,12 +492,23 @@ impl Config {
                 c.update.enforce_signature.is_some(),
             ),
         ];
+        let set_keys = present(&keys);
+        // Declared and validated, read by nothing yet. Saying so beats the
+        // silent alternative: a key an operator fills in and then waits on.
+        // They stay parseable so a file written for the design does not
+        // start failing the day this list is published.
+        let unread_keys: Vec<&str> = set_keys
+            .iter()
+            .copied()
+            .filter(|key| UNREAD_KEYS.contains(key))
+            .collect();
         json!({
             "version": 1,
             "kind": "config_check",
             "path": path.display().to_string(),
             "valid": true,
-            "set_keys": present(&keys),
+            "set_keys": set_keys,
+            "unread_keys": unread_keys,
             "allowed_user_count": c.telegram.allowed_user_ids.len(),
         })
     }
@@ -535,6 +577,61 @@ public_key = "RWQbf5jrBubDWDWgYNOyi1nYm+uTycGKIGfh+oOVB09ocmmx8o4mAj8w"
         assert!(!rendered.contains("/var/lib/danso"), "paths are values");
         assert_eq!(report["allowed_user_count"], 1);
         assert_eq!(report["valid"], true);
+        // The fixture sets keys of both kinds; the report must sort them.
+        let unread: Vec<&str> = report["unread_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for key in [
+            "core.sandbox",
+            "provider.endpoint",
+            "memory.mode",
+            "cron.store",
+            "service.unit",
+        ] {
+            assert!(
+                unread.contains(&key),
+                "{key} is set and read by nothing: {unread:?}"
+            );
+        }
+        for key in [
+            "provider.model",
+            "telegram.token_file",
+            "memory.scope",
+            "update.public_key",
+        ] {
+            assert!(
+                !unread.contains(&key),
+                "{key} is read by the service: {unread:?}"
+            );
+        }
+        assert!(
+            Config::parse("")
+                .unwrap()
+                .report(Path::new("/x/config.toml"))["unread_keys"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Every UNREAD_KEYS entry must be a key the report knows, or the list
+    /// drifts from the schema without anyone noticing.
+    #[test]
+    fn unread_keys_are_all_declared_keys() {
+        let rendered = Config::parse(FULL)
+            .unwrap()
+            .report(Path::new("/x/config.toml"));
+        let _ = rendered;
+        let source = include_str!("config.rs");
+        for key in UNREAD_KEYS {
+            assert!(
+                source.contains(&format!("(\"{key}\"")),
+                "{key} is not in the report's key table"
+            );
+        }
     }
 
     #[test]
