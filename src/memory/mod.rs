@@ -96,6 +96,10 @@ pub struct MemoryConfig {
     pub legacy_read: Option<std::path::PathBuf>,
 }
 
+/// The memory root override; `settings::KEY_SOURCES` names it for
+/// `memory.dir` so `config check` reports the variable this reads.
+pub const DIR_ENV: &str = "DANSO_MEMORY_DIR";
+
 impl MemoryConfig {
     /// `$DANSO_MEMORY_DIR` or `~/.danso/memory` (§8).
     /// `DANSO_MEMORY_DIR`, then `memory.dir` from `config.toml`, then the
@@ -103,14 +107,14 @@ impl MemoryConfig {
     /// `backup` used to let the file win, and then inspected a memory root
     /// the service was not writing to.
     pub fn resolve_root(file: Option<std::path::PathBuf>) -> std::path::PathBuf {
-        if let Some(dir) = std::env::var_os("DANSO_MEMORY_DIR") {
+        if let Some(dir) = std::env::var_os(DIR_ENV) {
             return std::path::PathBuf::from(dir);
         }
         file.unwrap_or_else(Self::default_root)
     }
 
     pub fn default_root() -> std::path::PathBuf {
-        if let Some(dir) = std::env::var_os("DANSO_MEMORY_DIR") {
+        if let Some(dir) = std::env::var_os(DIR_ENV) {
             return std::path::PathBuf::from(dir);
         }
         let home = std::env::var_os("HOME")

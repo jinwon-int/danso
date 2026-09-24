@@ -427,7 +427,7 @@ pub fn install_problems(
         .or_else(|| declared.get("DANSO_PROVIDER"))
         .cloned()
         .or_else(|| config.and_then(|c| c.provider.name.clone()))
-        .unwrap_or_else(|| "anthropic".to_string());
+        .unwrap_or_else(|| crate::settings::DEFAULT_PROVIDER.to_string());
     let model_names = crate::telegram::model_env_names(&provider);
     let model_in_file = config.is_some_and(|c| c.provider.model.is_some());
     if !model_names.iter().any(|name| declared.contains_key(*name)) && !model_in_file {

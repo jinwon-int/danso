@@ -6,8 +6,7 @@
 //! executor may still launch its normal bounded tool workers.
 
 use super::{
-    EFFORT_ENV, MODEL_ENV, PROVIDER_ENV, TelegramConfig, TelegramFoundation, Update, WORKSPACE_ENV,
-    ensure_private_dir,
+    TelegramConfig, TelegramFoundation, Update, ensure_private_dir,
     store::{ConversationRecord, ConversationStore, UsageRecord},
 };
 use crate::settings::{self, Layered};
@@ -35,7 +34,6 @@ use std::{
 use tokio::sync::{Notify, mpsc, oneshot};
 
 const JOURNALS_DIR: &str = "journals";
-const DEFAULT_PROVIDER: &str = "anthropic";
 const DEFAULT_MAX_TURNS: u32 = 48;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
 const DEFAULT_PROVIDER_TIMEOUT_SECONDS: u64 = 180;
@@ -120,18 +118,18 @@ impl RunSettings {
     fn resolve(layered: &Layered) -> Result<Self> {
         let provider = settings::resolve_string(
             layered,
-            &[PROVIDER_ENV, "DANSO_PROVIDER"],
+            settings::aliases("provider.name"),
             "provider.name",
             |c| c.provider.name.clone(),
         )?
         .map(|(value, _)| value)
-        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+        .unwrap_or_else(|| settings::DEFAULT_PROVIDER.to_string());
         ensure!(
             ["anthropic", "openai", "openai-codex", "glm"].contains(&provider.as_str()),
             "unsupported Telegram provider"
         );
 
-        let model_names = model_env_names(&provider);
+        let model_names = settings::model_env_names(&provider);
         let default_model = settings::resolve_string(
             layered,
             &model_names,
@@ -146,7 +144,7 @@ impl RunSettings {
 
         let default_effort = settings::resolve_string(
             layered,
-            &[EFFORT_ENV, "DANSO_REASONING_EFFORT"],
+            settings::aliases("provider.reasoning_effort"),
             "provider.reasoning_effort",
             |c| c.provider.reasoning_effort.clone(),
         )?
@@ -155,7 +153,7 @@ impl RunSettings {
 
         let workspace = settings::resolve_string(
             layered,
-            &[WORKSPACE_ENV, "DANSO_WORKSPACE"],
+            settings::aliases("core.workspace"),
             "core.workspace",
             |c| c.core.workspace.as_ref().map(|p| p.display().to_string()),
         )?
@@ -175,7 +173,7 @@ impl RunSettings {
 
         let max_turns = settings::resolve_u32(
             layered,
-            &["DANSO_TELEGRAM_MAX_TURNS", "DANSO_MAX_TURNS"],
+            settings::aliases("core.max_turns"),
             "core.max_turns",
             |c| c.core.max_turns,
             DEFAULT_MAX_TURNS,
@@ -184,7 +182,7 @@ impl RunSettings {
         )?;
         let timeout_seconds = settings::resolve_u64(
             layered,
-            &["DANSO_TELEGRAM_TIMEOUT_SECONDS", "DANSO_TIMEOUT_SECONDS"],
+            settings::aliases("core.timeout_seconds"),
             "core.timeout_seconds",
             |c| c.core.timeout_seconds,
             DEFAULT_TIMEOUT_SECONDS,
@@ -193,10 +191,7 @@ impl RunSettings {
         )?;
         let provider_timeout_seconds = settings::resolve_u64(
             layered,
-            &[
-                "DANSO_TELEGRAM_PROVIDER_TIMEOUT_SECONDS",
-                "DANSO_PROVIDER_TIMEOUT_SECONDS",
-            ],
+            settings::aliases("provider.timeout_seconds"),
             "provider.timeout_seconds",
             |c| c.provider.timeout_seconds,
             DEFAULT_PROVIDER_TIMEOUT_SECONDS,
@@ -205,10 +200,7 @@ impl RunSettings {
         )?;
         let tool_timeout_seconds = settings::resolve_u64(
             layered,
-            &[
-                "DANSO_TELEGRAM_TOOL_TIMEOUT_SECONDS",
-                "DANSO_TOOL_TIMEOUT_SECONDS",
-            ],
+            settings::aliases("core.tool_timeout_seconds"),
             "core.tool_timeout_seconds",
             |c| c.core.tool_timeout_seconds,
             DEFAULT_TOOL_TIMEOUT_SECONDS,
@@ -217,7 +209,7 @@ impl RunSettings {
         )?;
         let provider_retries = settings::resolve_u32(
             layered,
-            &["DANSO_TELEGRAM_PROVIDER_RETRIES", "DANSO_PROVIDER_RETRIES"],
+            settings::aliases("provider.retries"),
             "provider.retries",
             |c| c.provider.retries,
             DEFAULT_PROVIDER_RETRIES,
@@ -226,10 +218,7 @@ impl RunSettings {
         )?;
         let max_output_tokens = settings::resolve_optional_u32(
             layered,
-            &[
-                "DANSO_TELEGRAM_MAX_OUTPUT_TOKENS",
-                "DANSO_MAX_OUTPUT_TOKENS",
-            ],
+            settings::aliases("provider.max_output_tokens"),
             "provider.max_output_tokens",
             |c| c.provider.max_output_tokens,
         )?;
@@ -239,7 +228,7 @@ impl RunSettings {
         ])?;
         let heartbeat_seconds = settings::resolve_u64(
             layered,
-            &["DANSO_TELEGRAM_HEARTBEAT_SECONDS"],
+            settings::aliases("telegram.heartbeat_seconds"),
             "telegram.heartbeat_seconds",
             |c| c.telegram.heartbeat_seconds,
             DEFAULT_HEARTBEAT_SECONDS,
@@ -257,7 +246,7 @@ impl RunSettings {
         )? as usize;
         let memory_scope = settings::resolve_string(
             layered,
-            &["DANSO_TELEGRAM_MEMORY_SCOPE"],
+            settings::aliases("memory.scope"),
             "memory.scope",
             |c| c.memory.scope.clone(),
         )?
@@ -354,24 +343,6 @@ impl RunSettings {
             cancellation_reason: Some(cancellation_reason),
         }
     }
-}
-
-/// Every environment name the service accepts a model under, most specific
-/// first. `install` preflight uses the same list so it never refuses a unit
-/// the service would start.
-pub fn model_env_names(provider: &str) -> Vec<&'static str> {
-    let mut names = vec![MODEL_ENV, "DANSO_MODEL"];
-    match provider {
-        "anthropic" => names.push("DANSO_ANTHROPIC_MODEL"),
-        "openai" => names.push("DANSO_OPENAI_MODEL"),
-        "openai-codex" => {
-            names.push("DANSO_OPENAI_CODEX_MODEL");
-            names.push("DANSO_OPENAI_MODEL");
-        }
-        "glm" => names.push("DANSO_GLM_MODEL"),
-        _ => {}
-    }
-    names
 }
 
 fn task_limits_from_env() -> Result<crate::long_task::Limits> {
