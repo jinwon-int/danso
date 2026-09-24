@@ -368,8 +368,14 @@ impl ConversationStore {
             else {
                 continue;
             };
-            if let Some(record) = self.load(chat_id)? {
-                records.push(record);
+            // One unreadable record must not take every chat with it: this
+            // feeds health.json on every poll and orphan recovery at start,
+            // and a `?` here ended the service loop on a single bad file
+            // (#160). Skip it, say which chat, and keep the rest.
+            match self.load(chat_id) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => {}
+                Err(_) => eprintln!("telegram conversation record {chat_id} unreadable; skipping"),
             }
         }
         records.sort_by_key(|record| record.chat_id);

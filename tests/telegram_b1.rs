@@ -22,6 +22,9 @@ use std::{
 };
 use tokio::sync::Notify;
 
+/// Updates a redelivering Bot API fixture keeps returning until acknowledged.
+type Redeliver = Arc<Mutex<Vec<(i64, String)>>>;
+
 #[derive(Clone, Debug)]
 struct Request {
     path: String,
@@ -32,6 +35,10 @@ enum ServerMode {
     Bot {
         update: Option<String>,
         reconnect_duplicate: bool,
+        /// Telegram semantics: every update whose id is at or past the
+        /// requested `offset` is delivered again on each poll until the
+        /// client acknowledges it by polling with a higher offset.
+        redeliver: Redeliver,
     },
     Anthropic {
         release: Option<Arc<AtomicBool>>,
@@ -45,6 +52,7 @@ struct LoopbackServer {
     requests: Arc<Mutex<Vec<Request>>>,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
+    redeliver: Option<Redeliver>,
 }
 
 impl LoopbackServer {
@@ -52,6 +60,7 @@ impl LoopbackServer {
         Self::new(ServerMode::Bot {
             update: update.map(|update| serde_json::to_string(&update).expect("fixture update")),
             reconnect_duplicate: false,
+            redeliver: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -59,7 +68,57 @@ impl LoopbackServer {
         Self::new(ServerMode::Bot {
             update: Some(serde_json::to_string(&update).expect("fixture update")),
             reconnect_duplicate: true,
+            redeliver: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// A bot that keeps redelivering unacknowledged updates, as Telegram does.
+    /// Updates are handed to it with `deliver`, so a test can change the
+    /// service's state between one update and the next.
+    fn bot_redelivering() -> Self {
+        Self::new(ServerMode::Bot {
+            update: None,
+            reconnect_duplicate: false,
+            redeliver: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    fn deliver(&self, update: Update) {
+        let redeliver = self
+            .redeliver
+            .as_ref()
+            .expect("deliver needs a redelivering bot fixture");
+        redeliver.lock().expect("fixture redeliver lock").push((
+            update.update_id,
+            serde_json::to_string(&update).expect("fixture update"),
+        ));
+    }
+
+    /// Final answers ("fixture answer") delivered to one chat.
+    fn answers_to(&self, chat_id: i64) -> usize {
+        self.requests
+            .lock()
+            .expect("fixture request lock")
+            .iter()
+            .filter(|request| request.path.contains("/sendMessage"))
+            .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+            .filter(|request| {
+                request["chat_id"].as_i64() == Some(chat_id)
+                    && request["text"].as_str() == Some("fixture answer")
+            })
+            .count()
+    }
+
+    /// sendMessage calls addressed to one chat.
+    fn sent_to(&self, chat_id: i64) -> usize {
+        self.requests
+            .lock()
+            .expect("fixture request lock")
+            .iter()
+            .filter(|request| request.path.contains("/sendMessage"))
+            .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+            .filter(|request| request["chat_id"].as_i64() == Some(chat_id))
+            .count()
     }
 
     fn anthropic(release: Option<Arc<AtomicBool>>) -> Self {
@@ -96,6 +155,10 @@ impl LoopbackServer {
         let captured = Arc::clone(&requests);
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
+        let redeliver = match &mode {
+            ServerMode::Bot { redeliver, .. } => Some(Arc::clone(redeliver)),
+            ServerMode::Anthropic { .. } => None,
+        };
         let join = thread::spawn(move || {
             let mut delivered_update = false;
             let mut dropped_connection = false;
@@ -122,9 +185,30 @@ impl LoopbackServer {
                     });
                 let mut drop_connection = false;
                 let response = match &mode {
+                    ServerMode::Bot { redeliver, .. }
+                        if path.contains("/getUpdates")
+                            && !redeliver.lock().expect("fixture redeliver lock").is_empty() =>
+                    {
+                        let offset = path
+                            .split_once("offset=")
+                            .and_then(|(_, rest)| {
+                                rest.split(['&', ' ']).next()?.parse::<i64>().ok()
+                            })
+                            .unwrap_or(0);
+                        let pending = redeliver
+                            .lock()
+                            .expect("fixture redeliver lock")
+                            .iter()
+                            .filter(|(id, _)| *id >= offset)
+                            .map(|(_, body)| body.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!(r#"{{"ok":true,"result":[{pending}]}}"#)
+                    }
                     ServerMode::Bot {
                         update,
                         reconnect_duplicate,
+                        ..
                     } if path.contains("/getUpdates") => {
                         let result = if !delivered_update {
                             delivered_update = true;
@@ -185,6 +269,7 @@ impl LoopbackServer {
             requests,
             stop,
             join: Some(join),
+            redeliver,
         }
     }
 
@@ -260,12 +345,16 @@ fn write_response(stream: &mut TcpStream, body: &str) {
 }
 
 fn update(update_id: i64, user_id: i64, text: &str) -> Update {
+    update_in_chat(update_id, user_id, 42, text)
+}
+
+fn update_in_chat(update_id: i64, user_id: i64, chat_id: i64, text: &str) -> Update {
     Update {
         update_id,
         message: Some(Message {
             message_id: update_id,
             from: Some(User { id: user_id }),
-            chat: Chat { id: 42 },
+            chat: Chat { id: chat_id },
             date: None,
             text: Some(text.to_string()),
         }),
@@ -1337,4 +1426,61 @@ fn install_private_fact(root: &Path, scope: &str, fact_id: &str) {
         fs::set_permissions(&facts, fs::Permissions::from_mode(0o600))
             .expect("private fact permissions");
     }
+}
+
+/// One update that fails permanently (here: its chat's record path is a
+/// directory, so `load_record` and `save_record` both fail) must not pin the
+/// poll loop (#152). The loop retries it a bounded number of times, then
+/// skips past it, and the chat queued behind it is answered.
+#[tokio::test]
+async fn a_permanently_failing_update_is_skipped_and_the_next_chat_is_answered() {
+    let _lock = environment_lock().await;
+    let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
+    let bot = LoopbackServer::bot_redelivering();
+    let provider = LoopbackServer::anthropic(None);
+    let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
+    environment.set_provider_base("anthropic", &provider);
+    let service = TelegramService::from_env().expect("Telegram service config");
+    let shutdown = Arc::new(Notify::new());
+    let task = tokio::spawn(service.run_until(Arc::clone(&shutdown)));
+
+    // A healthy turn in chat 43 first: startup recovery completes while chat
+    // 42 has no record, so breaking chat 42 afterwards affects only chat 42.
+    bot.deliver(update_in_chat(1, 42, 43, "first"));
+    wait_for_message(&bot, "fixture answer").await;
+    let records = root.path().join("conversations");
+    wait_for(Duration::from_secs(5), || records.is_dir()).await;
+    fs::create_dir(records.join("42.json")).expect("break chat 42's record path");
+
+    bot.deliver(update_in_chat(2, 42, 42, "second"));
+    bot.deliver(update_in_chat(3, 42, 43, "third"));
+
+    // Chat 43 is answered again: the loop moved past update 2, and the
+    // service itself survived the unreadable record (#160).
+    wait_for(Duration::from_secs(10), || bot.answers_to(43) >= 2).await;
+    // ...and acknowledged update 3 to the Bot API.
+    wait_for(Duration::from_secs(5), || {
+        bot.requests
+            .lock()
+            .expect("fixture request lock")
+            .iter()
+            .any(|request| {
+                request.path.contains("/getUpdates") && request.path.contains("offset=4")
+            })
+    })
+    .await;
+    shutdown.notify_one();
+    task.await
+        .expect("service task join")
+        .expect("service loop");
+
+    assert_eq!(bot.answers_to(43), 2, "both healthy prompts answered");
+    assert_eq!(
+        bot.sent_to(42),
+        0,
+        "the broken chat was skipped, not answered"
+    );
+    assert_eq!(provider.request_count(), 2);
+    drop(environment);
 }
