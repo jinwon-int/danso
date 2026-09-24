@@ -279,26 +279,49 @@ impl Runner {
     }
 }
 
-// A pidfd pins identity even if Tokio reaps a child before future cancellation.
-struct HostCleanup(Option<std::os::fd::OwnedFd>);
+/// How the supervisor is addressed for signals after launch.
+enum HostTarget {
+    /// A pidfd pins identity even if Tokio reaps the child before future
+    /// cancellation: a signal can never reach a recycled pid.
+    PidFd(std::os::fd::OwnedFd),
+    /// Kernels before 5.3 (Android 4.19 among them, #157) have no
+    /// `pidfd_open`. The bare pid is only signalled while the guard is armed,
+    /// and the guard is disarmed as soon as the child is reaped here; the
+    /// remaining window is Tokio reaping it first, which the pidfd exists to
+    /// close and which this fallback accepts as the price of running at all.
+    Pid(libc::pid_t),
+}
+
+struct HostCleanup(Option<HostTarget>);
 impl HostCleanup {
     fn new(pid: u32) -> std::io::Result<Self> {
         use std::os::fd::FromRawFd;
+        // SAFETY: pidfd_open takes a pid and flags; it returns a new fd or -1.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+        if fd >= 0 {
+            // SAFETY: the kernel just handed us this descriptor and nothing
+            // else owns it.
+            let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+            return Ok(Self(Some(HostTarget::PidFd(fd))));
         }
-        Ok(Self(Some(unsafe {
-            std::os::fd::OwnedFd::from_raw_fd(fd as i32)
-        })))
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            return Ok(Self(Some(HostTarget::Pid(pid as libc::pid_t))));
+        }
+        Err(std::io::Error::new(
+            error.kind(),
+            format!("pidfd_open failed for the host supervisor: {error}"),
+        ))
     }
     fn stop(&self) {
         self.signal(libc::SIGTERM);
     }
     fn signal(&self, signal: i32) {
         use std::os::fd::AsRawFd;
-        if let Some(fd) = &self.0 {
-            unsafe {
+        match &self.0 {
+            // SAFETY: the fd is owned by this guard; a null siginfo asks the
+            // kernel to fill in a default one, and flags must be 0.
+            Some(HostTarget::PidFd(fd)) => unsafe {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal,
                     fd.as_raw_fd(),
@@ -306,7 +329,12 @@ impl HostCleanup {
                     std::ptr::null::<libc::siginfo_t>(),
                     0,
                 );
-            }
+            },
+            // SAFETY: kill on a pid this process spawned and has not reaped.
+            Some(HostTarget::Pid(pid)) => unsafe {
+                libc::kill(*pid, signal);
+            },
+            None => {}
         }
     }
 }

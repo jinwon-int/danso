@@ -217,6 +217,47 @@ fn euid() -> u32 {
 /// /tmp is a trusted ancestor); the final component must be process-owned
 /// and exactly 0700, and a mismatch is an error the caller must resolve by
 /// hand.
+/// The platform's own privileged user, whose directories sit above every
+/// path a process can use. Root everywhere; on Android also `system`
+/// (uid 1000), which owns `/data` and `/data/data` — every app-writable path
+/// passes through them, and `system` is as trusted as root there (#157).
+#[cfg(target_os = "android")]
+const PLATFORM_UIDS: &[u32] = &[0, 1000];
+#[cfg(not(target_os = "android"))]
+const PLATFORM_UIDS: &[u32] = &[0];
+
+/// An ancestor may be owned by the platform or by us; any other owner can
+/// rename what lies beneath it.
+fn trusted_ancestor_owner(uid: u32, euid: u32) -> bool {
+    uid == euid || PLATFORM_UIDS.contains(&uid)
+}
+
+/// Android's `/data` and `/data/data` are `0771 system:system`: writable by
+/// the `system` group, which holds only platform processes. That bit grants
+/// nothing to an app user, so it is tolerated when both owner and group are
+/// the platform's and nobody else can write. Anywhere else a group-writable,
+/// non-sticky ancestor is still refused.
+fn platform_group_writable(uid: u32, gid: u32, mode: u32) -> bool {
+    PLATFORM_UIDS.contains(&uid)
+        && PLATFORM_UIDS.contains(&gid)
+        && uid != 0 // root-owned trees keep the strict rule
+        && mode & 0o002 == 0
+}
+
+/// Android gives every app its own uid *and* its own gid with no other
+/// member, and Termux's own tree is `0771 u0_aNNN:u0_aNNN`
+/// (`/data/data/com.termux/files`). Group-writable there grants nobody
+/// anything. On other systems a primary group can be shared (`users`), so
+/// the strict rule stays.
+fn app_private_group_writable(uid: u32, gid: u32, mode: u32, euid: u32, egid: u32) -> bool {
+    cfg!(target_os = "android") && uid == euid && gid == egid && mode & 0o002 == 0
+}
+
+fn egid() -> u32 {
+    // SAFETY: getegid has no preconditions and cannot fail.
+    unsafe { libc::getegid() }
+}
+
 pub fn require_private_dir(path: &Path) -> Result<()> {
     use std::fs::{create_dir, set_permissions};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -252,14 +293,22 @@ pub fn require_private_dir(path: &Path) -> Result<()> {
                     );
                 } else {
                     ensure!(
-                        meta.uid() == 0 || meta.uid() == euid(),
+                        trusted_ancestor_owner(meta.uid(), euid()),
                         "memory path has an unsafe owner ancestor: {} (uid={})",
                         current.display(),
                         meta.uid()
                     );
                     if meta.mode() & 0o022 != 0 {
                         ensure!(
-                            meta.mode() & 0o1000 != 0,
+                            meta.mode() & 0o1000 != 0
+                                || platform_group_writable(meta.uid(), meta.gid(), meta.mode())
+                                || app_private_group_writable(
+                                    meta.uid(),
+                                    meta.gid(),
+                                    meta.mode(),
+                                    euid(),
+                                    egid()
+                                ),
                             "memory path has an unsafe writable ancestor: {} ({:04o})",
                             current.display(),
                             meta.mode() & 0o777
@@ -353,21 +402,65 @@ pub fn open_secure_with(path: &Path, what: &str, policy: ModePolicy) -> Result<s
             && parts[1..].iter().all(|p| matches!(p, Component::Normal(_))),
         "{what} path must be canonical"
     );
-    let mut dir = std::fs::File::open("/")?;
+    let mut dir = open_root()?;
     let last = parts.len() - 2;
     for (i, part) in parts[1..].iter().enumerate() {
         let name = CString::new(part.as_os_str().as_bytes())?;
-        let flags = libc::O_RDONLY
-            | libc::O_NOFOLLOW
-            | libc::O_CLOEXEC
-            | libc::O_NONBLOCK
-            | if i == last { 0 } else { libc::O_DIRECTORY };
+        let flags = if i == last {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+        } else {
+            intermediate_dir_flags()
+        };
         let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
         ensure!(fd >= 0, "{what} is unavailable: {}", path.display());
         dir = unsafe { std::fs::File::from_raw_fd(fd) };
+        if i != last {
+            require_real_dir(&dir, what)?;
+        }
     }
     validate_open(&dir, what, policy)?;
     Ok(dir)
+}
+
+/// Flags for pinning an intermediate path component. `O_PATH` asks only for
+/// search permission on the directory, not read: Android's `/data` is
+/// `0771 system:system`, traversable by an app but not listable, and an
+/// `O_RDONLY` open of it is EACCES (#157). An `O_PATH` descriptor still
+/// serves as `dirfd` for the next `openat` and answers `fstat`.
+///
+/// With `O_PATH`, `O_NOFOLLOW` no longer fails on a symlink — it opens the
+/// link itself — so the caller must check what it got; see
+/// [`require_real_dir`].
+/// The root directory as a pinned descriptor. `File::open("/")` asks to
+/// *read* `/`, which Android's policy denies an app (EACCES) although it may
+/// traverse it; `O_PATH` asks only for that.
+pub(crate) fn open_root() -> Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: a constant, NUL-terminated path and flags without O_CREAT.
+    let fd = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    ensure!(fd >= 0, "cannot open the root directory");
+    // SAFETY: the kernel just returned this descriptor and nothing else owns it.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+pub(crate) fn intermediate_dir_flags() -> libc::c_int {
+    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+}
+
+/// The check that makes `O_PATH | O_NOFOLLOW` safe: the descriptor must be a
+/// directory, not the symlink it would have opened in place of one.
+pub(crate) fn require_real_dir(dir: &std::fs::File, what: &str) -> Result<()> {
+    let meta = dir.metadata()?;
+    ensure!(
+        meta.is_dir() && !meta.file_type().is_symlink(),
+        "{what} path component is not a real directory"
+    );
+    Ok(())
 }
 
 /// Validate a path's on-disk state without opening it: no symlink, regular
@@ -544,6 +637,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ancestor_owner_rule_admits_self_and_platform_only() {
+        assert!(trusted_ancestor_owner(0, 10123));
+        assert!(trusted_ancestor_owner(10123, 10123));
+        assert!(!trusted_ancestor_owner(1001, 10123));
+        assert_eq!(
+            trusted_ancestor_owner(1000, 10123),
+            cfg!(target_os = "android")
+        );
+    }
+
+    #[test]
+    fn app_private_group_writable_ancestor_is_android_only_and_self_only() {
+        let android = cfg!(target_os = "android");
+        // Termux: /data/data/com.termux/files is 0771 u0_aNNN:u0_aNNN
+        assert_eq!(
+            app_private_group_writable(10346, 10346, 0o40771, 10346, 10346),
+            android
+        );
+        // someone else's app directory
+        assert!(!app_private_group_writable(
+            10347, 10347, 0o40771, 10346, 10346
+        ));
+        // our uid but a different (possibly shared) group
+        assert!(!app_private_group_writable(
+            10346, 3003, 0o40771, 10346, 10346
+        ));
+        // other-writable is never tolerated
+        assert!(!app_private_group_writable(
+            10346, 10346, 0o40777, 10346, 10346
+        ));
+    }
+
+    #[test]
+    fn group_writable_ancestor_is_tolerated_only_for_android_system() {
+        // /data on Android: 0771 system:system
+        assert_eq!(
+            platform_group_writable(1000, 1000, 0o40771),
+            cfg!(target_os = "android")
+        );
+        // other-writable is never tolerated
+        assert!(!platform_group_writable(1000, 1000, 0o40777));
+        // a root-owned group-writable directory keeps the strict rule
+        assert!(!platform_group_writable(0, 0, 0o40771));
+        // an arbitrary user's group-writable directory is never tolerated
+        assert!(!platform_group_writable(1001, 1001, 0o40771));
+    }
+
+    #[test]
     fn scope_names_are_canonical() {
         assert!(valid_scope("global"));
         assert!(valid_scope("shared"));
@@ -574,7 +715,10 @@ mod tests {
     fn require_private_dir_does_not_tighten_root_or_tmp() {
         use std::os::unix::fs::MetadataExt;
         let root_before = std::fs::metadata("/").unwrap().mode() & 0o777;
-        let tmp_before = std::fs::metadata("/tmp").unwrap().mode() & 0o777;
+        // Android has no /tmp; the assertion below then covers "/" alone.
+        let tmp_before = std::fs::metadata("/tmp")
+            .ok()
+            .map(|meta| meta.mode() & 0o777);
         assert_ne!(
             root_before, 0o700,
             "precondition: / must not already be 0700"
@@ -584,7 +728,9 @@ mod tests {
         require_private_dir(&dir).unwrap();
         assert_eq!(std::fs::metadata("/").unwrap().mode() & 0o777, root_before);
         assert_eq!(
-            std::fs::metadata("/tmp").unwrap().mode() & 0o777,
+            std::fs::metadata("/tmp")
+                .ok()
+                .map(|meta| meta.mode() & 0o777),
             tmp_before
         );
         assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
@@ -640,7 +786,15 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let second = tmp.path().join("g");
-        std::fs::hard_link(&file, &second).unwrap();
+        // Android's SELinux policy forbids app hard links (EACCES); the
+        // hard-link half of this test is then not testable there.
+        if let Err(error) = std::fs::hard_link(&file, &second) {
+            assert!(
+                cfg!(target_os = "android") && error.kind() == std::io::ErrorKind::PermissionDenied,
+                "hard_link: {error}"
+            );
+            return;
+        }
         assert!(atomic_write(&file, b"three\n", "probe").is_err());
         assert!(read_bounded(&file, 10, "probe").is_err());
     }
