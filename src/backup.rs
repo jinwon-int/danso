@@ -59,6 +59,7 @@ const CATEGORY_HOME_UNREADABLE: &str = "home_unreadable";
 const CATEGORY_BACKUP_DIR_UNAVAILABLE: &str = "backup_dir_unavailable";
 const CATEGORY_BACKUP_EXISTS: &str = "backup_exists";
 const CATEGORY_CONFIG_UNREADABLE: &str = "config_unreadable";
+const CATEGORY_CONFIG_INVALID: &str = "config_invalid";
 const CATEGORY_WRITE_FAILED: &str = "write_failed";
 const CATEGORY_BACKUP_MISSING: &str = "backup_missing";
 const CATEGORY_INVALID_BACKUP: &str = "invalid_backup";
@@ -329,7 +330,19 @@ pub fn create_at(
     ensure_backup_root(backup_root)?;
 
     let config_path = home.join(config::FILE_NAME);
-    let parsed_config = config::Config::load(&config_path).ok();
+    // An unreadable or invalid config is not the same as no config. Falling
+    // back silently dropped the `telegram.token_file` exclusion and the
+    // configured `[memory] dir`, so one typo in an unrelated key could put
+    // the bot token into an archive that travels between nodes (#153).
+    // A missing file is left to the config component copy below, which
+    // already refuses it as `config_unreadable`.
+    let parsed_config = match fs::symlink_metadata(&config_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        _ => Some(
+            config::Config::load(&config_path)
+                .map_err(|_| CommandError::failed(CATEGORY_CONFIG_INVALID))?,
+        ),
+    };
     let memory_root = parsed_config
         .as_ref()
         .and_then(|value| value.memory.dir.clone())
@@ -1491,6 +1504,44 @@ mod tests {
                 .expect("manifest json");
         assert_eq!(manifest["version"], 1);
         assert_eq!(manifest["components"][0]["mode"], "0600");
+    }
+
+    /// A config that fails to parse or validate must refuse the backup
+    /// rather than run without it (#153): without the parsed config the
+    /// `token_file` exclusion is gone and only the filename heuristic
+    /// remains, which a token stored under a neutral name defeats.
+    #[test]
+    fn invalid_config_refuses_backup_instead_of_dropping_exclusions() {
+        let (root, home, telegram, backups) = fixture();
+        // A token path the name heuristic does not recognise, declared only
+        // through config.toml, under a directory the backup copies.
+        let neutral_token = telegram.join(CONVERSATIONS_DIR_NAME).join("bot.key");
+        private_file(&neutral_token, b"TEST_TOKEN_SECRET_MARKER");
+        let memory = root.path().join("memory");
+        let mut config = format!(
+            "[memory]\ndir = \"{}\"\n[telegram]\ntoken_file = \"{}\"\n",
+            memory.display(),
+            neutral_token.display()
+        );
+        // Sanity: with a valid config the neutral-named token is excluded.
+        fs::write(home.join(config::FILE_NAME), config.as_bytes()).expect("config");
+        let backup = create_at(&home, &backups, Some(&telegram)).expect("backup");
+        assert!(!String::from_utf8_lossy(&all_bytes(&backup)).contains("TEST_TOKEN_SECRET_MARKER"));
+
+        // One unknown key elsewhere in the file invalidates it.
+        config.push_str("[cron]\nenbled = true\n");
+        fs::write(home.join(config::FILE_NAME), config.as_bytes()).expect("config");
+        let error = create_at(&home, &backups, Some(&telegram)).expect_err("must refuse");
+        assert_eq!(error.category(), CATEGORY_CONFIG_INVALID);
+        assert_eq!(error.kind(), ErrorKind::Failed);
+        // Nothing new was written: the earlier backup is the only entry and
+        // no temp directory was left behind.
+        let entries: Vec<_> = fs::read_dir(&backups)
+            .expect("backups")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0], backup.file_name().expect("name"));
     }
 
     #[cfg(unix)]
