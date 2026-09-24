@@ -21,6 +21,7 @@ pub mod runtime;
 #[cfg(feature = "ops")]
 pub mod service;
 pub mod session;
+pub mod settings;
 pub mod telegram;
 pub mod tools;
 #[cfg(feature = "ops")]

@@ -7,10 +7,11 @@
 //! `[provider]` and `[telegram]` sections name credential *files* or rely
 //! on the process environment.
 //!
-//! Precedence, once the run and bridge paths consume this file, is
-//! CLI flag > environment > file > default. This module owns parsing and
-//! validation and the body-free `config check` projection; the CLI keeps
-//! its flag-driven path unchanged until the bridge stage lands.
+//! Precedence is CLI flag > environment > file > default. The Telegram
+//! service, `doctor`, `backup` and `update` resolve their values through
+//! `crate::settings` in that order (#136); `danso run` stays flag-driven.
+//! This module owns parsing and validation and the body-free `config check`
+//! projection.
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};

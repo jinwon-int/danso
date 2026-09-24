@@ -62,19 +62,36 @@ worse than refusing — but `mkdir -p` is the natural first move and produces
 **does not start the service**. Combining install with start would make a
 configuration change into a silent restart.
 
-The unit carries no secrets. Supply the configuration through a systemd
-drop-in, which is also how ccc-node pins its model and labels:
+The unit carries no secrets. Put the token in an owner-only file and name it
+from `config.toml`; the service reads the file when
+`DANSO_TELEGRAM_BOT_TOKEN` is absent (#136):
+
+```
+# $DANSO_HOME/config.toml
+[telegram]
+token_file = "/srv/danso/telegram.token"      # mode 0600, owned by the service user
+allowed_user_ids = [123456789]
+[provider]
+model = "..."
+[core]
+workspace = "/srv/danso/workspace"
+```
+
+Anything the file does not say can still come from a drop-in, which is also
+how ccc-node pins its model and labels; a variable that is set wins over the
+file:
 
 ```
 # /etc/systemd/system/danso.service.d/10-danso.conf
 [Service]
-Environment=DANSO_TELEGRAM_BOT_TOKEN=...
 Environment=DANSO_TELEGRAM_MODEL=...
 Environment=DANSO_TELEGRAM_WORKSPACE=/srv/danso/workspace
 ```
 
-The drop-in file holds a token: `chmod 600` it. The unit file itself is
-world-readable, which is why the token must not go in it.
+**Do not put the token in an `Environment=` line.** systemd exposes a unit's
+environment to unprivileged users through `systemctl show` and D-Bus, so
+`chmod 600` on the drop-in does not keep it private. The unit file itself is
+world-readable, which is why the token must not go there either.
 
 `install` reads the unit it is about to write **and any drop-ins already
 present** — including the files their `EnvironmentFile=` lines name, when it

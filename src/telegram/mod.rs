@@ -7,6 +7,7 @@ mod access;
 mod client;
 mod lock;
 mod service;
+pub use service::model_env_names;
 mod store;
 
 pub use access::{AccessControl, Allowlist};
@@ -20,7 +21,7 @@ pub use store::{
     ActiveTaskRecord, ConversationRecord, ConversationStore, MAX_PREVIOUS_SESSIONS, UsageRecord,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -124,14 +125,73 @@ impl fmt::Debug for TelegramConfig {
     }
 }
 
+/// Largest token file the service will read; a bot token is under 100 bytes.
+const TOKEN_FILE_MAX_BYTES: u64 = 4096;
+
+/// The bot token from `telegram.token_file`: an owner-only regular file,
+/// opened with every component pinned, read bounded, trimmed. The value is
+/// never echoed; a bad file is reported by role, not content.
+fn token_from_file(path: &Path) -> Result<String> {
+    ensure!(
+        path.is_absolute(),
+        "telegram.token_file must be an absolute path"
+    );
+    let file = crate::memory::paths::open_secure(path, "Telegram token file")?;
+    use std::io::Read;
+    let mut raw = String::new();
+    file.take(TOKEN_FILE_MAX_BYTES + 1)
+        .read_to_string(&mut raw)
+        .context("Telegram token file must be UTF-8")?;
+    ensure!(
+        raw.len() as u64 <= TOKEN_FILE_MAX_BYTES,
+        "Telegram token file exceeds {TOKEN_FILE_MAX_BYTES} bytes"
+    );
+    let token = raw.trim().to_string();
+    ensure!(!token.is_empty(), "Telegram token file is empty");
+    Ok(token)
+}
+
 impl TelegramConfig {
     pub fn from_env() -> Result<Self> {
-        let bot_token =
-            std::env::var(BOT_TOKEN_ENV).context("DANSO_TELEGRAM_BOT_TOKEN is required")?;
-        ensure!(
-            !bot_token.trim().is_empty(),
-            "DANSO_TELEGRAM_BOT_TOKEN must not be empty"
-        );
+        Self::resolve(&crate::settings::Layered::load()?)
+    }
+
+    /// Environment first, then `config.toml` (#136): the token from
+    /// `telegram.token_file` and the allowlist from `telegram.allowed_user_ids`
+    /// when their variables are absent. A set-but-empty allowlist variable
+    /// still means deny-all — an operator who clears it gets what they asked.
+    pub fn resolve(layered: &crate::settings::Layered) -> Result<Self> {
+        let bot_token = match std::env::var(BOT_TOKEN_ENV) {
+            Ok(token) => {
+                ensure!(
+                    !token.trim().is_empty(),
+                    "DANSO_TELEGRAM_BOT_TOKEN must not be empty"
+                );
+                token
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("DANSO_TELEGRAM_BOT_TOKEN must be valid UTF-8")
+            }
+            Err(std::env::VarError::NotPresent) => {
+                let path = layered
+                    .config()
+                    .and_then(|config| config.telegram.token_file.clone())
+                    .context(
+                        "DANSO_TELEGRAM_BOT_TOKEN or telegram.token_file in config.toml is required",
+                    )?;
+                token_from_file(&path)?
+            }
+        };
+        let allowed_user_ids = match std::env::var(ALLOWED_USER_IDS_ENV) {
+            Ok(raw) => Allowlist::parse(&raw)?,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("{ALLOWED_USER_IDS_ENV} must be valid UTF-8")
+            }
+            Err(std::env::VarError::NotPresent) => layered
+                .config()
+                .map(|config| Allowlist::from_ids(config.telegram.allowed_user_ids.iter().copied()))
+                .unwrap_or_default(),
+        };
         let api_base_url = std::env::var(client::API_BASE_URL_ENV)
             .unwrap_or_else(|_| client::DEFAULT_API_BASE_URL.to_string());
         let poll_timeout_seconds = parse_u64_env(
@@ -142,7 +202,7 @@ impl TelegramConfig {
         let retries = parse_u32_env(client::RETRIES_ENV, client::RETRIES_DEFAULT, 5)?;
         Ok(Self {
             bot_token,
-            allowed_user_ids: Allowlist::from_env()?,
+            allowed_user_ids,
             data_dir: data_dir_from_env()?,
             api_base_url,
             poll_timeout_seconds,

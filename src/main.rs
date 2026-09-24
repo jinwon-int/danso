@@ -684,6 +684,17 @@ fn main() {
     let pause_requested = Arc::new(AtomicBool::new(false));
     let cancellation_reason = Arc::new(AtomicU8::new(0));
     let mut config = args.config();
+    // `--provider-retries` used to carry a default, so DANSO_PROVIDER_RETRIES
+    // could never be reached from `run`; the flag is now optional and the
+    // environment is the next source (#136).
+    config.provider_retries = match danso::provider::resolve_provider_retries(args.provider_retries)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("run refused: {error}");
+            std::process::exit(2);
+        }
+    };
     config.cancellation_reason = Some(Arc::clone(&cancellation_reason));
     if config.long_task.is_some() {
         config.pause_requested = Some(Arc::clone(&pause_requested));

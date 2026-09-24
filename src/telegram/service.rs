@@ -10,6 +10,7 @@ use super::{
     ensure_private_dir,
     store::{ConversationRecord, ConversationStore, UsageRecord},
 };
+use crate::settings::{self, Layered};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use danso_ops::{
@@ -110,34 +111,56 @@ struct RunSettings {
 
 impl RunSettings {
     fn from_env() -> Result<Self> {
-        let provider = first_env(&[PROVIDER_ENV, "DANSO_PROVIDER"])?
-            .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+        Self::resolve(&Layered::load()?)
+    }
+
+    /// Environment first, then `config.toml`, then the default (#136). The
+    /// file keys mirror the environment names; an error names the source
+    /// that actually supplied the value.
+    fn resolve(layered: &Layered) -> Result<Self> {
+        let provider = settings::resolve_string(
+            layered,
+            &[PROVIDER_ENV, "DANSO_PROVIDER"],
+            "provider.name",
+            |c| c.provider.name.clone(),
+        )?
+        .map(|(value, _)| value)
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
         ensure!(
             ["anthropic", "openai", "openai-codex", "glm"].contains(&provider.as_str()),
             "unsupported Telegram provider"
         );
 
-        let mut model_names = vec![MODEL_ENV, "DANSO_MODEL"];
-        match provider.as_str() {
-            "anthropic" => model_names.push("DANSO_ANTHROPIC_MODEL"),
-            "openai" => model_names.push("DANSO_OPENAI_MODEL"),
-            "openai-codex" => {
-                model_names.push("DANSO_OPENAI_CODEX_MODEL");
-                model_names.push("DANSO_OPENAI_MODEL");
-            }
-            "glm" => model_names.push("DANSO_GLM_MODEL"),
-            _ => unreachable!("provider was validated above"),
-        }
-        let default_model = first_env(&model_names)?
-            .context("DANSO_TELEGRAM_MODEL or the normal Danso model environment is required")?;
+        let model_names = model_env_names(&provider);
+        let default_model = settings::resolve_string(
+            layered,
+            &model_names,
+            "provider.model",
+            |c| c.provider.model.clone(),
+        )?
+        .map(|(value, _)| value)
+        .context(
+            "DANSO_TELEGRAM_MODEL, the normal Danso model environment, or provider.model in config.toml is required",
+        )?;
         validate_model(&default_model)?;
 
-        let default_effort = first_env(&[EFFORT_ENV, "DANSO_REASONING_EFFORT"])?;
+        let default_effort = settings::resolve_string(
+            layered,
+            &[EFFORT_ENV, "DANSO_REASONING_EFFORT"],
+            "provider.reasoning_effort",
+            |c| c.provider.reasoning_effort.clone(),
+        )?
+        .map(|(value, _)| value);
         validate_effort(default_effort.as_deref(), &provider)?;
 
-        let workspace = first_env(&[WORKSPACE_ENV, "DANSO_WORKSPACE"])?
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_dir().context("resolve Telegram workspace")?);
+        let workspace = settings::resolve_string(
+            layered,
+            &[WORKSPACE_ENV, "DANSO_WORKSPACE"],
+            "core.workspace",
+            |c| c.core.workspace.as_ref().map(|p| p.display().to_string()),
+        )?
+        .map(|(value, _)| PathBuf::from(value))
+        .unwrap_or(std::env::current_dir().context("resolve Telegram workspace")?);
         ensure!(
             workspace.is_absolute(),
             "Telegram workspace must be an absolute path"
@@ -150,74 +173,106 @@ impl RunSettings {
             "Telegram workspace must be a non-root directory"
         );
 
-        let max_turns = configured_u32(
+        let max_turns = settings::resolve_u32(
+            layered,
             &["DANSO_TELEGRAM_MAX_TURNS", "DANSO_MAX_TURNS"],
+            "core.max_turns",
+            |c| c.core.max_turns,
             DEFAULT_MAX_TURNS,
             1,
             128,
         )?;
-        let timeout_seconds = configured_u64(
+        let timeout_seconds = settings::resolve_u64(
+            layered,
             &["DANSO_TELEGRAM_TIMEOUT_SECONDS", "DANSO_TIMEOUT_SECONDS"],
+            "core.timeout_seconds",
+            |c| c.core.timeout_seconds,
             DEFAULT_TIMEOUT_SECONDS,
             1,
             3600,
         )?;
-        let provider_timeout_seconds = configured_u64(
+        let provider_timeout_seconds = settings::resolve_u64(
+            layered,
             &[
                 "DANSO_TELEGRAM_PROVIDER_TIMEOUT_SECONDS",
                 "DANSO_PROVIDER_TIMEOUT_SECONDS",
             ],
+            "provider.timeout_seconds",
+            |c| c.provider.timeout_seconds,
             DEFAULT_PROVIDER_TIMEOUT_SECONDS,
             1,
             300,
         )?;
-        let tool_timeout_seconds = configured_u64(
+        let tool_timeout_seconds = settings::resolve_u64(
+            layered,
             &[
                 "DANSO_TELEGRAM_TOOL_TIMEOUT_SECONDS",
                 "DANSO_TOOL_TIMEOUT_SECONDS",
             ],
+            "core.tool_timeout_seconds",
+            |c| c.core.tool_timeout_seconds,
             DEFAULT_TOOL_TIMEOUT_SECONDS,
             1,
             crate::tools::HOST_TOOL_TIMEOUT_MAX_SECONDS,
         )?;
-        let provider_retries = configured_u32(
+        let provider_retries = settings::resolve_u32(
+            layered,
             &["DANSO_TELEGRAM_PROVIDER_RETRIES", "DANSO_PROVIDER_RETRIES"],
+            "provider.retries",
+            |c| c.provider.retries,
             DEFAULT_PROVIDER_RETRIES,
             0,
             5,
         )?;
-        let max_output_tokens = configured_optional_u32(&[
-            "DANSO_TELEGRAM_MAX_OUTPUT_TOKENS",
-            "DANSO_MAX_OUTPUT_TOKENS",
-        ])?;
-        let compact_at_bytes = configured_optional_usize(&[
+        let max_output_tokens = settings::resolve_optional_u32(
+            layered,
+            &[
+                "DANSO_TELEGRAM_MAX_OUTPUT_TOKENS",
+                "DANSO_MAX_OUTPUT_TOKENS",
+            ],
+            "provider.max_output_tokens",
+            |c| c.provider.max_output_tokens,
+        )?;
+        let compact_at_bytes = settings::env_optional_usize(&[
             "DANSO_TELEGRAM_COMPACT_AT_BYTES",
             "DANSO_COMPACT_AT_BYTES",
         ])?;
-        let heartbeat_seconds = configured_u64(
+        let heartbeat_seconds = settings::resolve_u64(
+            layered,
             &["DANSO_TELEGRAM_HEARTBEAT_SECONDS"],
+            "telegram.heartbeat_seconds",
+            |c| c.telegram.heartbeat_seconds,
             DEFAULT_HEARTBEAT_SECONDS,
             0,
             MAX_HEARTBEAT_SECONDS,
         )?;
-        let followup_cap = configured_u64(
+        let followup_cap = settings::resolve_u64(
+            layered,
             &["DANSO_TELEGRAM_FOLLOWUP_CAP"],
+            "(none)",
+            |_| None,
             DEFAULT_FOLLOWUP_CAP as u64,
             0,
             MAX_FOLLOWUP_CAP,
         )? as usize;
-        let memory_scope =
-            first_env(&["DANSO_TELEGRAM_MEMORY_SCOPE"])?.unwrap_or_else(|| "global".to_string());
+        let memory_scope = settings::resolve_string(
+            layered,
+            &["DANSO_TELEGRAM_MEMORY_SCOPE"],
+            "memory.scope",
+            |c| c.memory.scope.clone(),
+        )?
+        .map(|(value, _)| value)
+        .unwrap_or_else(|| "global".to_string());
         ensure!(
             crate::memory::valid_scope(&memory_scope),
-            "DANSO_TELEGRAM_MEMORY_SCOPE must be global, shared, or private-<32 hex>"
+            "DANSO_TELEGRAM_MEMORY_SCOPE or memory.scope must be global, shared, or private-<32 hex>"
         );
-        let memory_root = first_env(&["DANSO_MEMORY_DIR"])?
-            .map(PathBuf::from)
-            .unwrap_or_else(crate::memory::MemoryConfig::default_root);
+        let memory_root = crate::memory::MemoryConfig::resolve_root(
+            layered.config().and_then(|c| c.memory.dir.clone()),
+        );
         ensure!(
             memory_root.is_absolute(),
-            "DANSO_MEMORY_DIR must be an absolute path"
+            "DANSO_MEMORY_DIR or memory.dir must be an absolute path"
         );
         let task_limits = task_limits_from_env()?;
 
@@ -226,11 +281,11 @@ impl RunSettings {
             default_model,
             default_effort,
             workspace,
-            trust_project: configured_bool(
+            trust_project: settings::env_bool(
                 &["DANSO_TELEGRAM_TRUST_PROJECT", "DANSO_TRUST_PROJECT"],
                 false,
             )?,
-            no_tools: configured_bool(&["DANSO_TELEGRAM_NO_TOOLS", "DANSO_NO_TOOLS"], false)?,
+            no_tools: settings::env_bool(&["DANSO_TELEGRAM_NO_TOOLS", "DANSO_NO_TOOLS"], false)?,
             max_turns,
             timeout_seconds,
             provider_timeout_seconds,
@@ -301,6 +356,24 @@ impl RunSettings {
     }
 }
 
+/// Every environment name the service accepts a model under, most specific
+/// first. `install` preflight uses the same list so it never refuses a unit
+/// the service would start.
+pub fn model_env_names(provider: &str) -> Vec<&'static str> {
+    let mut names = vec![MODEL_ENV, "DANSO_MODEL"];
+    match provider {
+        "anthropic" => names.push("DANSO_ANTHROPIC_MODEL"),
+        "openai" => names.push("DANSO_OPENAI_MODEL"),
+        "openai-codex" => {
+            names.push("DANSO_OPENAI_CODEX_MODEL");
+            names.push("DANSO_OPENAI_MODEL");
+        }
+        "glm" => names.push("DANSO_GLM_MODEL"),
+        _ => {}
+    }
+    names
+}
+
 fn task_limits_from_env() -> Result<crate::long_task::Limits> {
     let limits = crate::long_task::Limits {
         wall_seconds: configured_u64(
@@ -338,82 +411,16 @@ fn task_limits_from_env() -> Result<crate::long_task::Limits> {
     Ok(limits)
 }
 
-fn first_env(names: &[&str]) -> Result<Option<String>> {
-    for name in names {
-        match std::env::var(name) {
-            Ok(value) => return Ok(Some(value)),
-            Err(std::env::VarError::NotPresent) => {}
-            Err(std::env::VarError::NotUnicode(_)) => {
-                bail!("{name} must be valid UTF-8")
-            }
-        }
-    }
-    Ok(None)
-}
-
 fn configured_u64(names: &[&str], default: u64, min: u64, max: u64) -> Result<u64> {
-    let Some(raw) = first_env(names)? else {
-        return Ok(default);
-    };
-    ensure!(!raw.trim().is_empty(), "{} must not be empty", names[0]);
-    let value = raw
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("{} must be an integer", names[0]))?;
-    ensure!(
-        (min..=max).contains(&value),
-        "{} must be {min}..={max}",
-        names[0]
-    );
-    Ok(value)
-}
-
-fn configured_u32(names: &[&str], default: u32, min: u32, max: u32) -> Result<u32> {
-    let Some(raw) = first_env(names)? else {
-        return Ok(default);
-    };
-    ensure!(!raw.trim().is_empty(), "{} must not be empty", names[0]);
-    let value = raw
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| anyhow::anyhow!("{} must be an integer", names[0]))?;
-    ensure!(
-        (min..=max).contains(&value),
-        "{} must be {min}..={max}",
-        names[0]
-    );
-    Ok(value)
-}
-
-fn configured_optional_u32(names: &[&str]) -> Result<Option<u32>> {
-    let Some(raw) = first_env(names)? else {
-        return Ok(None);
-    };
-    ensure!(!raw.trim().is_empty(), "{} must not be empty", names[0]);
-    Ok(Some(raw.trim().parse::<u32>().map_err(|_| {
-        anyhow::anyhow!("{} must be an integer", names[0])
-    })?))
-}
-
-fn configured_optional_usize(names: &[&str]) -> Result<Option<usize>> {
-    let Some(raw) = first_env(names)? else {
-        return Ok(None);
-    };
-    ensure!(!raw.trim().is_empty(), "{} must not be empty", names[0]);
-    Ok(Some(raw.trim().parse::<usize>().map_err(|_| {
-        anyhow::anyhow!("{} must be an integer", names[0])
-    })?))
-}
-
-fn configured_bool(names: &[&str], default: bool) -> Result<bool> {
-    let Some(raw) = first_env(names)? else {
-        return Ok(default);
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => bail!("{} must be a boolean", names[0]),
-    }
+    settings::resolve_u64(
+        &Layered::without_file(),
+        names,
+        "(none)",
+        |_| None,
+        default,
+        min,
+        max,
+    )
 }
 
 fn atomic_write_health(path: &std::path::Path, payload: &[u8]) -> Result<()> {
@@ -1085,8 +1092,9 @@ pub struct TelegramService {
 
 impl TelegramService {
     pub fn from_env() -> Result<Self> {
-        let telegram = TelegramConfig::from_env()?;
-        let settings = RunSettings::from_env()?;
+        let layered = Layered::load()?;
+        let telegram = TelegramConfig::resolve(&layered)?;
+        let settings = RunSettings::resolve(&layered)?;
         Self::from_config(telegram, settings)
     }
 

@@ -5,11 +5,21 @@ process as every agent turn. It never starts a Danso CLI subprocess per
 message. The normal bounded tool workers remain the only subprocesses a turn
 may use.
 
-Configuration is environment-only:
+Configuration is resolved in one order — **environment, then
+`$DANSO_HOME/config.toml`, then the default** — for every value the service
+reads (docs/unified-design.md §6.1). A key the file declares is a key the
+service honours; a variable that is set always wins over the file. A
+`config.toml` that exists but does not parse or validate stops the service
+from starting, the same as `update` and `backup`.
 
-- `DANSO_TELEGRAM_BOT_TOKEN` is required.
-- `DANSO_TELEGRAM_ALLOWED_USER_IDS` is a comma-separated numeric allowlist.
-  Missing or empty means every update is denied.
+- `DANSO_TELEGRAM_BOT_TOKEN`, or `telegram.token_file` in `config.toml`: an
+  owner-only (`0600`) regular file holding the token, read with every path
+  component pinned. One of the two is required; the token itself never goes
+  in the file.
+- `DANSO_TELEGRAM_ALLOWED_USER_IDS` is a comma-separated numeric allowlist,
+  falling back to `telegram.allowed_user_ids` when the variable is absent.
+  A variable that is set but empty means every update is denied, whatever
+  the file says; no variable and no file also denies everything.
 - `DANSO_TELEGRAM_DATA_DIR` selects an absolute state directory. The default
   is `$HOME/.danso/telegram`.
 - `DANSO_TELEGRAM_API_BASE_URL` is optional and is intended for a controlled
@@ -17,16 +27,18 @@ Configuration is environment-only:
 - `DANSO_TELEGRAM_POLL_TIMEOUT_SECONDS` selects the long-poll timeout
   (`0..=300`, default `25`), and `DANSO_TELEGRAM_RETRIES` selects bounded Bot
   API retries (`0..=5`, default `3`).
-- `DANSO_TELEGRAM_HEARTBEAT_SECONDS` controls edits to the single progress
-  message (default `60`; `0` disables heartbeat edits), and
+- `DANSO_TELEGRAM_HEARTBEAT_SECONDS` (or `telegram.heartbeat_seconds`)
+  controls edits to the single progress message (default `60`; `0` disables
+  heartbeat edits), and
   `DANSO_TELEGRAM_FOLLOWUP_CAP` bounds the durable per-chat follow-up queue
   (default `5`).
-- `DANSO_TELEGRAM_WORKSPACE` selects the absolute workspace. If omitted, the
-  current directory is used.
-- `DANSO_TELEGRAM_MEMORY_SCOPE` selects the memory route used by turns and
-  explicit memory commands (`global` by default; `shared` or
-  `private-<32 lowercase hex>` are also valid). `DANSO_MEMORY_DIR` selects
-  the absolute memory root.
+- `DANSO_TELEGRAM_WORKSPACE` (or `core.workspace`) selects the absolute
+  workspace. If omitted, the current directory is used.
+- `DANSO_TELEGRAM_MEMORY_SCOPE` (or `memory.scope`) selects the memory route
+  used by turns and explicit memory commands (`global` by default; `shared`
+  or `private-<32 lowercase hex>` are also valid). `DANSO_MEMORY_DIR` (or
+  `memory.dir`) selects the absolute memory root; `doctor` and `backup`
+  resolve it in the same order, so they inspect the root the service writes.
 - Long-task limits use the same bounded values as the CLI. The task-specific
   environment names are `DANSO_TASK_WALL_SECONDS` (or
   `DANSO_TASK_TIMEOUT_SECONDS`), `DANSO_TASK_STAGE_REQUESTS`,
@@ -38,18 +50,29 @@ Configuration is environment-only:
 Provider and turn defaults use the normal Danso environment, with a
 Telegram-specific value taking precedence where available:
 
-- Provider: `DANSO_TELEGRAM_PROVIDER`, then `DANSO_PROVIDER` (default
-  `anthropic`).
+- Provider: `DANSO_TELEGRAM_PROVIDER`, then `DANSO_PROVIDER`, then
+  `provider.name` (default `anthropic`).
 - Model: `DANSO_TELEGRAM_MODEL`, then `DANSO_MODEL`, then the provider-specific
   model variable (`DANSO_ANTHROPIC_MODEL`, `DANSO_OPENAI_MODEL`,
-  `DANSO_OPENAI_CODEX_MODEL`, or `DANSO_GLM_MODEL`).
+  `DANSO_OPENAI_CODEX_MODEL`, or `DANSO_GLM_MODEL`), then `provider.model`.
 - Reasoning effort: `DANSO_TELEGRAM_EFFORT`, then
-  `DANSO_REASONING_EFFORT`.
+  `DANSO_REASONING_EFFORT`, then `provider.reasoning_effort`.
 - Provider credentials and base URLs follow [the provider
   table](providers.md). Turn limits may be set with
-  `DANSO_TELEGRAM_MAX_TURNS`, `DANSO_TELEGRAM_TIMEOUT_SECONDS`,
-  `DANSO_TELEGRAM_PROVIDER_TIMEOUT_SECONDS`, and
-  `DANSO_TELEGRAM_TOOL_TIMEOUT_SECONDS`.
+  `DANSO_TELEGRAM_MAX_TURNS` (`core.max_turns`),
+  `DANSO_TELEGRAM_TIMEOUT_SECONDS` (`core.timeout_seconds`),
+  `DANSO_TELEGRAM_PROVIDER_TIMEOUT_SECONDS` (`provider.timeout_seconds`),
+  `DANSO_TELEGRAM_TOOL_TIMEOUT_SECONDS` (`core.tool_timeout_seconds`),
+  `DANSO_TELEGRAM_PROVIDER_RETRIES` (`provider.retries`) and
+  `DANSO_TELEGRAM_MAX_OUTPUT_TOKENS` (`provider.max_output_tokens`); the
+  un-prefixed `DANSO_*` names are accepted as the next alias in each case.
+  An out-of-range value is refused with the name of the variable or file key
+  that supplied it.
+- Environment-only (no file key): `DANSO_TELEGRAM_DATA_DIR`,
+  `DANSO_TELEGRAM_API_BASE_URL`, `DANSO_TELEGRAM_POLL_TIMEOUT_SECONDS`,
+  `DANSO_TELEGRAM_RETRIES`, `DANSO_TELEGRAM_FOLLOWUP_CAP`,
+  `DANSO_[TELEGRAM_]COMPACT_AT_BYTES`, `DANSO_[TELEGRAM_]TRUST_PROJECT`,
+  `DANSO_[TELEGRAM_]NO_TOOLS`, and the `DANSO_[TELEGRAM_]TASK_*` limits.
 
 Example:
 

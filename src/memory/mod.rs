@@ -98,6 +98,17 @@ pub struct MemoryConfig {
 
 impl MemoryConfig {
     /// `$DANSO_MEMORY_DIR` or `~/.danso/memory` (§8).
+    /// `DANSO_MEMORY_DIR`, then `memory.dir` from `config.toml`, then the
+    /// default — the one order every reader uses (#136). `doctor` and
+    /// `backup` used to let the file win, and then inspected a memory root
+    /// the service was not writing to.
+    pub fn resolve_root(file: Option<std::path::PathBuf>) -> std::path::PathBuf {
+        if let Some(dir) = std::env::var_os("DANSO_MEMORY_DIR") {
+            return std::path::PathBuf::from(dir);
+        }
+        file.unwrap_or_else(Self::default_root)
+    }
+
     pub fn default_root() -> std::path::PathBuf {
         if let Some(dir) = std::env::var_os("DANSO_MEMORY_DIR") {
             return std::path::PathBuf::from(dir);

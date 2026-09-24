@@ -463,6 +463,10 @@ impl Environment {
         unsafe { env::set_var(name, value) };
     }
 
+    fn remove(&self, name: &str) {
+        unsafe { env::remove_var(name) };
+    }
+
     fn set_provider_base(&self, provider: &str, server: &LoopbackServer) {
         unsafe {
             match provider {
@@ -1540,5 +1544,89 @@ async fn a_finished_turn_releases_the_slot_even_when_its_record_is_unreadable() 
         "the second prompt was queued behind a finished turn: {:?}",
         bot.sent_texts()
     );
+    drop(environment);
+}
+
+/// The service resolves environment, then `config.toml`, then defaults
+/// (#136). With the token, model and allowlist variables absent, the file
+/// alone must start the service and authorise a user.
+#[tokio::test]
+async fn config_file_supplies_token_model_and_allowlist_when_the_environment_is_absent() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = environment_lock().await;
+    let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
+    let bot = LoopbackServer::bot(Some(update(1, 7, "hello from a file-authorised user")));
+    let provider = LoopbackServer::anthropic(None);
+    let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
+    environment.set_provider_base("anthropic", &provider);
+
+    // HOME is the workspace; the file lives at $HOME/.danso/config.toml.
+    let danso_home = root.path().join("workspace").join(".danso");
+    fs::create_dir_all(&danso_home).expect("danso home");
+    let token_file = danso_home.join("telegram.token");
+    fs::write(&token_file, "TEST_TOKEN\n").expect("token file");
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).expect("token mode");
+    fs::write(
+        danso_home.join("config.toml"),
+        format!(
+            "[telegram]\ntoken_file = \"{}\"\nallowed_user_ids = [7]\n[provider]\nmodel = \"fixture-model\"\n",
+            token_file.display()
+        ),
+    )
+    .expect("config");
+    environment.remove("DANSO_TELEGRAM_BOT_TOKEN");
+    environment.remove("DANSO_TELEGRAM_ALLOWED_USER_IDS");
+    environment.remove("DANSO_TELEGRAM_MODEL");
+
+    let service = TelegramService::from_env().expect("service from config.toml");
+    let shutdown = Arc::new(Notify::new());
+    let task = tokio::spawn(service.run_until(Arc::clone(&shutdown)));
+    wait_for_message(&bot, "fixture answer").await;
+    shutdown.notify_one();
+    task.await
+        .expect("service task join")
+        .expect("service loop");
+    // The token reached the Bot API path: the fixture saw /botTEST_TOKEN/…
+    assert!(
+        bot.requests
+            .lock()
+            .expect("fixture request lock")
+            .iter()
+            .all(|request| request.path.starts_with("/botTEST_TOKEN/"))
+    );
+    drop(environment);
+}
+
+/// A set-but-empty allowlist variable is deny-all even when the file names
+/// users: clearing the variable is an operator's explicit choice.
+#[tokio::test]
+async fn an_empty_allowlist_variable_denies_despite_the_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = environment_lock().await;
+    let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
+    let bot = LoopbackServer::bot(Some(update(1, 7, "should be denied")));
+    let provider = LoopbackServer::anthropic(None);
+    let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
+    environment.set_provider_base("anthropic", &provider);
+    let danso_home = root.path().join("workspace").join(".danso");
+    fs::create_dir_all(&danso_home).expect("danso home");
+    fs::set_permissions(&danso_home, fs::Permissions::from_mode(0o700)).expect("home mode");
+    fs::write(
+        danso_home.join("config.toml"),
+        "[telegram]\nallowed_user_ids = [7]\n",
+    )
+    .expect("config");
+    environment.set("DANSO_TELEGRAM_ALLOWED_USER_IDS", "");
+
+    let service = TelegramService::from_env().expect("service");
+    service
+        .handle_update(update(1, 7, "should be denied"))
+        .await
+        .expect("update handled");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(provider.request_count(), 0);
+    assert!(bot.sent_texts().is_empty());
     drop(environment);
 }
