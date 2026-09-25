@@ -60,6 +60,23 @@ fn main() {
             }
         }
     }
+    // `cron` is the read-only scheduler surface (§6.5): list/describe/due
+    // only. Like doctor and service it stays ahead of config and async
+    // runtime setup — inspecting the store must not create state or touch a
+    // network.
+    #[cfg(feature = "ops")]
+    if std::env::args().nth(1).as_deref() == Some("cron") {
+        use danso::cron::CronArgs;
+        let args = match CronArgs::try_parse_from(std::env::args_os().skip(1)) {
+            Ok(args) => args,
+            Err(error) => {
+                let code = error.exit_code();
+                error.print().ok();
+                std::process::exit(code);
+            }
+        };
+        std::process::exit(danso::cron::run(args));
+    }
     // `service` is the resident-service surface. `status` in particular must
     // stay ahead of config and async runtime setup for the same reason doctor
     // does: inspecting a service must not acquire its lock or create its state.

@@ -25,6 +25,9 @@ telegram = []
 anyhow = "1"
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# §6.5 (operator decision, issue #33): embedded tzdb via chrono-tz — never the
+# system tzdata, so Termux nodes resolve the same IANA names identically.
+chrono-tz = "0.10"
 danso-ops = { path = "crates/danso-ops" }
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
