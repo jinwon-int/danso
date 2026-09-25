@@ -1,6 +1,8 @@
 //! Read-only due planning — a port of ccc `agent_cron.py` `lock_status` and
 //! `due_plan` (§6.5). Nothing here acquires locks, writes, or executes.
 
+use crate::cron::commit::run_limit_metadata;
+use crate::cron::locks::read_lock;
 use crate::cron::retry::{RetryPolicy, retry_view};
 use crate::cron::schedule::{
     OCCURRENCE_SCAN_LIMIT, Schedule, next_after, parse_schedule, schedule_occurrences,
@@ -24,20 +26,8 @@ fn is_truthy(value: Option<&Value>) -> bool {
     }
 }
 
-/// Read one task lock (`cron/locks/<id>.lock`). Missing file → `None`; an
-/// unparseable lock becomes `{"error": ...}` exactly like the reference.
-fn read_lock(path: &Path) -> Value {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(_) => return Value::Null,
-    };
-    match serde_json::from_str::<Value>(&text) {
-        Ok(value @ Value::Object(_)) => value,
-        Ok(value) => json!({ "raw": value }),
-        Err(error) => json!({ "error": format!("invalid lock JSON: {error}") }),
-    }
-}
-
+/// True only when the recorded holder pid provably no longer exists
+/// (observability only — see the lock contract above).
 fn holder_process_gone(pid: i64) -> bool {
     // The lock contract makes bootId change and the opt-in lockTimeoutSec the
     // only staleness sources: a wrong liveness guess must never double-run a
@@ -111,17 +101,6 @@ pub fn lock_status(task_id: &str, task: &Task, at: DateTime<Utc>, locks: &Path) 
         base["holderAlive"] = json!(holder_alive);
     }
     base
-}
-
-fn run_limit_metadata(task: &Task) -> Value {
-    let maximum = task.max_runs;
-    let count = task.run_count;
-    json!({
-        "maxRuns": maximum,
-        "runCount": count,
-        "remainingRuns": maximum.map(|maximum| (maximum - count).max(0)),
-        "reached": maximum.is_some_and(|maximum| count >= maximum),
-    })
 }
 
 fn status_from_lock(lock: &Value, current: &str) -> String {
