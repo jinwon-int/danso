@@ -98,7 +98,7 @@ pub fn task_flock(store_path: &Path, task_id: &str) -> Result<FlockGuard, String
 
 /// `socket.gethostname()` equivalent; empty on failure (the lock record then
 /// simply carries no host, which the reference tolerates).
-fn hostname() -> String {
+pub fn hostname() -> String {
     let mut buffer = [0u8; 256];
     // SAFETY: `buffer` is writable for at least the passed length and the
     // result is NUL-terminated by the kernel when it fits.

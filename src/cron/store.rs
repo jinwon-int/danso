@@ -196,7 +196,7 @@ pub struct Task {
     pub run_history: Vec<RunHistoryItem>,
     #[serde(default)]
     pub retry_policy: Option<RetryPolicySpec>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_state: Option<RetryState>,
     #[serde(default)]
     pub last_run_at: Option<String>,

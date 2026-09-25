@@ -216,6 +216,29 @@ pub fn redact_credentials(input: &str) -> String {
     text
 }
 
+/// ccc bridge `redaction.redact_credentials`: replace the *whole* credential
+/// shape with the marker, keeping no prefix. This is the canonical pass for
+/// boundary outputs (the cron owner spool, §6.5) — unlike
+/// [`redact_credentials`] it leaves no credential-shaped residue, so
+/// [`contains_credential`] can re-verify the result.
+pub fn redact_credential_spans(input: &str) -> String {
+    const MARKER: &str = "[REDACTED_CREDENTIAL]";
+    let mut text = input.to_string();
+    for (pattern, _) in CREDENTIAL_PATTERNS {
+        let re = static_regex(pattern);
+        text = re.replace_all(&text, regex::NoExpand(MARKER)).into_owned();
+    }
+    text
+}
+
+/// ccc bridge `redaction.contains_credential`: true when any canonical
+/// credential shape survives in the text (warning/defense-in-depth use).
+pub fn contains_credential(value: &str) -> bool {
+    CREDENTIAL_PATTERNS
+        .iter()
+        .any(|(pattern, _)| static_regex(pattern).is_match(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
