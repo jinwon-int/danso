@@ -57,6 +57,49 @@ tool calls, tool definitions, tool results and operation states have named Rust
 types. Provider-specific field names stay inside the provider adapter. The
 interfaces are a source-level contract, not a frozen external library ABI.
 
+## State root (`DANSO_HOME`)
+
+`DANSO_HOME` is the one root of a node. It must be absolute; unset, it is
+`$HOME/.danso`. Everything a node keeps lives under it:
+
+| Path | Owner | Override |
+| --- | --- | --- |
+| `config.toml` | `config.rs` | — |
+| `bin/`, `state/` | `update` | — |
+| `backups/` | `backup` | `DANSO_BACKUP_DIR` |
+| `telegram/` | the Telegram service (`telegram::data_dir_from_env`) | `DANSO_TELEGRAM_DATA_DIR` |
+| `memory/` | the memory store (`memory::MemoryConfig::resolve_root`) | `DANSO_MEMORY_DIR`, then `memory.dir` in `config.toml` |
+
+Precedence for the two overridable roots is the service's usual one: the
+dedicated variable, then the file key (memory only), then the `DANSO_HOME`
+default. `doctor`, `backup`, `update`, `danso memory` and the service all
+resolve the same way, so they cannot inspect, archive or update a root the
+service is not writing to. A relative `DANSO_HOME` is refused everywhere
+rather than resolved against a working directory. `config check` reports
+`memory.dir` as `default` when neither the variable nor the file names it;
+that default is `$DANSO_HOME/memory`.
+
+### Migration (#136)
+
+Until #136 the Telegram and memory defaults were `$HOME/.danso/telegram` and
+`$HOME/.danso/memory` regardless of `DANSO_HOME`. Nodes that never set
+`DANSO_HOME` are unaffected: the resolved paths are byte-identical. Nodes
+that set `DANSO_HOME` **and** relied on either default (no
+`DANSO_TELEGRAM_DATA_DIR`, no `DANSO_MEMORY_DIR`/`memory.dir`) now resolve
+`$DANSO_HOME/{telegram,memory}` and would start from empty state while the
+old trees sit under `$HOME/.danso`. Nothing is moved automatically.
+
+`danso doctor` reports the split as the warning `home.legacy_state`,
+naming both paths and the move, when the root in use is the `DANSO_HOME`
+default and is missing or empty while the old location has entries. The
+procedure is: stop the service (`danso service stop`), run the `mv` the
+report names for each root — for example
+`mv $HOME/.danso/telegram $DANSO_HOME/telegram` — and start it again.
+`update` and `backup` already followed `DANSO_HOME` for `bin/`, `state/` and
+`backups/`; after the move a backup archives the same `telegram/` and
+`memory/` the service writes. Keeping the old location instead is a matter
+of exporting `DANSO_TELEGRAM_DATA_DIR` / `DANSO_MEMORY_DIR` explicitly.
+
 ## Adding a provider
 
 1. Add `src/provider/<name>.rs` and implement `Provider`.

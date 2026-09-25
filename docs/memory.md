@@ -20,7 +20,7 @@ with no Python, Node, Shell, or SQLite runtime dependency. Design source:
 ## On-disk layout (§3)
 
 ```
-$DANSO_MEMORY_DIR (default ~/.danso/memory)
+$DANSO_MEMORY_DIR (default $DANSO_HOME/memory, i.e. ~/.danso/memory)
   <scope>/                            global | shared | private-<32 lowercase hex>
     memories/MEMORY.md, USER.md       stable, human-editable facts (0600)
     state/memory-facts.jsonl          fact records, one JSON object per line (0600)
@@ -362,7 +362,8 @@ danso memory show                              # M1 snapshot preview (fixed caps
 danso memory eval --golden | --scenario        # built-in fixture suites, pinned clock
 ```
 
-Root: `--memory-dir` or `$DANSO_MEMORY_DIR` (default `~/.danso/memory`);
+Root: `--memory-dir` or `$DANSO_MEMORY_DIR` (default `$DANSO_HOME/memory`,
+`~/.danso/memory` unless `DANSO_HOME` is set);
 scope: `--scope global|shared|private-<32 hex>`. Configuration errors exit 2;
 runtime refusals exit 1. Read rules (§7): a private scope reads its own tree
 plus `shared`; `shared` and `global` never open another tree.

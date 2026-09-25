@@ -437,10 +437,11 @@ mod tests {
     use danso_ops::update::{GenerationRef, InstalledGeneration, PendingActivation, Source};
 
     /// `DANSO_HOME` is process-wide, so these cases share one guard rather than
-    /// racing each other through the environment.
+    /// racing each other through the environment — the `settings` one, since
+    /// the root resolvers' tests assert what an *unset* `DANSO_HOME` yields
+    /// (#136) and would otherwise see the value set here.
     fn with_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::settings::tests::env_lock();
         let previous = std::env::var_os("DANSO_HOME");
         unsafe { std::env::set_var("DANSO_HOME", home) };
         let outcome = body();

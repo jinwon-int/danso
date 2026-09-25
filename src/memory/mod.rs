@@ -99,28 +99,38 @@ pub struct MemoryConfig {
 /// The memory root override; `settings::KEY_SOURCES` names it for
 /// `memory.dir` so `config check` reports the variable this reads.
 pub const DIR_ENV: &str = "DANSO_MEMORY_DIR";
+/// The default root's name under `config::home()` (§8, #136).
+pub const DEFAULT_DIR_NAME: &str = "memory";
 
 impl MemoryConfig {
-    /// `$DANSO_MEMORY_DIR` or `~/.danso/memory` (§8).
-    /// `DANSO_MEMORY_DIR`, then `memory.dir` from `config.toml`, then the
-    /// default — the one order every reader uses (#136). `doctor` and
-    /// `backup` used to let the file win, and then inspected a memory root
-    /// the service was not writing to.
-    pub fn resolve_root(file: Option<std::path::PathBuf>) -> std::path::PathBuf {
-        if let Some(dir) = std::env::var_os(DIR_ENV) {
-            return std::path::PathBuf::from(dir);
-        }
-        file.unwrap_or_else(Self::default_root)
+    /// `DANSO_MEMORY_DIR`, then `memory.dir` from `config.toml`, then
+    /// `$DANSO_HOME/memory` — the one order every reader uses (#136).
+    /// `doctor` and `backup` used to let the file win, and then inspected a
+    /// memory root the service was not writing to. Fails only the way
+    /// `config::home` fails: a relative `DANSO_HOME` is a configuration
+    /// error, not a root.
+    pub fn resolve_root(file: Option<std::path::PathBuf>) -> anyhow::Result<std::path::PathBuf> {
+        Ok(Self::root_under(&crate::config::home()?, file))
     }
 
-    pub fn default_root() -> std::path::PathBuf {
+    /// `$DANSO_MEMORY_DIR`, else `$DANSO_HOME/memory` (§8); the root a run
+    /// or `danso memory` uses when no `--memory-dir` is given.
+    pub fn default_root() -> anyhow::Result<std::path::PathBuf> {
+        Self::resolve_root(None)
+    }
+
+    /// [`resolve_root`](Self::resolve_root) beneath an already-resolved home,
+    /// for the explicit-path entry points (`doctor::inspect_at`,
+    /// `backup::create_at`) that must not resolve the environment twice and
+    /// end up looking at a different root than the one they were handed.
+    pub fn root_under(
+        home: &std::path::Path,
+        file: Option<std::path::PathBuf>,
+    ) -> std::path::PathBuf {
         if let Some(dir) = std::env::var_os(DIR_ENV) {
             return std::path::PathBuf::from(dir);
         }
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/root"));
-        home.join(".danso/memory")
+        file.unwrap_or_else(|| home.join(DEFAULT_DIR_NAME))
     }
 
     /// Fail-closed configuration validation (§8): out-of-range values are
@@ -153,5 +163,73 @@ impl MemoryConfig {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::tests::with_env;
+    use std::path::PathBuf;
+
+    /// Without `DANSO_HOME` the default is the pre-#136 `$HOME/.danso/memory`
+    /// byte for byte; with it, the root follows `DANSO_HOME`. The variable
+    /// outranks the file, the file outranks the default, and a relative
+    /// `DANSO_HOME` is a configuration error rather than a guessed root.
+    #[test]
+    fn default_root_follows_danso_home_and_is_unchanged_without_it() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set for tests"));
+        let file = || Some(PathBuf::from("/cfg/memory"));
+        with_env(&[("DANSO_HOME", None), (DIR_ENV, None)], || {
+            assert_eq!(
+                MemoryConfig::default_root().unwrap(),
+                home.join(".danso/memory")
+            );
+            assert_eq!(
+                MemoryConfig::resolve_root(file()).unwrap(),
+                PathBuf::from("/cfg/memory")
+            );
+        });
+        with_env(
+            &[("DANSO_HOME", Some("/srv/danso")), (DIR_ENV, None)],
+            || {
+                assert_eq!(
+                    MemoryConfig::default_root().unwrap(),
+                    PathBuf::from("/srv/danso/memory")
+                );
+                assert_eq!(
+                    MemoryConfig::resolve_root(file()).unwrap(),
+                    PathBuf::from("/cfg/memory")
+                );
+            },
+        );
+        with_env(
+            &[
+                ("DANSO_HOME", Some("/srv/danso")),
+                (DIR_ENV, Some("/var/memory")),
+            ],
+            || {
+                assert_eq!(
+                    MemoryConfig::default_root().unwrap(),
+                    PathBuf::from("/var/memory")
+                );
+                assert_eq!(
+                    MemoryConfig::resolve_root(file()).unwrap(),
+                    PathBuf::from("/var/memory")
+                );
+            },
+        );
+        with_env(
+            &[("DANSO_HOME", Some("srv/danso")), (DIR_ENV, None)],
+            || {
+                let error = format!("{:#}", MemoryConfig::default_root().unwrap_err());
+                assert!(
+                    error.contains("DANSO_HOME must be an absolute path"),
+                    "{error}"
+                );
+                // The file cannot rescue a broken home: the order is fixed.
+                assert!(MemoryConfig::resolve_root(file()).is_err());
+            },
+        );
     }
 }

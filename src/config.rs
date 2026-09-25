@@ -52,7 +52,10 @@ pub const UNREAD_KEYS: &[&str] = &[
 /// Upper bound on the file size; a configuration is small by construction.
 pub const MAX_BYTES: u64 = 64 * 1024;
 
-/// `$DANSO_HOME`, defaulting to `$HOME/.danso`.
+/// `$DANSO_HOME`, defaulting to `$HOME/.danso`: the one root for the config
+/// file, `bin/`, `backups/`, `state/`, and — since #136 — the Telegram state
+/// (`telegram/`) and memory (`memory/`) defaults, which used to hang off
+/// `$HOME/.danso` even when `DANSO_HOME` pointed elsewhere.
 pub fn home() -> Result<PathBuf> {
     if let Some(home) = std::env::var_os("DANSO_HOME") {
         let home = PathBuf::from(home);
@@ -63,6 +66,17 @@ pub fn home() -> Result<PathBuf> {
     let home = PathBuf::from(home);
     ensure!(home.is_absolute(), "HOME must be an absolute path");
     Ok(home.join(".danso"))
+}
+
+/// `$HOME/.danso` when `DANSO_HOME` moves [`home`] somewhere else: the root
+/// the `telegram/` and `memory/` defaults lived under before #136, which is
+/// where a node that set `DANSO_HOME` may still have its state. `None` when
+/// the two are the same directory or `DANSO_HOME` is unset — nothing moved.
+pub fn legacy_home() -> Option<PathBuf> {
+    let home = home().ok()?;
+    std::env::var_os("DANSO_HOME")?;
+    let legacy = PathBuf::from(std::env::var_os("HOME")?).join(".danso");
+    (legacy.is_absolute() && legacy != home).then_some(legacy)
 }
 
 pub fn default_path() -> Result<PathBuf> {
@@ -755,5 +769,27 @@ public_key = "RWQbf5jrBubDWDWgYNOyi1nYm+uTycGKIGfh+oOVB09ocmmx8o4mAj8w"
         let report = check(Some(&path)).unwrap();
         assert_eq!(report["set_keys"], json!(["core.max_turns"]));
         assert!(check(Some(&dir.path().join("missing.toml"))).is_err());
+    }
+
+    /// `legacy_home` is the `$HOME/.danso` a `DANSO_HOME` node left its
+    /// state under (#136): `None` without `DANSO_HOME`, when `DANSO_HOME`
+    /// is that very directory, or when it is not a root at all.
+    #[test]
+    fn legacy_home_is_the_old_root_only_when_danso_home_moved_it() {
+        use crate::settings::tests::with_env;
+        let user_home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set for tests"));
+        let old = user_home.join(".danso");
+        with_env(&[("DANSO_HOME", None)], || assert_eq!(legacy_home(), None));
+        with_env(&[("DANSO_HOME", Some("/srv/danso"))], || {
+            assert_eq!(home().unwrap(), PathBuf::from("/srv/danso"));
+            assert_eq!(legacy_home(), Some(old.clone()));
+        });
+        with_env(&[("DANSO_HOME", Some(old.to_str().unwrap()))], || {
+            assert_eq!(legacy_home(), None);
+        });
+        with_env(&[("DANSO_HOME", Some("srv/danso"))], || {
+            assert!(home().is_err());
+            assert_eq!(legacy_home(), None);
+        });
     }
 }

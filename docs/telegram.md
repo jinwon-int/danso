@@ -23,7 +23,9 @@ which layer is supplying each key (`sources`: `env:<NAME>`, `file` or
   A variable that is set but empty means every update is denied, whatever
   the file says; no variable and no file also denies everything.
 - `DANSO_TELEGRAM_DATA_DIR` selects an absolute state directory. The default
-  is `$HOME/.danso/telegram`.
+  is `$DANSO_HOME/telegram` (`$HOME/.danso/telegram` when `DANSO_HOME` is
+  unset); `DANSO_HOME` is the one root of a node, see the state-root section
+  of [architecture.md](architecture.md) and its migration note.
 - `DANSO_TELEGRAM_API_BASE_URL` is optional and is intended for a controlled
   HTTPS endpoint or loopback fake server.
 - `DANSO_TELEGRAM_POLL_TIMEOUT_SECONDS` selects the long-poll timeout
@@ -39,8 +41,9 @@ which layer is supplying each key (`sources`: `env:<NAME>`, `file` or
 - `DANSO_TELEGRAM_MEMORY_SCOPE` (or `memory.scope`) selects the memory route
   used by turns and explicit memory commands (`global` by default; `shared`
   or `private-<32 lowercase hex>` are also valid). `DANSO_MEMORY_DIR` (or
-  `memory.dir`) selects the absolute memory root; `doctor` and `backup`
-  resolve it in the same order, so they inspect the root the service writes.
+  `memory.dir`, else `$DANSO_HOME/memory`) selects the absolute memory root;
+  `doctor` and `backup` resolve it in the same order, so they inspect the
+  root the service writes.
 - Long-task limits use the same bounded values as the CLI. The task-specific
   environment names are `DANSO_TASK_WALL_SECONDS` (or
   `DANSO_TASK_TIMEOUT_SECONDS`), `DANSO_TASK_STAGE_REQUESTS`,

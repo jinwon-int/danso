@@ -115,30 +115,41 @@ pub fn run() -> Result<DoctorReport> {
     // the CLI maps this one condition to exit 2 without rendering the error.
     let home = config::home().map_err(|_| anyhow::anyhow!("doctor home unavailable"))?;
     let telegram_data_dir = telegram::data_dir_from_env().ok();
-    Ok(inspect_at(&home, telegram_data_dir.as_deref(), Utc::now()))
+    let legacy_home = config::legacy_home();
+    Ok(inspect_at(
+        &home,
+        telegram_data_dir.as_deref(),
+        legacy_home.as_deref(),
+        Utc::now(),
+    ))
 }
 
 /// Build a report for explicit fixture paths.  The production command calls
 /// [`run`]; keeping this path explicit makes the read-only behavior testable
-/// without mutating process-wide environment variables.
+/// without mutating process-wide environment variables.  `legacy_home` is
+/// `config::legacy_home()`: the `$HOME/.danso` a `DANSO_HOME` node's state
+/// may still sit under (#136), `None` when there is no such split.
 pub fn inspect_at(
     home: &Path,
     telegram_data_dir: Option<&Path>,
+    legacy_home: Option<&Path>,
     generated_at: DateTime<Utc>,
 ) -> DoctorReport {
     let config_path = home.join(config::FILE_NAME);
     let (config_check, parsed_config) = inspect_config(&config_path);
-    let memory_dir = memory::MemoryConfig::resolve_root(
+    let memory_dir = memory::MemoryConfig::root_under(
+        home,
         parsed_config
             .as_ref()
             .and_then(|config| config.memory.dir.clone()),
     );
 
-    // The nine checks are emitted in this documented order (docs/doctor.md).
+    // The ten checks are emitted in this documented order (docs/doctor.md).
     let checks = vec![
         config_check,
         config_permissions(&config_path),
         home_layout(home, &memory_dir),
+        legacy_state(home, legacy_home, telegram_data_dir, &memory_dir),
         telegram_data_dir_check(telegram_data_dir),
         telegram_health(telegram_data_dir, generated_at),
         telegram_token_lock(telegram_data_dir),
@@ -210,6 +221,67 @@ fn home_layout(home: &Path, memory_dir: &Path) -> Check {
         (false, true) => Check::warn("home.layout", "home directory missing"),
         (true, false) => Check::warn("home.layout", "memory directory missing"),
         (false, false) => Check::warn("home.layout", "home and memory directories missing"),
+    }
+}
+
+/// `home.legacy_state` (#136): until #136 the Telegram state and memory
+/// defaults were `$HOME/.danso/{telegram,memory}` whatever `DANSO_HOME` said,
+/// so a node that set `DANSO_HOME` may still have its state there while the
+/// service now starts from an empty `$DANSO_HOME/{telegram,memory}`.  Only a
+/// root in use that is the `DANSO_HOME` default counts as split — a dedicated
+/// variable or `memory.dir` chose its root deliberately — and only when the
+/// old one holds entries and the new one is missing or empty.  Both paths are
+/// named (they are not secrets); nothing is moved, that is the operator's
+/// call with the service stopped.
+fn legacy_state(
+    home: &Path,
+    legacy_home: Option<&Path>,
+    telegram_data_dir: Option<&Path>,
+    memory_dir: &Path,
+) -> Check {
+    let id = "home.legacy_state";
+    let Some(legacy_home) = legacy_home else {
+        return Check::ok(id, "one state root");
+    };
+    let roots = [
+        (telegram::DEFAULT_DATA_DIR_NAME, telegram_data_dir),
+        (memory::DEFAULT_DIR_NAME, Some(memory_dir)),
+    ];
+    let mut moves = Vec::new();
+    for (name, current) in roots {
+        let Some(current) = current else { continue };
+        if current != home.join(name) {
+            continue;
+        }
+        let old = legacy_home.join(name);
+        if has_entries(&old) == Some(true) && has_entries(current) == Some(false) {
+            moves.push(format!("mv {} {}", old.display(), current.display()));
+        }
+    }
+    if moves.is_empty() {
+        return Check::ok(id, "legacy state absent");
+    }
+    Check::warn(
+        id,
+        format!(
+            "legacy state present; move it: {} while the service is stopped",
+            moves.join("; ")
+        ),
+    )
+}
+
+/// `Some(true)` for a directory holding at least one entry, `Some(false)` for
+/// a missing or empty one, `None` when that cannot be told without guessing.
+fn has_entries(path: &Path) -> Option<bool> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::read_dir(path)
+                .ok()
+                .map(|mut entries| entries.next().is_some())
+        }
+        Ok(_) => None,
     }
 }
 
@@ -739,7 +811,7 @@ mod tests {
     #[test]
     fn valid_fixture_is_body_free_and_has_counts() {
         let (home, telegram_dir, now) = fixture();
-        let report = inspect_at(&home, Some(&telegram_dir), now);
+        let report = inspect_at(&home, Some(&telegram_dir), None, now);
         let rendered = serde_json::to_string(&report).expect("report JSON");
         assert!(!rendered.contains("TEST_TOKEN_SECRET_MARKER"));
         assert!(!rendered.contains("TEST_MEMORY_SECRET_MARKER"));
@@ -763,7 +835,7 @@ mod tests {
             .expect("fixture parent")
             .join("telegram.token");
         fs::set_permissions(&token_path, fs::Permissions::from_mode(0o644)).expect("token mode");
-        let report = inspect_at(&home, Some(&telegram_dir), now);
+        let report = inspect_at(&home, Some(&telegram_dir), None, now);
         let config = report
             .checks
             .iter()
@@ -785,7 +857,7 @@ mod tests {
         let root = temp_root();
         let home = root.join("home");
         private_dir(&home);
-        let report = inspect_at(&home, None, Utc::now());
+        let report = inspect_at(&home, None, None, Utc::now());
         let rendered = serde_json::to_string(&report).expect("report JSON");
         assert!(rendered.contains("config file missing"));
 
@@ -793,7 +865,7 @@ mod tests {
             &home.join(config::FILE_NAME),
             b"[telegram]\ntokn = \"SECRET\"\n",
         );
-        let report = inspect_at(&home, None, Utc::now());
+        let report = inspect_at(&home, None, None, Utc::now());
         let rendered = serde_json::to_string(&report).expect("report JSON");
         assert!(rendered.contains("config invalid"));
         assert!(!rendered.contains("SECRET"));
@@ -806,7 +878,7 @@ mod tests {
         let (home, telegram_dir, now) = fixture();
         let health = telegram_dir.join(HEALTH_FILE_NAME);
         fs::remove_file(&health).expect("remove health fixture");
-        let report = inspect_at(&home, Some(&telegram_dir), now);
+        let report = inspect_at(&home, Some(&telegram_dir), None, now);
         let missing = report
             .checks
             .iter()
@@ -815,7 +887,7 @@ mod tests {
         assert_eq!(missing.detail, "health file missing");
 
         private_file(&health, b"not-json");
-        let report = inspect_at(&home, Some(&telegram_dir), now);
+        let report = inspect_at(&home, Some(&telegram_dir), None, now);
         let invalid = report
             .checks
             .iter()
@@ -827,7 +899,7 @@ mod tests {
             &health,
             br#"{"schema_version":1,"started_at":"2026-09-01T00:00:00Z","last_poll_at":"2026-09-01T00:00:00Z","service_pid":42}"#,
         );
-        let report = inspect_at(&home, Some(&telegram_dir), now);
+        let report = inspect_at(&home, Some(&telegram_dir), None, now);
         let stale = report
             .checks
             .iter()
@@ -835,6 +907,77 @@ mod tests {
             .expect("health check");
         assert!(stale.detail.starts_with("health stale"));
         assert_eq!(stale.status, "warn");
+        let _ = fs::remove_dir_all(home.parent().expect("fixture parent"));
+    }
+
+    /// A `DANSO_HOME` node whose state still sits under `$HOME/.danso`
+    /// (#136): doctor names both paths and the move, and moves nothing.
+    #[test]
+    fn legacy_state_under_the_old_home_is_named_with_its_move() {
+        let (home, telegram_dir, now) = fixture();
+        let legacy_home = home.parent().expect("fixture parent").join("old-danso");
+        private_dir(&legacy_home.join("telegram"));
+        private_file(&legacy_home.join("telegram/health.json"), b"{}");
+        private_dir(&legacy_home.join("memory/global"));
+
+        // The fixture's `memory.dir` and the explicit Telegram root are
+        // deliberate choices, not the default: no split to report.
+        let report = inspect_at(&home, Some(&telegram_dir), Some(&legacy_home), now);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "home.legacy_state")
+            .expect("legacy state check");
+        assert_eq!(
+            (check.status, check.detail.as_str()),
+            ("ok", "legacy state absent")
+        );
+
+        // The defaults in use, missing on the new side, populated on the old.
+        let default_telegram = home.join(telegram::DEFAULT_DATA_DIR_NAME);
+        private_file(&home.join(config::FILE_NAME), b"");
+        let report = inspect_at(&home, Some(&default_telegram), Some(&legacy_home), now);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "home.legacy_state")
+            .expect("legacy state check");
+        assert_eq!(check.status, "warn");
+        assert_eq!(
+            check.detail,
+            format!(
+                "legacy state present; move it: mv {} {}; mv {} {} while the service is stopped",
+                legacy_home.join("telegram").display(),
+                default_telegram.display(),
+                legacy_home.join("memory").display(),
+                home.join(memory::DEFAULT_DIR_NAME).display()
+            )
+        );
+        assert!(
+            legacy_home.join("telegram/health.json").exists(),
+            "nothing moved"
+        );
+        assert!(!default_telegram.exists(), "nothing created");
+
+        // An empty legacy tree, or a populated new one, is not a split.
+        fs::remove_file(legacy_home.join("telegram/health.json")).expect("empty old telegram");
+        private_dir(&home.join(memory::DEFAULT_DIR_NAME).join("global"));
+        let report = inspect_at(&home, Some(&default_telegram), Some(&legacy_home), now);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "home.legacy_state")
+            .expect("legacy state check");
+        assert_eq!(check.detail, "legacy state absent");
+
+        // No `DANSO_HOME` split at all: one root, nothing to compare.
+        let report = inspect_at(&home, Some(&default_telegram), None, now);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "home.legacy_state")
+            .expect("legacy state check");
+        assert_eq!(check.detail, "one state root");
         let _ = fs::remove_dir_all(home.parent().expect("fixture parent"));
     }
 
