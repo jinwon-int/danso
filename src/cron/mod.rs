@@ -2,14 +2,18 @@
 //! store at `$DANSO_HOME/cron/tasks.json`.
 //!
 //! PR1 shipped the read-only queries (`list`, `describe <id>`, `due`); PR2
-//! adds the run-lock surface (`lock`), the tick/run dry-run planners, and the
-//! tested state-commit write path (`commit.rs`). Execute modes of `tick` and
-//! `run` refuse with a typed, zero-mutation result until the payload
-//! executors land in #120 PR3 — a half-execution is worse than a refusal.
+//! added the run-lock surface (`lock`), the tick/run dry-run planners, and the
+//! tested state-commit write path (`commit.rs`); PR3 replaces the execute-mode
+//! refusals with the payload executors (`exec.rs`: command argv and prompt
+//! harness runs) and the notify spool write path (`notify.rs`), wiring the
+//! full run pipeline: prechecks → lock → payload → spool → history → retry →
+//! run limit → state commit → release/quarantine.
 
 pub mod commit;
 pub mod due;
+pub mod exec;
 pub mod locks;
+pub mod notify;
 pub mod retry;
 pub mod run;
 pub mod schedule;
@@ -20,7 +24,7 @@ pub mod time;
 use crate::cron::due::{due_plan, normalize, read_only_mutations};
 use crate::cron::schedule::parse_schedule;
 use crate::cron::store::Store;
-use crate::cron::time::{fmt_dt, parse_utc, truncate_minute};
+use crate::cron::time::{parse_utc, truncate_minute};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
@@ -80,13 +84,12 @@ enum CronCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Timer-facing tick: plan what would run. Execution (no `--dry-run`)
-    /// refuses until the payload executors land in #120 PR3.
+    /// Timer-facing tick: plan what would run, or execute the due tasks.
     Tick {
         /// Print the plan without touching the filesystem.
         #[arg(long)]
         dry_run: bool,
-        /// Cap executions per tick (1-100; consumed by the PR3 pipeline).
+        /// Cap executions per tick (1-100).
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(1..=100))]
         max_runs: Option<i64>,
         /// Plan for a fixed instant instead of now.
@@ -95,8 +98,8 @@ enum CronCommand {
         #[arg(long)]
         json: bool,
     },
-    /// One manual run. Execution (no `--dry-run`) refuses until the payload
-    /// executors land in #120 PR3.
+    /// One manual run of a task (the payload, its spool notification, and the
+    /// durable run-state commit).
     Run {
         id: String,
         /// Print the preview without touching the filesystem.
@@ -289,18 +292,20 @@ pub fn run(args: CronArgs) -> i32 {
         } => {
             let max_runs = max_runs.unwrap_or(10);
             if !dry_run {
-                let at_display = match parse_utc(at.as_deref(), "--at") {
-                    Ok(parsed) => fmt_dt(parsed.or_else(|| Some(truncate_minute(Utc::now()))))
-                        .unwrap_or_default(),
-                    Err(_) => String::new(),
-                };
-                let document = tick::execute_unavailable(&store_display, &at_display, max_runs);
+                let (document, code) = tick::execute(
+                    &path,
+                    &store,
+                    &store_display,
+                    at.as_deref(),
+                    truncate_minute(Utc::now()),
+                    max_runs.max(1) as usize,
+                );
                 if json {
                     print_document(&document);
                 } else {
                     emit_tick(&document);
                 }
-                return 2;
+                return code;
             }
             let plan = tick::dry_run(
                 &store,
@@ -326,13 +331,21 @@ pub fn run(args: CronArgs) -> i32 {
             json,
         } => {
             if !dry_run {
-                let document = run::execute_unavailable(&store_display, &id);
+                let (document, code) = run::execute(
+                    &path,
+                    &store,
+                    &store_display,
+                    &id,
+                    at.as_deref(),
+                    truncate_minute(Utc::now()),
+                    None,
+                );
                 if json {
                     print_document(&document);
                 } else {
                     emit_run(&document);
                 }
-                return 2;
+                return code;
             }
             let (document, code) = run::dry_plan(
                 &store,
@@ -368,6 +381,10 @@ fn emit_lock(document: &serde_json::Value) {
 }
 
 fn emit_tick(document: &serde_json::Value) {
+    if document["mode"].as_str() == Some("tick-execute") {
+        emit_tick_execute(document);
+        return;
+    }
     println!("# danso cron tick\n");
     println!(
         "- store: `{}`",
@@ -404,11 +421,65 @@ fn emit_tick(document: &serde_json::Value) {
     }
 }
 
+fn emit_tick_execute(document: &serde_json::Value) {
+    println!("# danso cron tick execute\n");
+    println!(
+        "- store: `{}`",
+        document["store"].as_str().unwrap_or_default()
+    );
+    println!("- at: `{}`", document["at"].as_str().unwrap_or_default());
+    println!(
+        "- planned: {} runnable: {} executed: {} (maxRuns={}{})",
+        document["plannedActions"].as_i64().unwrap_or(0),
+        document["runnableActions"].as_i64().unwrap_or(0),
+        document["executedActions"].as_i64().unwrap_or(0),
+        document["maxRuns"].as_i64().unwrap_or(0),
+        if document["truncated"].as_bool().unwrap_or(false) {
+            ", truncated"
+        } else {
+            ""
+        },
+    );
+    let results = document["results"].as_array().cloned().unwrap_or_default();
+    if results.is_empty() {
+        println!("No runnable cron tasks.");
+    } else {
+        println!("\n| task | status | exit | notification | lock release |");
+        println!("|---|---|---|---|---|");
+        for result in &results {
+            println!(
+                "| `{}` | `{}` | `{}` | `{}` | `{}` |",
+                result["taskId"].as_str().unwrap_or_default(),
+                result["status"].as_str().unwrap_or_default(),
+                result["headless"]["exitCode"],
+                result["notification"]["delivery"]
+                    .as_str()
+                    .unwrap_or_default(),
+                result["lock"]["release"]["state"]
+                    .as_str()
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    if let Some(errors) = document["errors"].as_array()
+        && !errors.is_empty()
+    {
+        println!("\n## Errors");
+        for error in errors {
+            println!("- {}", error.as_str().unwrap_or_default());
+        }
+    }
+    println!(
+        "\n- mutations: `{}`",
+        serde_json::to_string(&document["mutations"]).expect("serializable")
+    );
+}
+
 fn emit_run(document: &serde_json::Value) {
     let title = if document["mode"].as_str() == Some("run-dry-run-read-only") {
         "# danso cron run dry-run plan"
     } else {
-        "# danso cron run"
+        "# danso cron run result"
     };
     println!("{title}\n");
     println!(
@@ -417,6 +488,67 @@ fn emit_run(document: &serde_json::Value) {
     );
     if let Some(error) = document["error"].as_str() {
         println!("- error: `{error}`");
+        return;
+    }
+    if document["mode"].as_str() == Some("run-execute") {
+        println!(
+            "- status: `{}`",
+            document["status"].as_str().unwrap_or_default()
+        );
+        println!(
+            "- runId: `{}`",
+            document["runId"].as_str().unwrap_or_default()
+        );
+        if let Some(lock) = document.get("lock").filter(|lock| lock.is_object()) {
+            println!(
+                "- lock: `{}` release=`{}`",
+                lock["state"].as_str().unwrap_or_default(),
+                lock["release"]["state"].as_str().unwrap_or_default(),
+            );
+        }
+        if let Some(headless) = document
+            .get("headless")
+            .filter(|headless| headless.is_object())
+        {
+            println!(
+                "- payload: `{}` exit=`{}`",
+                headless["payloadKind"].as_str().unwrap_or_default(),
+                headless["exitCode"]
+                    .as_i64()
+                    .map(|code| code.to_string())
+                    .unwrap_or_default(),
+            );
+        }
+        println!(
+            "- notification: `{}`",
+            document["notification"]["delivery"]
+                .as_str()
+                .unwrap_or_default(),
+        );
+        if let Some(retry) = document.get("retry").filter(|retry| retry.is_object()) {
+            println!(
+                "- retry: cleared=`{}` attempt=`{}` eligibleAt=`{}`",
+                retry["cleared"].as_bool().unwrap_or(false),
+                retry["attempt"],
+                retry["retryEligibleAt"].as_str().unwrap_or("(none)"),
+            );
+        }
+        if let Some(error) = document["persistError"].as_str() {
+            println!("- persistError: `{error}`");
+        }
+        if let Some(release) = document
+            .get("releaseError")
+            .filter(|release| release.is_object())
+        {
+            println!(
+                "- releaseError: `{}`",
+                release["state"].as_str().unwrap_or_default()
+            );
+        }
+        println!(
+            "- mutations: `{}`",
+            serde_json::to_string(&document["mutations"]).expect("serializable")
+        );
         return;
     }
     println!("- at: `{}`", document["at"].as_str().unwrap_or_default());
