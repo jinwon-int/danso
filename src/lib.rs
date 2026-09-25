@@ -4,6 +4,12 @@ pub mod compaction;
 pub mod config;
 pub mod context;
 pub mod contracts;
+/// The read-only scheduler surface (`danso cron list|describe|due`, §6.5 of
+/// the unified design). Gated on `ops` like service/update: a CLI-only build
+/// has no cron surface, but the store schema it reads is identical either
+/// way, so a store written by one build validates on every build.
+#[cfg(feature = "ops")]
+pub mod cron;
 pub mod doctor;
 pub mod failure;
 /// The self-update surface. Gated on `ops` like the service CLI.
