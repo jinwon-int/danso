@@ -47,11 +47,15 @@ const WARNING_MISSING: &str = "missing";
 const WARNING_UNREADABLE: &str = "unreadable";
 const WARNING_LAYOUT: &str = "layout";
 const WARNING_SCAN_BOUND: &str = "scan_bound";
-const VALID_WARNINGS: [&str; 4] = [
+/// The component's pre-#136 root (`$HOME/.danso/<name>`) still holds
+/// entries that this snapshot does not contain (#177).
+const WARNING_LEGACY_STATE: &str = "legacy_state";
+const VALID_WARNINGS: [&str; 5] = [
     WARNING_MISSING,
     WARNING_UNREADABLE,
     WARNING_LAYOUT,
     WARNING_SCAN_BOUND,
+    WARNING_LEGACY_STATE,
 ];
 
 const CATEGORY_HOME_UNAVAILABLE: &str = "home_unavailable";
@@ -277,7 +281,13 @@ pub fn run_backup() -> Result<PathBuf, CommandError> {
     let home = config::home().map_err(|_| CommandError::cannot_run(CATEGORY_HOME_UNAVAILABLE))?;
     let backup_root = backup_root(&home)?;
     let telegram_data_dir = telegram::data_dir_from_env().ok();
-    create_at(&home, &backup_root, telegram_data_dir.as_deref())
+    let legacy_home = config::legacy_home();
+    create_at(
+        &home,
+        &backup_root,
+        telegram_data_dir.as_deref(),
+        legacy_home.as_deref(),
+    )
 }
 
 /// Run `danso restore` after resolving relative CLI paths against the current
@@ -314,11 +324,15 @@ fn backup_root(home: &Path) -> Result<PathBuf, CommandError> {
 /// Explicit-path entry point used by the implementation and tests.  The
 /// optional Telegram path is already obtained through the existing resolver
 /// by `run_backup`; it is explicit here so tests never need process-global
-/// environment mutation.
+/// environment mutation.  `legacy_home` is `config::legacy_home()`: when a
+/// pre-#136 root under it still holds entries the snapshot omits, the
+/// matching component carries the `legacy_state` warning (#177) — the
+/// archive itself stays what the service under `home` reads and writes.
 pub fn create_at(
     home: &Path,
     backup_root: &Path,
     telegram_data_dir: Option<&Path>,
+    legacy_home: Option<&Path>,
 ) -> Result<PathBuf, CommandError> {
     if !home.is_absolute() || !backup_root.is_absolute() {
         return Err(CommandError::failed(CATEGORY_BACKUP_DIR_UNAVAILABLE));
@@ -389,6 +403,22 @@ pub fn create_at(
             &temp_path.join(CONVERSATIONS_DIR_NAME),
             token_path.as_deref(),
         )?);
+    }
+    // State the operator has not migrated is not archived and must not look
+    // archived: name it in the component it belongs to, as a fixed category
+    // like every other omission.  `doctor` spells out the paths.
+    for root in config::legacy_roots(home, legacy_home, telegram_data_dir, &memory_root) {
+        let name = if root.name == memory::DEFAULT_DIR_NAME {
+            MEMORY_COMPONENT
+        } else {
+            CONVERSATIONS_COMPONENT
+        };
+        if let Some(component) = components.iter_mut().find(|c| c.name == name)
+            && !component.warnings.iter().any(|w| w == WARNING_LEGACY_STATE)
+        {
+            component.warnings.push(WARNING_LEGACY_STATE.to_string());
+            component.warnings.sort();
+        }
     }
 
     let manifest = Manifest {
@@ -1475,7 +1505,7 @@ mod tests {
     #[test]
     fn backup_is_atomic_and_excludes_token_bytes() {
         let (_root, home, telegram, backups) = fixture();
-        let backup = create_at(&home, &backups, Some(&telegram)).expect("backup");
+        let backup = create_at(&home, &backups, Some(&telegram), None).expect("backup");
         assert!(backup.is_dir());
         assert!(!fs::read_dir(&backups).expect("backups").any(|entry| {
             entry
@@ -1530,13 +1560,13 @@ mod tests {
         );
         // Sanity: with a valid config the neutral-named token is excluded.
         fs::write(home.join(config::FILE_NAME), config.as_bytes()).expect("config");
-        let backup = create_at(&home, &backups, Some(&telegram)).expect("backup");
+        let backup = create_at(&home, &backups, Some(&telegram), None).expect("backup");
         assert!(!String::from_utf8_lossy(&all_bytes(&backup)).contains("TEST_TOKEN_SECRET_MARKER"));
 
         // One unknown key elsewhere in the file invalidates it.
         config.push_str("[cron]\nenbled = true\n");
         fs::write(home.join(config::FILE_NAME), config.as_bytes()).expect("config");
-        let error = create_at(&home, &backups, Some(&telegram)).expect_err("must refuse");
+        let error = create_at(&home, &backups, Some(&telegram), None).expect_err("must refuse");
         assert_eq!(error.category(), CATEGORY_CONFIG_INVALID);
         assert_eq!(error.kind(), ErrorKind::Failed);
         // Nothing new was written: the earlier backup is the only entry and
@@ -1557,7 +1587,7 @@ mod tests {
         fs::remove_dir_all(memory.join("global/state")).expect("remove state");
         std::os::unix::fs::symlink(memory.join("global/memories"), memory.join("global/state"))
             .expect("symlink");
-        let backup = create_at(&home, &backups, Some(&telegram)).expect("backup");
+        let backup = create_at(&home, &backups, Some(&telegram), None).expect("backup");
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(backup.join(MANIFEST_FILE_NAME)).expect("manifest"))
                 .expect("manifest json");
@@ -1579,7 +1609,7 @@ mod tests {
     #[test]
     fn restore_reproduces_owner_only_files_and_one_report() {
         let (_root, home, telegram, backups) = fixture();
-        let backup = create_at(&home, &backups, Some(&telegram)).expect("backup");
+        let backup = create_at(&home, &backups, Some(&telegram), None).expect("backup");
         let target = backups.join("restore");
         let report = restore_at(&target, &backup, false).expect("restore");
         assert!(report.restored);
@@ -1614,7 +1644,7 @@ mod tests {
     #[test]
     fn restore_rejects_nonempty_and_config_targets() {
         let (_root, home, telegram, backups) = fixture();
-        let backup = create_at(&home, &backups, Some(&telegram)).expect("backup");
+        let backup = create_at(&home, &backups, Some(&telegram), None).expect("backup");
         let target = backups.join("restore");
         private_file(&target.join("existing"), b"existing");
         let error = restore_at(&target, &backup, false).unwrap_err();
@@ -1627,7 +1657,7 @@ mod tests {
     #[test]
     fn restore_preflight_rejects_corrupt_manifest_without_creating_target() {
         let (_root, home, telegram, backups) = fixture();
-        let backup = create_at(&home, &backups, Some(&telegram)).expect("backup");
+        let backup = create_at(&home, &backups, Some(&telegram), None).expect("backup");
         fs::write(backup.join(MANIFEST_FILE_NAME), b"not json").expect("corrupt manifest");
         let target = backups.join("corrupt-target");
         let error = restore_at(&target, &backup, false).expect_err("corrupt backup refusal");
@@ -1638,7 +1668,7 @@ mod tests {
     #[test]
     fn restore_preflight_rejects_token_shaped_file_without_creating_target() {
         let (_root, home, telegram, backups) = fixture();
-        let backup = create_at(&home, &backups, Some(&telegram)).expect("backup");
+        let backup = create_at(&home, &backups, Some(&telegram), None).expect("backup");
         private_file(
             &backup
                 .join(MEMORY_DIR_NAME)
@@ -1655,5 +1685,70 @@ mod tests {
     fn restore_requires_target() {
         let error = RestoreArgs::try_parse_from(["danso restore", "backup"]).unwrap_err();
         assert_eq!(error.exit_code(), 2);
+    }
+
+    /// A `DANSO_HOME` node whose pre-#136 state still sits under the old
+    /// root (#177): the snapshot holds only the root in use, says so with
+    /// the fixed `legacy_state` category on that component, and copies
+    /// nothing from the old tree.  A root chosen explicitly is not compared.
+    #[test]
+    fn legacy_state_left_behind_is_named_not_archived() {
+        let (root, home, _chosen_telegram, backups) = fixture();
+        let legacy_home = root.path().join("old-danso");
+        private_file(
+            &legacy_home.join("telegram/conversations/a.json"),
+            b"OLD_CONVERSATION_MARKER",
+        );
+        private_dir(&legacy_home.join("memory/global"));
+        let default_telegram = home.join(telegram::DEFAULT_DATA_DIR_NAME);
+        private_file(
+            &default_telegram.join("conversations/b.json"),
+            b"new conversation\n",
+        );
+
+        let backup = create_at(&home, &backups, Some(&default_telegram), Some(&legacy_home))
+            .expect("backup");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(backup.join(MANIFEST_FILE_NAME)).expect("manifest"))
+                .expect("json");
+        let warnings = |name: &str| {
+            manifest["components"]
+                .as_array()
+                .expect("components")
+                .iter()
+                .find(|c| c["name"] == name)
+                .expect("component")["warnings"]
+                .clone()
+        };
+        assert_eq!(
+            warnings("conversations"),
+            serde_json::json!(["legacy_state"])
+        );
+        // The fixture's `memory.dir` is a deliberate choice: not compared.
+        assert_eq!(warnings("memory"), serde_json::json!([]));
+        assert_eq!(
+            manifest["components"][2]["file_count"], 1,
+            "only the root in use is archived"
+        );
+        let bytes = all_bytes(&backup);
+        assert!(
+            !bytes.windows(23).any(|w| w == b"OLD_CONVERSATION_MARKER"),
+            "legacy bodies never enter the archive"
+        );
+        // The same snapshot restores: the category is a known one.
+        let target = root.path().join("restore-target");
+        let args = RestoreArgs {
+            target: target.clone(),
+            force: false,
+            backup_dir: backup.clone(),
+        };
+        assert!(run_restore(&args).expect("restore").restored);
+
+        // Without a split there is nothing to name.
+        let backup = create_at(&home, &backups, Some(&default_telegram), None).expect("backup");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(backup.join(MANIFEST_FILE_NAME)).expect("manifest"))
+                .expect("json");
+        assert_eq!(manifest["components"][2]["warnings"], serde_json::json!([]));
     }
 }

@@ -55,12 +55,17 @@ The ten checks are emitted in this order:
   the Telegram state root and the memory root that is the `DANSO_HOME`
   default (`$DANSO_HOME/telegram`, `$DANSO_HOME/memory`), the check looks at
   the pre-#136 location (`$HOME/.danso/telegram`, `$HOME/.danso/memory`):
-  when that one has entries and the root in use is missing or empty, the
-  detail is the warning `legacy state present; move it: mv <old> <new>
-  [; mv <old> <new>] while the service is stopped`, both paths spelled out;
-  else `legacy state absent`. A root chosen by `DANSO_TELEGRAM_DATA_DIR`,
-  `DANSO_MEMORY_DIR` or `memory.dir` is never compared. The doctor moves
-  nothing.
+  whenever that one has entries the detail is a warning, both paths spelled
+  out. While the root in use is missing or empty it is `legacy state
+  present; move it: mv <old> <new>[; mv <old> <new>] while the service is
+  stopped`; once the root in use holds entries as well — the service ran
+  after the switch, so a plain `mv` would clobber it (#176) — that root is
+  listed instead as `both roots hold entries, reconcile by hand: <old> into
+  <new>`, and a report may carry both parts. Otherwise `legacy state
+  absent`. A root chosen by `DANSO_TELEGRAM_DATA_DIR`, `DANSO_MEMORY_DIR`
+  or `memory.dir` is never compared. The doctor moves nothing. A backup
+  taken on such a node records the same omission as the `legacy_state`
+  warning on the component (see [backup.md](backup.md)).
 - `telegram.data_dir` resolves `DANSO_TELEGRAM_DATA_DIR` exactly as the
   Telegram service does, including its `$DANSO_HOME/telegram` default
   (`$HOME/.danso/telegram` when `DANSO_HOME` is unset), and reports
