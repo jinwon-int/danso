@@ -235,6 +235,70 @@ pub fn locks_dir(store_path: &Path) -> std::path::PathBuf {
         .join("locks")
 }
 
+/// `cron/history/` next to the store — the §7 overflow archive. Entries evicted
+/// by a task's `maxRunHistory` cap land in `<id>.jsonl` here (danso addition:
+/// ccc drops them; §7 keeps them).
+pub fn history_dir(store_path: &Path) -> std::path::PathBuf {
+    store_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("history")
+}
+
+/// Replace `path` through a private same-directory temp file and rename, so a
+/// reader sees either the old or the new bytes and never a torn file. The file
+/// is fsynced and the directory sync is attempted best-effort (filesystems
+/// without directory fsync are tolerated).
+///
+/// This is the danso port of ccc `secure_fs.atomic_write_bytes`; unlike the
+/// reference it always fsyncs (the ccc store files here are small, and a
+/// durable run-state commit is the whole point of the write path).
+pub fn atomic_write_bytes(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| format!("cannot create directory: {error}"))?;
+    let temp = parent.join(format!(
+        ".{}.tmp.{}",
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    let write = || -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&temp)
+            .map_err(|error| format!("cannot create temp file: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("cannot write temp file: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("cannot sync temp file: {error}"))?;
+        Ok(())
+    };
+    match write() {
+        Ok(()) => {}
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("cannot replace file: {error}"));
+    }
+    if let Ok(dir) = std::fs::File::open(parent)
+        && let Err(error) = dir.sync_all()
+    {
+        // Best effort only: some filesystems reject directory fsync.
+        let _ = error;
+    }
+    Ok(())
+}
+
 /// Load the store. A missing file is an empty store; anything unreadable,
 /// structurally invalid, or semantically invalid fails closed with all
 /// validation errors joined.
