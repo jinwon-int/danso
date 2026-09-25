@@ -4,10 +4,14 @@
 //! The due/lock semantics mirror ccc `agent_cron.py`; schedule matching
 //! itself is golden-tested against the Python reference in `cron_schedule.rs`.
 
+// The cron surface is gated on `ops` (src/lib.rs); a CLI-only build has
+// neither the module nor the binary subcommand these tests drive.
+#![cfg(feature = "ops")]
+
 use chrono::{DateTime, Utc};
 use danso::cron::due::due_plan;
 use danso::cron::store::{self, store_path};
-use danso::cron::time::boot_id;
+use danso::cron::time::{boot_id, parse_utc};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -518,6 +522,81 @@ fn a_broken_lock_file_reads_as_stale_not_fatal() {
     );
 }
 
+/// Timestamps are sliced by byte offset; a multibyte character at one of
+/// those offsets must be an ISO8601 error, never a char-boundary panic —
+/// from `--at` as well as from store fields the validator does not parse.
+#[test]
+fn non_ascii_timestamps_fail_closed_without_panicking() {
+    for raw in ["2026-01-0é", "2026-01-01T00:00+1é0", "2026-01-01T0é:00"] {
+        let error = parse_utc(Some(raw), "field").expect_err(raw);
+        assert!(error.contains("field is not valid ISO8601"), "{error}");
+    }
+    let mut task = base_task("multibyte");
+    task["lastRunAt"] = json!("2026-01-0é");
+    let fixture = fixture(json!({"version": 1, "tasks": [task]}));
+    let at_plan = due_plan(
+        &store::load(&fixture.path).expect("store"),
+        fixture.path.to_str().expect("utf8"),
+        Some("2026-01-0é"),
+        utc("2026-09-25T09:30:00Z"),
+    );
+    assert_eq!(at_plan["ok"], json!(false));
+    assert!(
+        at_plan["errors"][0]
+            .as_str()
+            .expect("error")
+            .contains("--at")
+    );
+    let row = row(&plan(&fixture), 0);
+    assert_eq!(row["status"], json!("invalid-schedule"));
+    assert!(
+        row["error"]
+            .as_str()
+            .expect("error")
+            .contains("lastRunAt is not valid ISO8601")
+    );
+}
+
+/// Only a missing lock file means free. A lock that exists but cannot be
+/// read is an errored holder and the row is `stale-lock`, like invalid
+/// JSON — never `free`/`due` for a task that may well be held.
+#[test]
+fn an_unreadable_lock_file_reads_as_stale_not_free() {
+    let task = json!({
+        "id": "unreadable", "schedule": "@daily", "prompt": "p", "enabled": true,
+        "lastRunAt": "2026-09-22T00:00:00Z"
+    });
+    let fixture = fixture(json!({"version": 1, "tasks": [task]}));
+    // A directory where the lock file should be: exists, cannot be read as
+    // a file, on every platform and as every user.
+    std::fs::create_dir_all(locks_dir(&fixture).join("unreadable.lock")).expect("mkdir");
+    let row = row(&plan(&fixture), 0);
+    assert_eq!(row["lockState"], json!("stale"));
+    assert_eq!(row["status"], json!("stale-lock"));
+    assert!(
+        row["holder"]["error"]
+            .as_str()
+            .expect("error")
+            .starts_with("cannot read lock:")
+    );
+}
+
+/// ccc's JSON Schema `maxLength` counts characters; so must the port, or a
+/// store ccc accepts fails closed here on multibyte text.
+#[test]
+fn length_limits_count_characters_not_bytes() {
+    let mut task = base_task("hangul");
+    task["payload"] = json!({"kind": "prompt", "model": "모".repeat(128)});
+    task["notifyChatId"] = json!("@abcd");
+    let within = fixture(json!({"version": 1, "tasks": [task]}));
+    store::load(&within.path).expect("128 characters of model name load");
+    let mut task = base_task("hangul-long");
+    task["payload"] = json!({"kind": "prompt", "model": "모".repeat(129)});
+    let beyond = fixture(json!({"version": 1, "tasks": [task]}));
+    let error = store::load(&beyond.path).expect_err("129 characters refused");
+    assert!(error.contains("model must be 1-128 characters"), "{error}");
+}
+
 // --- CLI contract (real binary): exit codes, JSON shapes, read-onlyness ---
 
 fn cron(args: &[&str]) -> std::process::Output {
@@ -625,6 +704,47 @@ fn the_cli_lists_and_describes_prompt_free() {
         "missing",
     ]);
     assert_eq!(output.status.code(), Some(1));
+}
+
+/// `describe` shows what a command task executes (payload is prompt-free)
+/// and, when the row cannot be planned for a non-schedule reason, why —
+/// the same `error` that `due` reports, instead of a bare
+/// `invalid-schedule` next to `scheduleValid: true`.
+#[test]
+fn describe_reports_payload_and_plan_errors() {
+    let mut command = base_task("cmd");
+    command["payload"] = json!({"kind": "command", "argv": ["/bin/false", "-x"], "cwd": "/tmp"});
+    let mut broken = base_task("broken");
+    broken["lastRunAt"] = json!("yesterday");
+    let fixture = fixture(json!({"version": 1, "tasks": [command, broken]}));
+    let store_arg = fixture.path.to_str().expect("utf8");
+
+    let output = cron(&["--store", store_arg, "describe", "cmd", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: Value = serde_json::from_str(&stdout(&output)).expect("JSON");
+    assert_eq!(document["payload"]["kind"], json!("command"));
+    assert_eq!(document["payload"]["argv"], json!(["/bin/false", "-x"]));
+    assert_eq!(document["payload"]["cwd"], json!("/tmp"));
+    assert!(document.get("error").is_none());
+    let output = cron(&["--store", store_arg, "describe", "cmd"]);
+    assert!(
+        stdout(&output).contains("- payload: "),
+        "{}",
+        stdout(&output)
+    );
+
+    let output = cron(&["--store", store_arg, "describe", "broken", "--json"]);
+    let document: Value = serde_json::from_str(&stdout(&output)).expect("JSON");
+    assert_eq!(document["scheduleValid"], json!(true));
+    assert_eq!(document["status"], json!("invalid-schedule"));
+    assert!(
+        document["error"]
+            .as_str()
+            .expect("error")
+            .contains("lastRunAt is not valid ISO8601: yesterday")
+    );
+    let output = cron(&["--store", store_arg, "describe", "broken"]);
+    assert!(stdout(&output).contains("- error: "), "{}", stdout(&output));
 }
 
 #[test]

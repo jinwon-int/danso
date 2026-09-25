@@ -42,7 +42,11 @@ pub fn store_lock_path(store_path: &Path) -> PathBuf {
 pub fn read_lock(path: &Path) -> Value {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(_) => return Value::Null,
+        // Only a missing file means free. A lock that exists but cannot be
+        // read (permissions, a directory at the path, I/O) is reported as
+        // an errored holder, which planners treat as stale — never as free.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Value::Null,
+        Err(error) => return json!({ "error": format!("cannot read lock: {}", error.kind()) }),
     };
     match serde_json::from_str::<Value>(&text) {
         Ok(value @ Value::Object(_)) => value,

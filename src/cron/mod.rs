@@ -509,7 +509,7 @@ fn describe_document(task: &store::Task, store_display: &str) -> serde_json::Val
     let plan = due_plan(
         &Store {
             version: 1,
-            tasks: vec![clone_task(task)],
+            tasks: vec![task.clone()],
         },
         store_display,
         None,
@@ -531,6 +531,11 @@ fn describe_document(task: &store::Task, store_display: &str) -> serde_json::Val
             "runLimit",
             "retryEligibleAt",
             "retryAttempt",
+            // Why a row is `invalid-schedule` for a non-schedule reason
+            // (`lastRunAt`/`notBefore`/`anchorAt`) or carries a retry
+            // error: `due` reports these, `describe` must not hide them.
+            "error",
+            "retryError",
         ] {
             if let Some(value) = row.get(key) {
                 document[key] = value.clone();
@@ -538,11 +543,6 @@ fn describe_document(task: &store::Task, store_display: &str) -> serde_json::Val
         }
     }
     document
-}
-
-fn clone_task(task: &store::Task) -> store::Task {
-    serde_json::from_value(serde_json::to_value(task).expect("serializable task"))
-        .expect("round trip")
 }
 
 fn emit_describe(document: &serde_json::Value) {
@@ -576,6 +576,8 @@ fn emit_describe(document: &serde_json::Value) {
         "lastRunId",
         "runHistoryCount",
         "status",
+        "error",
+        "retryError",
         "due",
         "dueCount",
         "missedRuns",
