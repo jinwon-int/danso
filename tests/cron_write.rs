@@ -5,6 +5,10 @@
 //! documented danso divergences from §7: the `.bak` store snapshot and the
 //! `cron/history/<id>.jsonl` overflow archive.
 
+// The cron surface is gated on `ops` (src/lib.rs); a CLI-only build has
+// neither the module nor the binary subcommand these tests drive.
+#![cfg(feature = "ops")]
+
 use chrono::{DateTime, Utc};
 use danso::cron::commit::{
     append_run_history, apply_retry_transition, apply_run_limit, archive_history, commit_run_state,

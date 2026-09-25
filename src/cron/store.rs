@@ -378,11 +378,13 @@ pub fn validate(store: &Store) -> Vec<String> {
                 ));
             }
         }
-        if task.timezone.trim().is_empty() || task.timezone.len() > 64 {
+        // Length limits count characters like the ccc JSON Schema
+        // `maxLength`, not UTF-8 bytes: a store ccc accepts loads here.
+        if task.timezone.trim().is_empty() || task.timezone.chars().count() > 64 {
             errors.push(format!("{location}.timezone must be 1-64 characters"));
         }
         if let Some(chat_id) = &task.notify_chat_id {
-            let valid = chat_id.len() <= 64
+            let valid = chat_id.chars().count() <= 64
                 && pattern(
                     &CHAT_ID_RX,
                     r"^(-?[0-9]{1,32}|@[A-Za-z][A-Za-z0-9_]{3,31})$",
@@ -505,7 +507,7 @@ pub fn validate(store: &Store) -> Vec<String> {
                 errors.push(format!("{location}.cwd must not be empty"));
             }
             if let Some(model) = &payload.model
-                && (model.is_empty() || model.len() > 128)
+                && (model.is_empty() || model.chars().count() > 128)
             {
                 errors.push(format!("{location}.model must be 1-128 characters"));
             }

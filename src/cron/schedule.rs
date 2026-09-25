@@ -146,28 +146,13 @@ impl CronFields {
             && self.month.contains(&(local.month() as i32))
     }
 
-    /// Earliest naive wall-clock minute after `naive` that could match.
-    /// With `month_jump = false` a month mismatch caps at the next local
-    /// midnight so zone-aware callers can verify each hop against a constant
-    /// UTC offset.
-    fn next_candidate_local(&self, naive: NaiveDateTime, month_jump: bool) -> NaiveDateTime {
+    /// Earliest naive wall-clock minute after `naive` that could match. A
+    /// month mismatch caps at the next local midnight — hops never exceed one
+    /// local day, so zone-aware callers can verify each hop against a
+    /// constant UTC offset.
+    fn next_candidate_local(&self, naive: NaiveDateTime) -> NaiveDateTime {
         if !self.month.contains(&(naive.month() as i32)) {
-            if !month_jump {
-                return next_local_midnight(naive);
-            }
-            let next_month = self
-                .month
-                .iter()
-                .copied()
-                .filter(|m| *m > naive.month() as i32)
-                .min();
-            return match next_month {
-                Some(month) => month_start(naive.year(), month),
-                None => month_start(
-                    naive.year() + 1,
-                    *self.month.iter().min().expect("non-empty"),
-                ),
-            };
+            return next_local_midnight(naive);
         }
         if !self.day_matches(naive) {
             return next_local_midnight(naive);
@@ -201,13 +186,6 @@ impl CronFields {
     }
 }
 
-fn month_start(year: i32, month: i32) -> NaiveDateTime {
-    chrono::NaiveDate::from_ymd_opt(year, month as u32, 1)
-        .expect("valid date")
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight")
-}
-
 fn next_local_midnight(naive: NaiveDateTime) -> NaiveDateTime {
     naive
         .date()
@@ -220,19 +198,9 @@ fn next_local_midnight(naive: NaiveDateTime) -> NaiveDateTime {
 /// A parsed schedule; `parse_schedule` is the only constructor.
 #[derive(Debug, Clone)]
 pub enum Schedule {
-    Cron {
-        fields: Box<CronFields>,
-        tz: Tz,
-        expr: String,
-    },
-    Interval {
-        seconds: i64,
-        expr: String,
-    },
-    Once {
-        run_at: DateTime<Utc>,
-        expr: String,
-    },
+    Cron { fields: Box<CronFields>, tz: Tz },
+    Interval { seconds: i64 },
+    Once { run_at: DateTime<Utc> },
 }
 
 impl Schedule {
@@ -270,24 +238,15 @@ pub fn parse_schedule(expr: &str, tz_name: &str) -> Result<Schedule, String> {
         if seconds > MAX_INTERVAL_SECONDS {
             return Err("interval must be at most 366 days".to_string());
         }
-        return Ok(Schedule::Interval {
-            seconds,
-            expr: expr.to_string(),
-        });
+        return Ok(Schedule::Interval { seconds });
     }
     if let Some(rest) = expr.strip_prefix("at ") {
         let run_at = parse_local(rest, tz, "schedule")?;
-        return Ok(Schedule::Once {
-            run_at,
-            expr: expr.to_string(),
-        });
+        return Ok(Schedule::Once { run_at });
     }
     if expr.contains('T') && !expr.contains(' ') {
         let run_at = parse_local(expr, tz, "schedule")?;
-        return Ok(Schedule::Once {
-            run_at,
-            expr: expr.to_string(),
-        });
+        return Ok(Schedule::Once { run_at });
     }
     let resolved = SHORTHANDS
         .iter()
@@ -317,7 +276,6 @@ pub fn parse_schedule(expr: &str, tz_name: &str) -> Result<Schedule, String> {
             dow_any: parts[4] == "*",
         }),
         tz,
-        expr: resolved.to_string(),
     })
 }
 
@@ -347,7 +305,7 @@ fn first_match_zone(
         if fields.matches(local_naive) {
             return Some(cur);
         }
-        let target = fields.next_candidate_local(local_naive, false);
+        let target = fields.next_candidate_local(local_naive);
         // Earliest instant on ambiguity (fold 0), matching Python's
         // `replace(tzinfo=tz)`. A nonexistent target always fails the landing
         // check below in the Python reference, so skipping straight to the

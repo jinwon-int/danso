@@ -31,14 +31,13 @@ fn is_truthy(value: Option<&Value>) -> bool {
 fn holder_process_gone(pid: i64) -> bool {
     // The lock contract makes bootId change and the opt-in lockTimeoutSec the
     // only staleness sources: a wrong liveness guess must never double-run a
-    // task. This surfaces a provably dead same-boot holder only.
+    // task. This surfaces a provably dead same-boot holder only, by the one
+    // liveness rule this binary has (`danso service status` uses the same):
+    // ESRCH and a zombie are gone, EPERM is alive.
     if pid <= 0 || pid > i32::MAX as i64 {
         return false;
     }
-    // ESRCH: no such process. Every other error (e.g. EPERM) means the
-    // holder may still exist, so report it alive.
-    let gone = unsafe { libc::kill(pid as i32, 0) };
-    gone == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    !danso_ops::probe::pid_alive(pid as u32)
 }
 
 /// Lock state for one task at `at` (ccc `lock_status`).
@@ -335,6 +334,9 @@ pub fn normalize(task: &Task) -> Value {
         "maxRuns": task.max_runs,
         "runCount": task.run_count,
         "redactProfile": task.redact_profile,
+        // `Payload` carries no prompt text (kind/argv/cwd/model/limits), so
+        // the projection can show what a command task will execute.
+        "payload": task.payload,
         "lastRunAt": task.last_run_at,
         "lastStatus": task.last_status,
         "lastRunId": task.last_run_id,

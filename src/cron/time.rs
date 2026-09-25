@@ -36,6 +36,13 @@ struct IsoStamp {
 /// `+HH[:MM[:SS]]` / `+HHMM` offset. Date-only means midnight.
 fn parse_iso(value: &str) -> Result<IsoStamp, ()> {
     let text = value.trim();
+    // Every accepted stamp is ASCII, and the slicing below is by byte
+    // offset: a multibyte character straddling an offset must be an error,
+    // not a char-boundary panic (`--at`, `lastRunAt`, a lock's `acquiredAt`
+    // all reach here unchecked).
+    if !text.is_ascii() {
+        return Err(());
+    }
     let bytes = text.as_bytes();
     if bytes.len() < 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return Err(());
@@ -212,11 +219,9 @@ pub fn local_to_utc(tz: Tz, naive: NaiveDateTime) -> DateTime<Utc> {
 static BOOT_ID: OnceLock<String> = OnceLock::new();
 
 /// Process-invariant boot id for lock staleness; empty when unreadable, which
-/// disables boot-id staleness exactly like the Python reference.
+/// disables boot-id staleness exactly like the Python reference. One reader
+/// per binary: this caches `danso_ops::probe::boot_id`, the same source
+/// `danso service` scopes its pid records to.
 pub fn boot_id() -> &'static str {
-    BOOT_ID.get_or_init(|| {
-        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .map(|text| text.trim().to_string())
-            .unwrap_or_default()
-    })
+    BOOT_ID.get_or_init(|| danso_ops::probe::boot_id().unwrap_or_default())
 }
