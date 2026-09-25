@@ -38,7 +38,7 @@ appear only under `unread_keys`; the report claims no source for them.
 Absolute inspected paths may therefore appear, but values from the files and
 the environment do not.
 
-The nine checks are emitted in this order:
+The ten checks are emitted in this order:
 
 - `config.parse` resolves `$DANSO_HOME` exactly as `config check` does (or
   `$HOME/.danso`), then uses the existing config parser and validator. Missing
@@ -47,10 +47,24 @@ The nine checks are emitted in this order:
 - `config.permissions` checks `config.toml` for mode `0600`. Group/world
   readable files warn with `config group/world readable`.
 - `home.layout` reports whether the resolved Danso home and configured memory
-  directory (or the existing default) are present.
+  directory (`DANSO_MEMORY_DIR`, `memory.dir`, or the `$DANSO_HOME/memory`
+  default) are present.
+- `home.legacy_state` is the migration signal for #136 (see the state-root
+  section of [architecture.md](architecture.md)). `one state root` when
+  `DANSO_HOME` is unset or is `$HOME/.danso` itself. Otherwise, for each of
+  the Telegram state root and the memory root that is the `DANSO_HOME`
+  default (`$DANSO_HOME/telegram`, `$DANSO_HOME/memory`), the check looks at
+  the pre-#136 location (`$HOME/.danso/telegram`, `$HOME/.danso/memory`):
+  when that one has entries and the root in use is missing or empty, the
+  detail is the warning `legacy state present; move it: mv <old> <new>
+  [; mv <old> <new>] while the service is stopped`, both paths spelled out;
+  else `legacy state absent`. A root chosen by `DANSO_TELEGRAM_DATA_DIR`,
+  `DANSO_MEMORY_DIR` or `memory.dir` is never compared. The doctor moves
+  nothing.
 - `telegram.data_dir` resolves `DANSO_TELEGRAM_DATA_DIR` exactly as the
-  Telegram service does, including its `$HOME/.danso/telegram` default, and
-  reports directory presence.
+  Telegram service does, including its `$DANSO_HOME/telegram` default
+  (`$HOME/.danso/telegram` when `DANSO_HOME` is unset), and reports
+  directory presence.
 - `telegram.health` reads only `health.json` within a bounded limit and
   reports schema version, service-PID presence, and started/last-poll ages in
   seconds. A missing file is exactly `health file missing`; malformed or

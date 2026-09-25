@@ -2,7 +2,7 @@
 //! over the native memory store (issue #52 §8). No provider, Python, Node,
 //! or ccc-node runtime is involved; errors are body-free and fail closed.
 //! Unspecified flags default to memory OFF semantics: without a scope the
-//! `global` tree under `$DANSO_MEMORY_DIR` (or `~/.danso/memory`) is used.
+//! `global` tree under `$DANSO_MEMORY_DIR` (or `$DANSO_HOME/memory`) is used.
 
 use clap::{Parser, Subcommand};
 use danso::memory::distill::journal;
@@ -122,21 +122,16 @@ pub enum Command {
     },
 }
 
-fn default_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("DANSO_MEMORY_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/root"));
-    home.join(".danso/memory")
-}
-
 pub fn route(args: &MemoryArgs) -> anyhow::Result<Route> {
     let scope = args.scope.as_deref().unwrap_or("global");
     // `--memory-dir` is explicit per-invocation configuration; it wins over
-    // the DANSO_MEMORY_DIR environment and the ~/.danso default (§8).
-    let root = args.memory_dir.clone().unwrap_or_else(default_root);
+    // the DANSO_MEMORY_DIR environment and the $DANSO_HOME/memory default
+    // (§8). The default is the service's (`MemoryConfig::default_root`), so
+    // the CLI and the bridge cannot read two different trees (#136).
+    let root = match args.memory_dir.clone() {
+        Some(root) => root,
+        None => memory::MemoryConfig::default_root()?,
+    };
     let route = Route::new(&root, scope)?;
     match &args.memory_legacy_read {
         Some(dir) => route.with_legacy(dir),

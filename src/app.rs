@@ -466,12 +466,10 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
     // The harness records working state on compaction and at a finished run
     // (§5.3); the runtime itself stays memory-agnostic.
     let memory_root = if args.memory.mode != memory::MemoryMode::Off {
-        Some(
-            args.memory
-                .root
-                .clone()
-                .unwrap_or_else(memory::MemoryConfig::default_root),
-        )
+        Some(match args.memory.root.clone() {
+            Some(root) => root,
+            None => memory::MemoryConfig::default_root()?,
+        })
     } else {
         None
     };

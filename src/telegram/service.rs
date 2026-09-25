@@ -258,7 +258,7 @@ impl RunSettings {
         );
         let memory_root = crate::memory::MemoryConfig::resolve_root(
             layered.config().and_then(|c| c.memory.dir.clone()),
-        );
+        )?;
         ensure!(
             memory_root.is_absolute(),
             "DANSO_MEMORY_DIR or memory.dir must be an absolute path"

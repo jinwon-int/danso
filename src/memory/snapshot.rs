@@ -494,10 +494,10 @@ pub fn inject_into_context(
     if config.mode == super::MemoryMode::Off {
         return Ok(());
     }
-    let root = config
-        .root
-        .clone()
-        .unwrap_or_else(super::MemoryConfig::default_root);
+    let root = match config.root.clone() {
+        Some(root) => root,
+        None => super::MemoryConfig::default_root()?,
+    };
     let mut route = Route::new(&root, &config.scope)?;
     if let Some(dir) = &config.legacy_read {
         route = route.with_legacy(dir)?;

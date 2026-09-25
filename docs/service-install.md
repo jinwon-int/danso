@@ -32,7 +32,8 @@ known gap, tracked separately.
 The service refuses to keep journals inside the workspace it runs commands in,
 and the state root holds the journals. The rendered unit sets
 `WorkingDirectory` to `$HOME`, and the default state root is
-`$HOME/.danso/telegram` — inside it. So a unit that supplies the two required
+`$DANSO_HOME/telegram` — `$HOME/.danso/telegram`, since the unit sets `HOME`
+and not `DANSO_HOME` — inside it. So a unit that supplies the two required
 variables and nothing else **still cannot start**:
 
 ```

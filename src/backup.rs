@@ -343,7 +343,11 @@ pub fn create_at(
                 .map_err(|_| CommandError::failed(CATEGORY_CONFIG_INVALID))?,
         ),
     };
-    let memory_root = memory::MemoryConfig::resolve_root(
+    // Beneath the `home` this entry point was handed, not a second
+    // resolution of the environment: the archive's `memory/` must be the
+    // tree the same home's service writes (#136).
+    let memory_root = memory::MemoryConfig::root_under(
+        home,
         parsed_config
             .as_ref()
             .and_then(|value| value.memory.dir.clone()),

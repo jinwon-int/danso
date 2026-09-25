@@ -32,13 +32,18 @@ pub const ALLOWED_USER_IDS_ENV: &str = "DANSO_TELEGRAM_ALLOWED_USER_IDS";
 /// Re-exported, not redefined: `danso-ops` writes this name into the systemd
 /// unit, and a second copy here is how the two drift apart.
 pub use danso_ops::unit::DATA_DIR_ENV;
-pub const DEFAULT_DATA_DIR_SUFFIX: &str = ".danso/telegram";
+/// The default state root's name under `config::home()` (#136).
+pub const DEFAULT_DATA_DIR_NAME: &str = "telegram";
 pub const WORKSPACE_ENV: &str = "DANSO_TELEGRAM_WORKSPACE";
 pub const PROVIDER_ENV: &str = "DANSO_TELEGRAM_PROVIDER";
 pub const MODEL_ENV: &str = "DANSO_TELEGRAM_MODEL";
 pub const EFFORT_ENV: &str = "DANSO_TELEGRAM_EFFORT";
 
-/// Resolve the Telegram state root from process configuration.
+/// Resolve the Telegram state root from process configuration:
+/// `DANSO_TELEGRAM_DATA_DIR`, else `$DANSO_HOME/telegram` (#136). The
+/// default used to be `$HOME/.danso/telegram` whatever `DANSO_HOME` said,
+/// so a node with `DANSO_HOME` set kept its config in one root and its
+/// state in another; `doctor` flags the leftover (`home.legacy_state`).
 pub fn data_dir_from_env() -> Result<PathBuf> {
     if let Some(raw) = std::env::var_os(DATA_DIR_ENV) {
         ensure!(!raw.is_empty(), "{DATA_DIR_ENV} must not be empty");
@@ -49,12 +54,8 @@ pub fn data_dir_from_env() -> Result<PathBuf> {
         );
         return Ok(path);
     }
-
-    let home = std::env::var_os("HOME").context("HOME is required for Telegram state")?;
-    ensure!(!home.is_empty(), "HOME must not be empty");
-    let home = PathBuf::from(home);
-    ensure!(home.is_absolute(), "HOME must be an absolute path");
-    Ok(home.join(DEFAULT_DATA_DIR_SUFFIX))
+    let home = crate::config::home().context("Telegram state root")?;
+    Ok(home.join(DEFAULT_DATA_DIR_NAME))
 }
 
 /// Make a private, owner-only directory and fail closed on an unsafe existing
@@ -645,5 +646,49 @@ mod tests {
         let encoded = serde_json::to_string(&record).unwrap();
         assert!(encoded.contains("\"model\":\"fixture-model\""));
         assert!(encoded.contains("\"totalTokens\":30"));
+    }
+
+    /// `DANSO_TELEGRAM_DATA_DIR`, else `$DANSO_HOME/telegram` (#136).
+    /// Without `DANSO_HOME` the default is the pre-#136
+    /// `$HOME/.danso/telegram` byte for byte; a relative `DANSO_HOME` is
+    /// refused, not resolved against the working directory.
+    #[test]
+    fn data_dir_default_follows_danso_home_and_is_unchanged_without_it() {
+        use crate::settings::tests::with_env;
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set for tests"));
+        with_env(&[("DANSO_HOME", None), (DATA_DIR_ENV, None)], || {
+            assert_eq!(data_dir_from_env().unwrap(), home.join(".danso/telegram"));
+        });
+        with_env(
+            &[("DANSO_HOME", Some("/srv/danso")), (DATA_DIR_ENV, None)],
+            || {
+                assert_eq!(
+                    data_dir_from_env().unwrap(),
+                    PathBuf::from("/srv/danso/telegram")
+                );
+            },
+        );
+        with_env(
+            &[
+                ("DANSO_HOME", Some("/srv/danso")),
+                (DATA_DIR_ENV, Some("/var/lib/danso/telegram")),
+            ],
+            || {
+                assert_eq!(
+                    data_dir_from_env().unwrap(),
+                    PathBuf::from("/var/lib/danso/telegram")
+                );
+            },
+        );
+        with_env(
+            &[("DANSO_HOME", Some("srv/danso")), (DATA_DIR_ENV, None)],
+            || {
+                let error = format!("{:#}", data_dir_from_env().unwrap_err());
+                assert!(
+                    error.contains("DANSO_HOME must be an absolute path"),
+                    "{error}"
+                );
+            },
+        );
     }
 }
