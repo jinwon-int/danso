@@ -90,15 +90,19 @@ that set `DANSO_HOME` **and** relied on either default (no
 old trees sit under `$HOME/.danso`. Nothing is moved automatically.
 
 `danso doctor` reports the split as the warning `home.legacy_state`,
-naming both paths and the move, when the root in use is the `DANSO_HOME`
-default and is missing or empty while the old location has entries. The
-procedure is: stop the service (`danso service stop`), run the `mv` the
-report names for each root — for example
-`mv $HOME/.danso/telegram $DANSO_HOME/telegram` — and start it again.
-`update` and `backup` already followed `DANSO_HOME` for `bin/`, `state/` and
-`backups/`; after the move a backup archives the same `telegram/` and
-`memory/` the service writes. Keeping the old location instead is a matter
-of exporting `DANSO_TELEGRAM_DATA_DIR` / `DANSO_MEMORY_DIR` explicitly.
+naming both paths, whenever the root in use is the `DANSO_HOME` default and
+the old location has entries. The procedure is: stop the service
+(`danso service stop`), run the `mv` the report names for each root — for
+example `mv $HOME/.danso/telegram $DANSO_HOME/telegram` — and start it
+again. If the service already ran after the switch, the new root holds
+entries too and the report says so (`both roots hold entries, reconcile by
+hand`, #176): a `mv` would fail or clobber, so merge the two trees
+deliberately. `update` and `backup` already followed `DANSO_HOME` for
+`bin/`, `state/` and `backups/`; until the move, a backup archives only the
+root the service writes and marks the omission with the `legacy_state`
+component warning (#177) — the old tree is not in the snapshot. Keeping the
+old location instead is a matter of exporting `DANSO_TELEGRAM_DATA_DIR` /
+`DANSO_MEMORY_DIR` explicitly.
 
 ## Adding a provider
 

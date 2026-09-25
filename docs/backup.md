@@ -84,7 +84,17 @@ The manifest is JSON and contains no state bodies:
 The optional `mode` is the source octal mode of `config.toml`; it is recorded
 as a string so the leading zero is retained. All other manifest data consists
 of counts, modes, relative component layout, and fixed categories. The fixed
-warning categories are `missing`, `unreadable`, `layout`, and `scan_bound`.
+warning categories are `missing`, `unreadable`, `layout`, `scan_bound`, and
+`legacy_state`.
+
+`legacy_state` on the `memory` or `conversations` component means the
+snapshot is complete for the root the service uses, but that root is the
+`$DANSO_HOME` default and the pre-#136 location (`$HOME/.danso/memory` or
+`$HOME/.danso/telegram`) still holds entries which are **not** in the
+archive (#177). The backup neither reads nor copies the old tree; migrate
+it first (`danso doctor` names both paths under `home.legacy_state`), then
+back up again. A backup carrying this category restores like any other; a
+`danso` older than the category refuses it as `invalid_backup`.
 
 The configured Telegram token file is never opened or copied. The
 `.telegram-token.lock` file and `data-dir/health.json` are also excluded:

@@ -226,13 +226,14 @@ fn home_layout(home: &Path, memory_dir: &Path) -> Check {
 
 /// `home.legacy_state` (#136): until #136 the Telegram state and memory
 /// defaults were `$HOME/.danso/{telegram,memory}` whatever `DANSO_HOME` said,
-/// so a node that set `DANSO_HOME` may still have its state there while the
-/// service now starts from an empty `$DANSO_HOME/{telegram,memory}`.  Only a
-/// root in use that is the `DANSO_HOME` default counts as split — a dedicated
-/// variable or `memory.dir` chose its root deliberately — and only when the
-/// old one holds entries and the new one is missing or empty.  Both paths are
-/// named (they are not secrets); nothing is moved, that is the operator's
-/// call with the service stopped.
+/// so a node that set `DANSO_HOME` may still have its state there.  Every
+/// old root that holds entries while the same-named `DANSO_HOME` default is
+/// in use is named (`config::legacy_roots`): with the new root missing or
+/// empty the detail is the `mv` to run; with the new root populated too —
+/// the service ran at least once after the switch (#176) — the two trees
+/// are named for reconciling by hand.  Both paths are spelled out (they are
+/// not secrets); nothing is moved, that is the operator's call with the
+/// service stopped.
 fn legacy_state(
     home: &Path,
     legacy_home: Option<&Path>,
@@ -240,49 +241,39 @@ fn legacy_state(
     memory_dir: &Path,
 ) -> Check {
     let id = "home.legacy_state";
-    let Some(legacy_home) = legacy_home else {
+    if legacy_home.is_none() {
         return Check::ok(id, "one state root");
-    };
-    let roots = [
-        (telegram::DEFAULT_DATA_DIR_NAME, telegram_data_dir),
-        (memory::DEFAULT_DIR_NAME, Some(memory_dir)),
-    ];
-    let mut moves = Vec::new();
-    for (name, current) in roots {
-        let Some(current) = current else { continue };
-        if current != home.join(name) {
-            continue;
-        }
-        let old = legacy_home.join(name);
-        if has_entries(&old) == Some(true) && has_entries(current) == Some(false) {
-            moves.push(format!("mv {} {}", old.display(), current.display()));
-        }
     }
-    if moves.is_empty() {
+    let roots = config::legacy_roots(home, legacy_home, telegram_data_dir, memory_dir);
+    if roots.is_empty() {
         return Check::ok(id, "legacy state absent");
+    }
+    let (merges, moves): (Vec<_>, Vec<_>) = roots.iter().partition(|root| root.current_populated);
+    let mut actions = Vec::new();
+    if !moves.is_empty() {
+        let moves: Vec<String> = moves
+            .iter()
+            .map(|root| format!("mv {} {}", root.legacy.display(), root.current.display()))
+            .collect();
+        actions.push(format!("move it: {}", moves.join("; ")));
+    }
+    if !merges.is_empty() {
+        let merges: Vec<String> = merges
+            .iter()
+            .map(|root| format!("{} into {}", root.legacy.display(), root.current.display()))
+            .collect();
+        actions.push(format!(
+            "both roots hold entries, reconcile by hand: {}",
+            merges.join("; ")
+        ));
     }
     Check::warn(
         id,
         format!(
-            "legacy state present; move it: {} while the service is stopped",
-            moves.join("; ")
+            "legacy state present; {} while the service is stopped",
+            actions.join("; ")
         ),
     )
-}
-
-/// `Some(true)` for a directory holding at least one entry, `Some(false)` for
-/// a missing or empty one, `None` when that cannot be told without guessing.
-fn has_entries(path: &Path) -> Option<bool> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(false),
-        Err(_) => None,
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            fs::read_dir(path)
-                .ok()
-                .map(|mut entries| entries.next().is_some())
-        }
-        Ok(_) => None,
-    }
 }
 
 fn telegram_data_dir_check(data_dir: Option<&Path>) -> Check {
@@ -959,9 +950,31 @@ mod tests {
         );
         assert!(!default_telegram.exists(), "nothing created");
 
-        // An empty legacy tree, or a populated new one, is not a split.
-        fs::remove_file(legacy_home.join("telegram/health.json")).expect("empty old telegram");
+        // A populated new root does not hide the old one (#176): the
+        // service ran once after the switch, so the trees must be
+        // reconciled rather than moved.
         private_dir(&home.join(memory::DEFAULT_DIR_NAME).join("global"));
+        let report = inspect_at(&home, Some(&default_telegram), Some(&legacy_home), now);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "home.legacy_state")
+            .expect("legacy state check");
+        assert_eq!(check.status, "warn");
+        assert_eq!(
+            check.detail,
+            format!(
+                "legacy state present; move it: mv {} {}; both roots hold entries, reconcile by hand: {} into {} while the service is stopped",
+                legacy_home.join("telegram").display(),
+                default_telegram.display(),
+                legacy_home.join("memory").display(),
+                home.join(memory::DEFAULT_DIR_NAME).display()
+            )
+        );
+
+        // An empty legacy tree is not a split.
+        fs::remove_file(legacy_home.join("telegram/health.json")).expect("empty old telegram");
+        fs::remove_dir(legacy_home.join("memory/global")).expect("empty old memory");
         let report = inspect_at(&home, Some(&default_telegram), Some(&legacy_home), now);
         let check = report
             .checks

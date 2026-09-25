@@ -79,6 +79,78 @@ pub fn legacy_home() -> Option<PathBuf> {
     (legacy.is_absolute() && legacy != home).then_some(legacy)
 }
 
+/// One pre-#136 state root that still holds entries while the same-named
+/// `DANSO_HOME` default is the root in use (#176, #177).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyRoot {
+    /// `telegram` or `memory`.
+    pub name: &'static str,
+    /// `$HOME/.danso/<name>`, holding at least one entry.
+    pub legacy: PathBuf,
+    /// `$DANSO_HOME/<name>`, the root the service reads and writes.
+    pub current: PathBuf,
+    /// `false` when `current` is missing or empty (a plain `mv` migrates
+    /// it); `true` when it holds entries too, or cannot be read, so the two
+    /// trees need reconciling by hand.
+    pub current_populated: bool,
+}
+
+/// The pre-#136 roots the operator still has to deal with: for each of the
+/// Telegram state root and the memory root that is the `DANSO_HOME` default
+/// (a dedicated variable or `memory.dir` chose its root deliberately and is
+/// never compared), the `legacy_home` sibling when it holds entries —
+/// whether or not the root in use is populated already.  `doctor` reports
+/// these as `home.legacy_state` and `backup` records the `legacy_state`
+/// warning for them.  Nothing is read beyond directory listings and
+/// nothing is moved.
+pub fn legacy_roots(
+    home: &Path,
+    legacy_home: Option<&Path>,
+    telegram_data_dir: Option<&Path>,
+    memory_dir: &Path,
+) -> Vec<LegacyRoot> {
+    let Some(legacy_home) = legacy_home else {
+        return Vec::new();
+    };
+    let roots = [
+        (crate::telegram::DEFAULT_DATA_DIR_NAME, telegram_data_dir),
+        (crate::memory::DEFAULT_DIR_NAME, Some(memory_dir)),
+    ];
+    let mut found = Vec::new();
+    for (name, current) in roots {
+        let Some(current) = current else { continue };
+        if current != home.join(name) {
+            continue;
+        }
+        let legacy = legacy_home.join(name);
+        if has_entries(&legacy) != Some(true) {
+            continue;
+        }
+        found.push(LegacyRoot {
+            name,
+            legacy,
+            current: current.to_path_buf(),
+            current_populated: has_entries(current) != Some(false),
+        });
+    }
+    found
+}
+
+/// `Some(true)` for a directory holding at least one entry, `Some(false)` for
+/// a missing or empty one, `None` when that cannot be told without guessing.
+fn has_entries(path: &Path) -> Option<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::read_dir(path)
+                .ok()
+                .map(|mut entries| entries.next().is_some())
+        }
+        Ok(_) => None,
+    }
+}
+
 pub fn default_path() -> Result<PathBuf> {
     Ok(home()?.join(FILE_NAME))
 }
@@ -791,5 +863,49 @@ public_key = "RWQbf5jrBubDWDWgYNOyi1nYm+uTycGKIGfh+oOVB09ocmmx8o4mAj8w"
             assert!(home().is_err());
             assert_eq!(legacy_home(), None);
         });
+    }
+
+    /// `legacy_roots` names a pre-#136 root whenever it holds entries and
+    /// the same-named `DANSO_HOME` default is in use — populated or not on
+    /// the new side (#176) — and never a root chosen explicitly.
+    #[test]
+    fn legacy_roots_name_populated_old_roots_under_the_defaults_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("new");
+        let old = dir.path().join("old");
+        let telegram = home.join(crate::telegram::DEFAULT_DATA_DIR_NAME);
+        let memory = home.join(crate::memory::DEFAULT_DIR_NAME);
+        std::fs::create_dir_all(old.join("telegram")).unwrap();
+        std::fs::write(old.join("telegram/health.json"), b"{}").unwrap();
+        std::fs::create_dir_all(old.join("memory")).unwrap();
+
+        // No split at all, or an old tree that is empty: nothing to name.
+        assert!(legacy_roots(&home, None, Some(&telegram), &memory).is_empty());
+        let roots = legacy_roots(&home, Some(&old), Some(&telegram), &memory);
+        assert_eq!(
+            roots,
+            vec![LegacyRoot {
+                name: "telegram",
+                legacy: old.join("telegram"),
+                current: telegram.clone(),
+                current_populated: false,
+            }]
+        );
+
+        // The new side populated too is still named, marked as such.
+        std::fs::create_dir_all(telegram.join("conversations")).unwrap();
+        std::fs::create_dir_all(old.join("memory/global")).unwrap();
+        let roots = legacy_roots(&home, Some(&old), Some(&telegram), &memory);
+        assert_eq!(
+            roots
+                .iter()
+                .map(|r| (r.name, r.current_populated))
+                .collect::<Vec<_>>(),
+            vec![("telegram", true), ("memory", false)]
+        );
+
+        // Roots chosen deliberately are never compared.
+        let chosen = dir.path().join("chosen");
+        assert!(legacy_roots(&home, Some(&old), Some(&chosen), &chosen).is_empty());
     }
 }
