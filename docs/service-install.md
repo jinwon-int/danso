@@ -1,31 +1,30 @@
 # Installing the resident service
 
 Everything here was measured on a node, not inferred from the code
-(yukson, 2026-09-17, #118 D-stage). Each item is something the acceptance run
-tripped over in the order an operator would meet it.
+(yukson, 2026-09-17, #118 D-stage; re-measured on vps6, 2026-09-26, #118 F3
+closure — the five values below supplied by `config.toml` alone, no operator
+drop-in: install → `available` → `systemctl stop` → `systemctl restart`, and
+`install` refuses a unit whose config names neither token nor model). Each
+item is something the acceptance run tripped over in the order an operator
+would meet it.
 
 ## What the service needs to start
 
-Two variables are required and there is no default for either:
+Five values decide whether the service can start. Each resolves the same way:
+environment first, then `config.toml`, then the default (#136).
 
-| Variable | Notes |
-|---|---|
-| `DANSO_TELEGRAM_BOT_TOKEN` | the bot token; never put it in the unit file |
-| `DANSO_TELEGRAM_MODEL` | or `DANSO_MODEL`, or the provider-specific name |
+| Environment | config.toml | Default | Notes |
+|---|---|---|---|
+| `DANSO_TELEGRAM_BOT_TOKEN` | `telegram.token_file` | none | required, one way or the other; never put the token in the unit file |
+| `DANSO_TELEGRAM_MODEL` (or `DANSO_MODEL`, or the provider-specific name) | `provider.model` | none | required, one way or the other |
+| `DANSO_TELEGRAM_WORKSPACE` | `core.workspace` | the process's working directory | see *the workspace trap* below |
+| `DANSO_TELEGRAM_PROVIDER` | `provider.name` | `anthropic` | set it when you are not on the default |
+| `DANSO_TELEGRAM_ALLOWED_USER_IDS` | `telegram.allowed_user_ids` | empty | an empty allowlist answers nobody |
 
-Three more have defaults that are usually wrong for a service:
-
-| Variable | Default | Why you normally set it |
-|---|---|---|
-| `DANSO_TELEGRAM_WORKSPACE` | the process's working directory | see *the workspace trap* below |
-| `DANSO_TELEGRAM_PROVIDER` | `anthropic` | set it when you are not on the default |
-| `DANSO_TELEGRAM_ALLOWED_USER_IDS` | empty | an empty allowlist answers nobody |
-
-`config.toml` declares most of these too, under `[telegram]` and `[provider]`.
-**The service does not read it.** The Telegram loop is environment-only; the
-config file is consumed by `doctor`, `backup` and `update`. Setting
-`telegram.token_file` in `config.toml` will not start a service. This is a
-known gap, tracked separately.
+`token_file` must be an absolute path to an owner-only regular file, and it is
+read only when the environment variable is absent. A set-but-empty
+`DANSO_TELEGRAM_ALLOWED_USER_IDS` still means deny-all — an operator who
+clears it gets what they asked.
 
 ## The workspace trap
 
