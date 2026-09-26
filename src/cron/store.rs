@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::OnceLock;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Store {
     pub version: u8,
@@ -93,15 +93,15 @@ pub enum PayloadKind {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Payload {
     pub kind: PayloadKind,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argv: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_sec: Option<i64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_max_bytes: Option<i64>,
 }
 
@@ -152,17 +152,17 @@ pub struct Task {
     pub schedule: String,
     pub prompt: String,
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub success_exit_codes: Option<Vec<i64>>,
     #[serde(default)]
     pub permission_mode: PermissionMode,
     #[serde(default)]
     pub notify: NotifyMode,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_chat_id: Option<String>,
     #[serde(default)]
     pub attach_memory: Vec<String>,
@@ -172,11 +172,11 @@ pub struct Task {
     pub redact_profile: String,
     #[serde(default = "default_timezone")]
     pub timezone: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_at: Option<String>,
     #[serde(default)]
     pub keep_after_run: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Payload>,
     #[serde(default)]
     pub catch_up_policy: CatchUpPolicy,
@@ -186,23 +186,23 @@ pub struct Task {
     pub lock_timeout_sec: i64,
     #[serde(default = "default_max_run_history")]
     pub max_run_history: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_runs: Option<i64>,
     #[serde(default)]
     pub run_count: i64,
     #[serde(default)]
     pub run_history: Vec<RunHistoryItem>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_policy: Option<RetryPolicySpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_state: Option<RetryState>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_status: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_id: Option<String>,
 }
 
@@ -313,8 +313,14 @@ pub fn load(path: &Path) -> Result<Store, String> {
         }
         Err(_) => return Err("cron store is unreadable".to_string()),
     };
-    let store: Store = serde_json::from_str(&text)
-        .map_err(|error| format!("cron store is not a valid v1 store: {error}"))?;
+    load_str(&text)
+}
+
+/// Parse + validate a store document from in-memory text with the same
+/// fail-closed rules as `load`; used by the ccc `tasks.json` import path.
+pub fn load_str(text: &str) -> Result<Store, String> {
+    let store: Store = serde_json::from_str(text)
+        .map_err(|error| format!("cron store document is not a valid v1 store: {error}"))?;
     let errors = validate(&store);
     if errors.is_empty() {
         Ok(store)

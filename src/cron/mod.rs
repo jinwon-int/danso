@@ -7,9 +7,12 @@
 //! refusals with the payload executors (`exec.rs`: command argv and prompt
 //! harness runs) and the notify spool write path (`notify.rs`), wiring the
 //! full run pipeline: prechecks → lock → payload → spool → history → retry →
-//! run limit → state commit → release/quarantine.
+//! run limit → state commit → release/quarantine. PR4 adds the store-mutation
+//! surface (`crud.rs`: add/edit/remove/enable/disable under the store flock
+//! with the ccc exit-code contract, plus the ccc `tasks.json` import path).
 
 pub mod commit;
+pub mod crud;
 pub mod due;
 pub mod exec;
 pub mod locks;
@@ -111,6 +114,136 @@ enum CronCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Create a task in the store (validated, atomic; never executes).
+    Add {
+        id: String,
+        #[command(flatten)]
+        flags: CrudFlags,
+    },
+    /// Set-only partial update (payload flags merge; `--argv` replaces the
+    /// whole argv; no clear semantics — unset by remove+add).
+    Edit {
+        id: String,
+        #[command(flatten)]
+        flags: CrudFlags,
+    },
+    /// Remove a task from the store (store-only; never executes).
+    Remove {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable a disabled task.
+    Enable {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disable a task (an in-flight run is not interrupted).
+    Disable {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import tasks from a ccc-compatible `tasks.json` (schema v1,
+    /// fail-closed). Ids already present in the store are skipped.
+    Import {
+        /// Source store path.
+        #[arg(long, value_name = "PATH")]
+        from: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The `add`/`edit` flag table, mirroring ccc `CRUD_VALUE_FLAGS` /
+/// `CRUD_BOOL_FLAGS` (`--json` lives here too, like ccc's parse layer).
+#[derive(clap::Args)]
+struct CrudFlags {
+    #[arg(long)]
+    schedule: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    timezone: Option<String>,
+    #[arg(long)]
+    notify: Option<String>,
+    #[arg(long, value_name = "CHAT_ID")]
+    notify_chat_id: Option<String>,
+    #[arg(long)]
+    permission_mode: Option<String>,
+    #[arg(long)]
+    catch_up_policy: Option<String>,
+    #[arg(long, value_name = "ISO8601")]
+    anchor_at: Option<String>,
+    #[arg(long, value_name = "ISO8601")]
+    not_before: Option<String>,
+    #[arg(long)]
+    redact_profile: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    allowed_tools: Option<Vec<String>>,
+    #[arg(long, value_delimiter = ',', value_parser = clap::value_parser!(i64))]
+    success_exit_codes: Option<Vec<i64>>,
+    #[arg(long)]
+    max_catchup: Option<i64>,
+    #[arg(long)]
+    lock_timeout_sec: Option<i64>,
+    #[arg(long)]
+    max_run_history: Option<i64>,
+    #[arg(long)]
+    max_runs: Option<i64>,
+    #[arg(long)]
+    cwd: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    timeout_sec: Option<i64>,
+    #[arg(long)]
+    output_max_bytes: Option<i64>,
+    /// Each `--argv` occurrence appends one command word (ccc argv bucket).
+    /// ccc consumes the next token blindly, so hyphen-leading words like
+    /// `-c` are values here too.
+    #[arg(long = "argv", allow_hyphen_values = true)]
+    argv: Vec<String>,
+    #[arg(long)]
+    keep_after_run: bool,
+    #[arg(long)]
+    disabled: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+impl From<&CrudFlags> for crud::FieldFlags {
+    fn from(flags: &CrudFlags) -> Self {
+        Self {
+            schedule: flags.schedule.clone(),
+            prompt: flags.prompt.clone(),
+            name: flags.name.clone(),
+            timezone: flags.timezone.clone(),
+            notify: flags.notify.clone(),
+            notify_chat_id: flags.notify_chat_id.clone(),
+            permission_mode: flags.permission_mode.clone(),
+            catch_up_policy: flags.catch_up_policy.clone(),
+            anchor_at: flags.anchor_at.clone(),
+            not_before: flags.not_before.clone(),
+            redact_profile: flags.redact_profile.clone(),
+            allowed_tools: flags.allowed_tools.clone(),
+            success_exit_codes: flags.success_exit_codes.clone(),
+            max_catchup: flags.max_catchup,
+            lock_timeout_sec: flags.lock_timeout_sec,
+            max_run_history: flags.max_run_history,
+            max_runs: flags.max_runs,
+            cwd: flags.cwd.clone(),
+            model: flags.model.clone(),
+            timeout_sec: flags.timeout_sec,
+            output_max_bytes: flags.output_max_bytes,
+            argv: flags.argv.clone(),
+            keep_after_run: flags.keep_after_run,
+            disabled: flags.disabled,
+        }
+    }
 }
 
 #[derive(ValueEnum, Clone, Copy, PartialEq)]
@@ -361,6 +494,81 @@ pub fn run(args: CronArgs) -> i32 {
             }
             code
         }
+        CronCommand::Add { id, flags } => {
+            let json = flags.json;
+            crud_dispatch(
+                crud::add(&path, &store_display, &id, &crud::FieldFlags::from(&flags)),
+                "add",
+                json,
+            )
+        }
+        CronCommand::Edit { id, flags } => {
+            let json = flags.json;
+            crud_dispatch(
+                crud::edit(&path, &store_display, &id, &crud::FieldFlags::from(&flags)),
+                "edit",
+                json,
+            )
+        }
+        CronCommand::Remove { id, json } => crud_dispatch(
+            crud::simple(&path, &store_display, "remove", &id),
+            "remove",
+            json,
+        ),
+        CronCommand::Enable { id, json } => crud_dispatch(
+            crud::simple(&path, &store_display, "enable", &id),
+            "enable",
+            json,
+        ),
+        CronCommand::Disable { id, json } => crud_dispatch(
+            crud::simple(&path, &store_display, "disable", &id),
+            "disable",
+            json,
+        ),
+        CronCommand::Import { from, json } => {
+            crud_dispatch(crud::import(&path, &store_display, &from), "import", json)
+        }
+    }
+}
+
+/// Print one CRUD result (JSON passthrough or the ccc one-line report) and
+/// return its exit code; store/flock/IO errors print body-free on stderr.
+fn crud_dispatch(outcome: Result<(serde_json::Value, i32), String>, mode: &str, json: bool) -> i32 {
+    match outcome {
+        Ok((document, code)) => {
+            emit_crud(mode, &document, json);
+            code
+        }
+        Err(error) => {
+            eprintln!("cron: {error}");
+            1
+        }
+    }
+}
+
+fn emit_crud(mode: &str, document: &serde_json::Value, as_json: bool) {
+    if as_json {
+        print_document(document);
+        return;
+    }
+    if document["ok"].as_bool().unwrap_or(false) {
+        if mode == "import" {
+            println!(
+                "danso cron import OK: added {} skipped {}",
+                document["added"].as_array().map(Vec::len).unwrap_or(0),
+                document["skipped"].as_array().map(Vec::len).unwrap_or(0),
+            );
+        } else {
+            println!(
+                "danso cron {mode} OK: {}",
+                document["taskId"].as_str().unwrap_or_default()
+            );
+        }
+    } else {
+        eprintln!(
+            "danso cron {mode} failed: {}",
+            document["error"].as_str().unwrap_or_default()
+        );
     }
 }
 
