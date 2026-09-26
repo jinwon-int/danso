@@ -541,7 +541,14 @@ fn main() {
             std::process::exit(code);
         }
         match danso::backup::run_backup() {
-            Ok(path) => println!("{}", path.display()),
+            Ok(path) => {
+                // A partial snapshot says so where the operator is
+                // looking (#185): paths only, before the archive path.
+                for line in danso::backup::legacy_stderr_warnings() {
+                    eprintln!("{line}");
+                }
+                println!("{}", path.display());
+            }
             Err(error) => {
                 eprintln!("backup failed: {}", error.category());
                 std::process::exit(error.exit_code());

@@ -99,8 +99,9 @@ entries too and the report says so (`both roots hold entries, reconcile by
 hand`, #176): a `mv` would fail or clobber, so merge the two trees
 deliberately. `update` and `backup` already followed `DANSO_HOME` for
 `bin/`, `state/` and `backups/`; until the move, a backup archives only the
-root the service writes and marks the omission with the `legacy_state`
-component warning (#177) — the old tree is not in the snapshot. Keeping the
+root the service writes, marks the omission with the `legacy_state`
+component warning (#177), and prints one `backup warning:` line per old
+tree on stderr (#185) — the old tree is not in the snapshot. Keeping the
 old location instead is a matter of exporting `DANSO_TELEGRAM_DATA_DIR` /
 `DANSO_MEMORY_DIR` explicitly.
 
