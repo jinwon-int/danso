@@ -65,7 +65,8 @@ The ten checks are emitted in this order:
   absent`. A root chosen by `DANSO_TELEGRAM_DATA_DIR`, `DANSO_MEMORY_DIR`
   or `memory.dir` is never compared. The doctor moves nothing. A backup
   taken on such a node records the same omission as the `legacy_state`
-  warning on the component (see [backup.md](backup.md)).
+  warning on the component and prints one `backup warning:` line per old
+  tree on stderr (see [backup.md](backup.md)).
 - `telegram.data_dir` resolves `DANSO_TELEGRAM_DATA_DIR` exactly as the
   Telegram service does, including its `$DANSO_HOME/telegram` default
   (`$HOME/.danso/telegram` when `DANSO_HOME` is unset), and reports

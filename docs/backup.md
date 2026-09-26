@@ -96,6 +96,14 @@ it first (`danso doctor` names both paths under `home.legacy_state`), then
 back up again. A backup carrying this category restores like any other; a
 `danso` older than the category refuses it as `invalid_backup`.
 
+The same omission is named where the operator is looking (#185): a
+successful `danso backup` prints one
+`backup warning: <old> is not in the snapshot; the service uses <new>`
+line per stranded tree on stderr — paths only, never contents. A node
+without the `DANSO_HOME` split prints nothing, a deliberately chosen root
+(`DANSO_TELEGRAM_DATA_DIR`, `DANSO_MEMORY_DIR`, `memory.dir`) is never
+compared, and the manifest, its schema, and the exit status are unchanged.
+
 The configured Telegram token file is never opened or copied. The
 `.telegram-token.lock` file and `data-dir/health.json` are also excluded:
 credentials must not enter a portable snapshot, and locks/health are runtime
