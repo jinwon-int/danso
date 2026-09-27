@@ -171,8 +171,10 @@ whether to take it is why `apply` is a separate command.
 The comparison is archive digest against archive digest. `installed-generation.json`
 records `artifact_sha256` for this — the binary's digest is not the archive's,
 and comparing those two would never match. A record written before that field
-existed reports exit 10 with `"result": "unknown"`, and the next `apply` fills
-it in.
+existed (or after `update rollback`, which does not know the previous archive)
+reports exit 11 with `"result": "unknown"` — deliberately neither `0` ("up to
+date") nor `10` ("a different release is available"), so a cron wrapper can
+tell "nothing to do" from "cannot tell" — and the next `apply` fills it in.
 
 ### What the transport is and is not
 

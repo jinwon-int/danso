@@ -31,7 +31,9 @@ pub enum UpdateCommand {
     /// Ask the configured release source what it offers for this target.
     ///
     /// Fetches the signed manifest and nothing else — no archive, no writes,
-    /// no lock. Exits 10 when a different release is available.
+    /// no lock. Exits 10 when a different release is available, 11 when the
+    /// installed generation does not record the archive it came from, and 2
+    /// when the manifest makes the choice ambiguous.
     Check {
         #[arg(long)]
         json: bool,
@@ -93,6 +95,19 @@ pub enum UpdateCommand {
 /// `1`, which `update status` already uses for an unresolved activation.
 pub const EXIT_UPDATE_AVAILABLE: i32 = 10;
 
+/// Exit code for "a release is offered, but the installed record does not say
+/// which archive it came from, so the two cannot be compared".
+///
+/// Its own code so a cron wrapper can tell the three facts apart without
+/// parsing output: `0` is "up to date", [`EXIT_UPDATE_AVAILABLE`] is "a
+/// different release is available", and this is "cannot tell". Deliberately
+/// neither of those two: `0` would read as "nothing to do" while the node may
+/// be serving something else, and `10` would make a wrapper that re-applies on
+/// `10` reinstall the release `update rollback` just rolled away from — the
+/// fail-open `check` exists to avoid. A record written before `apply` recorded
+/// the archive reads this way; the next `apply` fills the field in (#191).
+pub const EXIT_CANNOT_COMPARE: i32 = 11;
+
 /// What the release source offers, against what is installed.
 ///
 /// **This does not compare versions, and deliberately says nothing about
@@ -126,11 +141,12 @@ pub enum Available {
     /// Something is installed, but nothing recorded which archive it came
     /// from, so there is nothing to compare against.
     ///
-    /// **Exit 0, not 10.** Acting on "cannot tell" is the fail-open this
-    /// command exists to avoid: a wrapper that re-applies on 10 would, after
-    /// `update rollback` — which writes a record without these fields —
-    /// immediately reinstall the release the operator just rolled away from.
-    /// The next `apply` records the archive and the comparison starts working.
+    /// **Exit [`EXIT_CANNOT_COMPARE`], neither 0 nor 10.** Reporting 0 would
+    /// read as "up to date" to a cron wrapper while the node may be serving
+    /// something else; reporting 10 would make a wrapper that re-applies on
+    /// `10` immediately reinstall the release the operator just rolled away
+    /// from. The next `apply` records the archive and the comparison starts
+    /// working.
     Unknown {
         artifact: String,
         artifact_sha256: String,
@@ -159,7 +175,10 @@ impl Available {
             // artifact for this machine is a fact about the release.
             Available::NothingForThisTarget { .. } => 0,
             Available::NotInstalled { .. } => EXIT_UPDATE_AVAILABLE,
-            Available::Unknown { .. } => 0,
+            // #191: not 0 — a wrapper must not read "cannot tell" as "up to
+            // date" — and not 10 — a re-applying wrapper must not reinstall a
+            // rolled-away release.
+            Available::Unknown { .. } => EXIT_CANNOT_COMPARE,
             // Neither 0 nor 10: this is "cannot decide", and a cron wrapper
             // that branches on those two must not take either branch.
             Available::Ambiguous { .. } => 2,
