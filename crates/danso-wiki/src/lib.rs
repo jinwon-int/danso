@@ -8,12 +8,19 @@
 //! never touches the network. Termux is a supported host: no subprocesses, no
 //! Python, std fs only.
 
+pub mod abstention;
+pub mod alias;
+pub mod authority;
 pub mod cache;
 pub mod chunk;
+pub mod corpus;
+pub mod embedding;
+pub mod find;
 pub mod manifest;
 pub mod meta;
 mod preserve;
 pub mod status;
+pub mod text;
 
 /// The only index layout this build reads. Both spellings of the version must
 /// carry it — `meta.json` calls it `version`, `manifest.jsonl` calls it

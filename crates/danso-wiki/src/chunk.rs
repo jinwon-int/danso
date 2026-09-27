@@ -26,8 +26,11 @@ pub struct Chunk {
     pub heading_stack: Vec<String>,
     #[serde(default)]
     pub level: Option<u32>,
+    /// The writer emits this as a small integer (0–5 in the real index), not
+    /// the string the first draft assumed — a reader that only ever parsed
+    /// synthetic fixtures would fail-closed on every real chunk.
     #[serde(default)]
-    pub split: Option<String>,
+    pub split: Option<u32>,
     pub bytes: u64,
     pub mtime: f64,
     pub file_hash: String,
