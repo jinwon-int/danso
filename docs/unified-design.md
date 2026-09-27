@@ -101,6 +101,7 @@ flowchart TD
 | `danso-runtime` | `AgentEvent`, `AgentSession`, `TurnRunner`(인프로세스/서브프로세스), `ApprovalHandler` | 없음 |
 | `danso-telegram` | Bot API 클라이언트, 업데이트 루프, 렌더러, 명령, 승인, 대화 저장소, 하트비트, 스풀 | `reqwest` `multipart` feature (파일 전송) |
 | `danso-ops` | 설정, cron 스케줄러, doctor, audit, update, service, health, 사용량 미터 | `toml`, `ed25519-dalek`(업데이트 서명), `hmac` |
+| `danso-wiki` | wiki-agent 인덱스 **읽기 전용** 경로(`danso wiki {status,find,prefetch,load,sync}` — 빌드·write-path·네트워크 제외, `index.cache` 사전 파싱) | `bincode`(로컬 캐시 직렬화) |
 | `danso` (bin) | 서브커맨드 조합. `default-features = ["ops"]`, `telegram`은 opt-in | — |
 
 현재 단일 크레이트에서 분리하는 시점은 **3행 첫 PR 직전**(§9 A단계)이다.
