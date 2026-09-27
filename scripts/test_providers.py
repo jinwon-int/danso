@@ -346,6 +346,37 @@ class Providers(Fixture):
                 self.assertNotIn('"role":"assistant"', self.session.read_text())
                 self.assertEqual(len(self.requests), before_requests + 1)
 
+    def test_sse_stream_past_the_transfer_cap_still_completes(self):
+        """SSE framing multiplies transfer bytes (#180): one JSON frame per
+        delta means a turn inside the output-token contract can transfer
+        well past 1 MiB. The streamed turn must complete, not fail as
+        `response_too_large`."""
+        for provider in ('anthropic', 'glm'):
+            with self.subTest(provider=provider):
+                self.session = self.root / f'big-stream-{provider}.jsonl'
+                text = 'x' * 1_500_000
+                self.responses.append((200, response(provider, text=text, reasoning=False)))
+                p = self.run_cli(provider, '--no-tools', env=self.streaming_env(provider))
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertNotIn('DANSO_PROVIDER=', p.stderr)
+                deltas = [json.loads(line)['text'] for line in p.stdout.splitlines()
+                          if line.startswith('{"type":"danso_text_delta"')]
+                self.assertEqual(''.join(deltas), text)
+
+    def test_sse_stream_over_the_streaming_bound_fails_closed(self):
+        """Past the streaming transfer bound (#180) the turn still fails as
+        `response_too_large`, and the stderr diagnostic names our own
+        counters — the bound, accumulated bytes, frames — never the body."""
+        self.session = self.root / 'overbound-stream.jsonl'
+        self.responses.append((200, response('glm', text='x' * (17 * 1024 * 1024),
+                                             reasoning=False)))
+        p = self.run_cli('glm', '--no-tools', env=self.streaming_env('glm'))
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertIn('response_too_large', p.stderr)
+        self.assertIn('transfer bound', p.stderr)
+        self.assertIn('frames', p.stderr)
+        self.assertNotIn('xxxxx', p.stderr)
+
     def test_stream_wait_is_bound_to_one_request(self):
         """A signal for another request must not satisfy this one's wait.
 
