@@ -27,6 +27,21 @@ impl HttpDiagnostic {
         self.source = Some(error);
         anyhow::Error::new(self)
     }
+
+    /// Z.AI quota/subscription exhaustion, per the official error table
+    /// (docs.z.ai/api-reference/api-code): 1113 no resource package,
+    /// 1308 usage-limit window, 1309 expired plan, 1310 weekly/monthly
+    /// limit, 1311 plan lacks the model, 1313 fair-usage throttle,
+    /// 1314/1315 enterprise package/key mismatch, 1316..=1321 5-hour/7-day
+    /// windows. Each resets in hours or days — or needs account action —
+    /// so the bounded retry schedule (waits capped at 60 s) cannot
+    /// recover: the turn fails closed on the first response instead of
+    /// burning retries against the wall clock. Transient 429s (1302
+    /// request rate, 1305 overload) and 429s without an allowlisted code
+    /// keep the normal retry schedule.
+    pub fn quota_exhausted(&self) -> bool {
+        matches!(self.provider_code, Some(1113 | 1308..=1311 | 1313..=1321))
+    }
 }
 
 #[derive(Deserialize)]
@@ -125,6 +140,30 @@ mod tests {
         ] {
             h.insert(reqwest::header::RETRY_AFTER, s.parse().unwrap());
             assert_eq!(retry_after(&h), want);
+        }
+    }
+
+    #[test]
+    fn quota_exhaustion_covers_the_official_non_transient_429_family() {
+        let diagnostic = |provider_code: Option<u16>| HttpDiagnostic {
+            source: None,
+            version: 1,
+            provider: "zai",
+            http_status: 429,
+            provider_code,
+            retry_after_seconds: None,
+        };
+        // Official table: every 429 that resets in hours/days or needs
+        // account action.
+        for code in [
+            1113, 1308, 1309, 1310, 1311, 1313, 1314, 1315, 1316, 1319, 1321,
+        ] {
+            assert!(diagnostic(Some(code)).quota_exhausted(), "{code}");
+        }
+        // Transient 429s stay on the retry schedule; an unclassifiable
+        // body (code omitted) must not fail fast either.
+        for code in [None, Some(1302), Some(1305), Some(1214)] {
+            assert!(!diagnostic(code).quota_exhausted(), "{code:?}");
         }
     }
 }
