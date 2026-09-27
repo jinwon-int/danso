@@ -195,9 +195,18 @@ impl Http {
             if !response.status().is_success() {
                 let status = response.status();
                 let retry_after = retry_after_seconds(response.headers());
-                if attempt < attempts && retryable_status(status.as_u16()) {
+                // Z.AI only: classify the bounded error body before the
+                // retry decision — a quota/subscription 429 resets in
+                // hours or days, past anything the backoff schedule can
+                // wait out (#180 part 2).
+                let zai = if self.zai_diagnostics {
+                    Some(super::http_diagnostic::capture(response).await)
+                } else {
+                    None
+                };
+                let exhausted = zai.as_ref().is_some_and(|d| d.quota_exhausted());
+                if attempt < attempts && retryable_status(status.as_u16()) && !exhausted {
                     let delay = retry_delay(attempt, retry_after);
-                    drop(response);
                     let waited = Instant::now();
                     tokio::time::sleep(delay).await;
                     // Body-free timing (issue #98 e): the backoff actually slept.
@@ -207,12 +216,9 @@ impl Http {
                     continue;
                 }
                 let error = crate::failure::http_status_error(status);
-                return Err(if self.zai_diagnostics {
-                    super::http_diagnostic::capture(response)
-                        .await
-                        .with_source(error)
-                } else {
-                    error
+                return Err(match zai {
+                    Some(diagnostic) => diagnostic.with_source(error),
+                    None => error,
                 });
             }
             break response;
@@ -297,8 +303,16 @@ impl Http {
             if !response.status().is_success() {
                 let status = response.status();
                 let retry_after = retry_after_seconds(response.headers());
-                if attempt < attempts && retryable_status(status.as_u16()) {
-                    drop(response);
+                // Same quota fast-fail as the buffered path: a Z.AI
+                // exhaustion 429 will not recover within the schedule
+                // (#180 part 2).
+                let zai = if self.zai_diagnostics {
+                    Some(super::http_diagnostic::capture(response).await)
+                } else {
+                    None
+                };
+                let exhausted = zai.as_ref().is_some_and(|d| d.quota_exhausted());
+                if attempt < attempts && retryable_status(status.as_u16()) && !exhausted {
                     let waited = Instant::now();
                     tokio::time::sleep(retry_delay(attempt, retry_after)).await;
                     // Body-free timing (issue #98 e): the backoff actually slept.
@@ -308,12 +322,9 @@ impl Http {
                     continue;
                 }
                 let error = crate::failure::http_status_error(status);
-                return Err(if self.zai_diagnostics {
-                    super::http_diagnostic::capture(response)
-                        .await
-                        .with_source(error)
-                } else {
-                    error
+                return Err(match zai {
+                    Some(diagnostic) => diagnostic.with_source(error),
+                    None => error,
                 });
             }
             break response;
@@ -585,8 +596,11 @@ mod tests {
     }
 }
 
-/// Retryable provider statuses (issue #67 B): quota/rate limiting and the
-/// classic transient server errors. Other 4xx never retry.
+/// Retryable provider statuses (issue #67 B): rate limiting and the
+/// classic transient server errors. Other 4xx never retry. A Z.AI 429
+/// whose error body carries a quota/subscription code skips this
+/// schedule at the call site — the limit resets in hours, not seconds
+/// (#180 part 2).
 fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
@@ -766,5 +780,67 @@ mod retry_tests {
                 .is_err()
         );
         assert_eq!(usage.timing().retry_wait_ms, 0);
+    }
+
+    /// A quota/subscription 429 (official table: 1113, 1308..=1311,
+    /// 1313..=1321 — 1310 is the observed weekly/monthly exhaustion)
+    /// resets in hours or days, so the first response fails the turn and
+    /// the diagnostic keeps the provider code; the bounded retry schedule
+    /// must not spend its attempts against it (#180 part 2). The server
+    /// serves exactly one response — a retry would stall on accept and
+    /// surface a transport error, failing the diagnostic assertion.
+    #[tokio::test]
+    async fn quota_exhaustion_429_fails_closed_without_burning_retries() {
+        let (base, listener) = local_http();
+        let weekly = &b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 44\r\nConnection: close\r\n\r\n{\"error\":{\"code\":\"1310\",\"message\":\"SECRET\"}}"[..];
+        serve_sequence(listener, vec![weekly]);
+        let mut client = client(&base, 3);
+        client.enable_zai_diagnostics();
+        let mut usage = crate::usage::Usage::default();
+        let error = client
+            .post_bytes(
+                &serde_json::json!({"private":"PRIVATE_BODY_MARKER"}),
+                &mut usage,
+                reqwest::header::HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+        // No backoff wait was recorded: the schedule never ran.
+        assert_eq!(usage.timing().retry_wait_ms, 0);
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains("SECRET"), "{rendered}");
+        let diagnostic = error
+            .chain()
+            .find_map(|cause| {
+                cause
+                    .downcast_ref::<super::super::http_diagnostic::HttpDiagnostic>()
+                    .map(|d| (d.http_status, d.provider_code))
+            })
+            .expect("Z.AI diagnostic attached");
+        assert_eq!(diagnostic, (429, Some(1310)));
+    }
+
+    /// A transient 429 (1302 request-rate) keeps the normal schedule: the
+    /// second attempt succeeds, so the turn completes.
+    #[tokio::test]
+    async fn transient_rate_limit_429_still_retries_through_the_schedule() {
+        let (base, listener) = local_http();
+        let rate_limited = &b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 42\r\nConnection: close\r\n\r\n{\"error\":{\"code\":1302,\"message\":\"SECRET\"}}"[..];
+        let ok =
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}"[..];
+        serve_sequence(listener, vec![rate_limited, ok]);
+        let mut client = client(&base, 1);
+        client.enable_zai_diagnostics();
+        let mut usage = crate::usage::Usage::default();
+        let bytes = client
+            .post_bytes(
+                &serde_json::json!({"private":"PRIVATE_BODY_MARKER"}),
+                &mut usage,
+                reqwest::header::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"{\"ok\":true}".to_vec());
+        assert!(usage.timing().retry_wait_ms >= 1000);
     }
 }

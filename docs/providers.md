@@ -425,3 +425,15 @@ not the retry scheduler's capped delay. No prose, URL or credential is emitted.
 Retry counts, scheduling, journal transitions and replay policy are unchanged.
 Old consumers may ignore this optional record; update CCC before the native binary
 to display it. See https://docs.z.ai/api-reference/api-code for code meanings.
+
+Quota/subscription 429s fail closed on the first response (#180 part 2). The
+official table classifies 1113 (no resource package), 1308 (usage-limit
+window), 1309 (expired plan), 1310 (weekly/monthly limit), 1311 (plan lacks
+the model), 1313 (fair-usage throttle), 1314/1315 (enterprise package/key),
+and 1316..=1321 (5-hour/7-day windows) as limits that reset in hours or days
+— or need account action — so the bounded retry schedule (waits capped at
+60 s) cannot recover and the turn fails immediately with the usual records.
+Transient 429s (1302 request rate, 1305 overload) and 429s without an
+allowlisted code keep the normal retry schedule. `next_flush_time` appears
+only inside the provider's prose and is not parsed or emitted; consumers
+render the resume expectation from `provider_code` alone.

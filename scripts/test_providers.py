@@ -673,6 +673,39 @@ class Providers(Fixture):
                         'provider_code': expected, 'retry_after_seconds': 120})
                 self.assertIn('"http_status":429', p.stderr)
 
+    def test_zai_quota_exhaustion_429_fails_closed_without_retry_burn(self):
+        """Official Z.AI table (#180 part 2): a quota/subscription 429 —
+        1113, 1308..=1311, 1313..=1321, including the observed 1310
+        weekly/monthly exhaustion — resets in hours or days, so the bounded
+        retry schedule cannot recover. The first response fails the turn
+        with the diagnostic attached; transient 429s (1302) keep the
+        schedule."""
+        for code in ('1113', '1308', '1309', '1310', '1311', '1313', '1316', '1321'):
+            with self.subTest(code=code):
+                before = len(self.requests)
+                self.responses.append((429, {'error': {'code': code, 'message': 'SENSITIVE_BODY'}}))
+                p = self.run_cli('glm', '--provider-retries', '3')
+                self.assertEqual(p.returncode, 3, p.stderr)
+                self.assertNotIn('SENSITIVE_BODY', p.stderr)
+                self.assertEqual(len(self.requests), before + 1, code)
+                records = [json.loads(line.split('=', 1)[1]) for line in p.stderr.splitlines()
+                           if line.startswith('DANSO_HTTP=')]
+                self.assertEqual(records, [{'version': 1, 'provider': 'zai', 'http_status': 429,
+                                            'provider_code': int(code), 'retry_after_seconds': None}])
+        # The same exhaustion fast-fails on the SSE ingestion path.
+        before = len(self.requests)
+        self.responses.append((429, {'error': {'code': '1310', 'message': 'SENSITIVE_BODY'}}))
+        p = self.run_cli('glm', '--provider-retries', '3', env=self.streaming_env('glm'))
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertEqual(len(self.requests), before + 1)
+        # Transient rate limiting keeps the schedule: one retry, two requests.
+        self.retry_after = '1'
+        for _ in range(2):
+            self.responses.append((429, {'error': {'code': '1302', 'message': 'SENSITIVE_BODY'}}))
+        p = self.run_cli('glm', '--provider-retries', '1')
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertEqual(len(self.requests), before + 3)
+
     def test_glm_thinking_toggle_length_diagnosis_and_endpoint_conflicts(self):
         # Default body keeps thinking enabled (issue #70 A).
         self.responses.append((200, response('glm')))
