@@ -150,7 +150,10 @@ model. Extra arguments are forwarded, so a later `--model` in argv wins.
   arithmetic are checked; overflow fails without changing the last valid summary. Cost remains unknown (zero
   solely for Piri schema compatibility).
 - The serialized request is hard-capped at the selected provider/model budget
-  above, responses remain capped at 1 MiB, and HTTP transport is 180s by
+  above, buffered responses remain capped at 1 MiB, SSE ingestion is bounded
+  to a 16 MiB transfer sanity cap (SSE framing multiplies the same decoded
+  output, so the transfer bound is separate from the token contract), and
+  HTTP transport is 180s by
   default. With no override, [context compaction](compaction.md) starts at the
   derived threshold and preserves the journal while starting a fresh provider
   reasoning context. The CLI run/turn/tool limits still apply.
@@ -282,7 +285,8 @@ loopback override authorizes the local fixture to receive credentials/content.
 Never use a real login in fixture tests. Ordinary `OPENAI_API_KEY` and
 `DANSO_OPENAI_BASE_URL` are ignored for this adapter.
 
-Bytes through the terminal event are bounded to 1 MiB and the normal provider
+Bytes through the terminal event are bounded by the SSE transfer cap (16 MiB)
+and the normal provider
 timeout. The first validated `response.completed` or `response.done` response
 ends the request, without waiting for the SSE connection to close. Failed,
 incomplete, truncated or unknown events before completion fail before any

@@ -3,6 +3,29 @@ use anyhow::{Result, ensure};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
+/// Transfer bound for streaming responses. SSE frames one JSON event per
+/// delta, so the same decoded output (`max_output_tokens`-bounded content
+/// plus reasoning deltas) transfers several times its plain bytes and a
+/// 1 MiB transfer cap trips inside the token budget (#180). Worst case is
+/// 16384 output tokens at roughly 250 bytes of framing per delta — about
+/// 4 MiB — so 16 MiB keeps several times that headroom while still
+/// bounding a runaway stream. This is a transfer sanity check, not an
+/// output measure: decoded output stays bounded by the adapters' token
+/// contract.
+const SSE_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The streaming transfer bound tripped (#180): the diagnostic carries only
+/// our own counters — accumulated bytes and delivered frames — never
+/// provider text.
+fn sse_cap_error(received: usize, frames: usize) -> anyhow::Error {
+    crate::failure::provider_error(crate::failure::ProviderReason::ResponseTooLarge).context(
+        format!(
+            "stream exceeded the {} MiB transfer bound at {received} bytes across {frames} frames",
+            SSE_MAX_RESPONSE_BYTES / (1024 * 1024)
+        ),
+    )
+}
+
 pub struct Http {
     client: reqwest::Client,
     url: reqwest::Url,
@@ -332,22 +355,38 @@ impl Http {
 
         let mut pending = Vec::new();
         let mut received = 0usize;
+        let mut frames = 0usize;
+        // Prefix length of `pending` already proven free of a frame
+        // terminator. Rescanning the whole buffer per chunk is quadratic in
+        // the stream size, and a single unsplittable frame can be megabytes
+        // (#180), so each chunk resumes the scan at most one terminator
+        // length (4 bytes: "\r\n\r\n") into the scanned prefix.
+        let mut scanned = 0usize;
         while let Some(chunk) = response.chunk().await.map_err(|error| {
             transport_error(&error, "response_body", started, request_bytes, attempt)
         })? {
-            received = received.checked_add(chunk.len()).ok_or_else(|| {
-                crate::failure::provider_error(crate::failure::ProviderReason::ResponseTooLarge)
-            })?;
-            if received > 1024 * 1024 {
-                return Err(crate::failure::provider_error(
-                    crate::failure::ProviderReason::ResponseTooLarge,
-                ));
+            received = received
+                .checked_add(chunk.len())
+                .ok_or_else(|| sse_cap_error(received, frames))?;
+            if received > SSE_MAX_RESPONSE_BYTES {
+                return Err(sse_cap_error(received, frames));
             }
             pending.extend_from_slice(&chunk);
-            while let Some(end) = sse_frame_end(&pending) {
-                let frame: Vec<u8> = pending.drain(..end).collect();
-                if event(&frame)? {
-                    return Ok(());
+            loop {
+                let from = scanned.saturating_sub(3);
+                match sse_frame_end(&pending[from..]) {
+                    Some(end) => {
+                        let frame: Vec<u8> = pending.drain(..from + end).collect();
+                        scanned = scanned.saturating_sub(from + end);
+                        frames += 1;
+                        if event(&frame)? {
+                            return Ok(());
+                        }
+                    }
+                    None => {
+                        scanned = pending.len();
+                        break;
+                    }
                 }
             }
         }
@@ -842,5 +881,251 @@ mod retry_tests {
             .unwrap();
         assert_eq!(bytes, b"{\"ok\":true}".to_vec());
         assert!(usage.timing().retry_wait_ms >= 1000);
+    }
+}
+
+#[cfg(test)]
+mod sse_bound_tests {
+    use super::*;
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    /// One SSE response with an exact `body`, byte-served from a throwaway
+    /// listener so a test can size the transfer precisely.
+    fn serve_sse(body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut request = vec![0; length];
+            reader.read_exact(&mut request).unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).unwrap();
+            socket.write_all(&body).unwrap();
+            socket.flush().unwrap();
+        });
+        base
+    }
+
+    /// One SSE response whose `body` is served as separately written
+    /// `parts`, so a frame terminator can straddle a transport chunk
+    /// boundary whatever the socket does with the writes.
+    fn serve_sse_split(parts: Vec<Vec<u8>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut request = vec![0; length];
+            reader.read_exact(&mut request).unwrap();
+            let total: usize = parts.iter().map(|part| part.len()).sum();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                total
+            );
+            socket.write_all(head.as_bytes()).unwrap();
+            for part in parts {
+                socket.write_all(&part).unwrap();
+                socket.flush().unwrap();
+                // Let the writes land in separate reads so the frame scan
+                // really has to resume mid-terminator.
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        base
+    }
+
+    fn sse_client(base: &str) -> Http {
+        Http::with_timeouts_with_budget(
+            base,
+            "test",
+            reqwest::header::AUTHORIZATION,
+            "Bearer PRIVATE_KEY_MARKER",
+            "PRIVATE_KEY_MARKER",
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            crate::provider::DEFAULT_REQUEST_BUDGET_BYTES,
+        )
+        .unwrap()
+    }
+
+    /// One exact 200-byte `data:` frame, the shape SSE framing gives every
+    /// delta: envelope plus a small payload.
+    fn frame(index: usize) -> Vec<u8> {
+        format!("data: {:0192}\n\n", index).into_bytes()
+    }
+
+    /// SSE framing multiplies the same decoded output (#180): a stream that
+    /// transfers well past the old 1 MiB cap — still far inside the
+    /// `max_output_tokens` contract — delivers every frame and completes.
+    /// The frames are opaque to the transport: the closure is the decoder.
+    #[tokio::test]
+    async fn stream_past_the_old_transfer_cap_delivers_every_frame() {
+        let deltas = 9_000usize;
+        let mut body = Vec::new();
+        for index in 0..deltas {
+            body.extend_from_slice(&frame(index));
+        }
+        body.extend_from_slice(b"data: done\n\n");
+        assert!(body.len() > 1024 * 1024, "test must cross the old cap");
+        let base = serve_sse(body);
+        let client = sse_client(&base);
+        let mut usage = crate::usage::Usage::default();
+        let mut delivered = 0usize;
+        let mut transferred = 0usize;
+        client
+            .post_sse(
+                &serde_json::json!({"private": "PRIVATE_BODY_MARKER"}),
+                &mut usage,
+                reqwest::header::HeaderMap::new(),
+                |frame| {
+                    transferred += frame.len();
+                    delivered += 1;
+                    Ok(frame == b"data: done\n\n")
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(delivered, deltas + 1, "every frame reaches the decoder");
+        assert!(
+            transferred > 1024 * 1024,
+            "decoded transfer past the old cap"
+        );
+    }
+
+    /// A transfer past the streaming bound still fails closed as
+    /// `response_too_large`, and the diagnostic names our own counters —
+    /// bytes and frames — without copying provider bytes.
+    #[tokio::test]
+    async fn stream_over_the_streaming_bound_fails_with_counter_diagnostic() {
+        let frame_size = 100_000usize;
+        let frame_count = 200; // 20 MiB total: past the 16 MiB bound.
+        let mut body = Vec::with_capacity(frame_size * frame_count);
+        for _ in 0..frame_count {
+            let payload = "x".repeat(frame_size - "data: \n\n".len());
+            body.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
+        }
+        let base = serve_sse(body);
+        let client = sse_client(&base);
+        let mut usage = crate::usage::Usage::default();
+        let error = client
+            .post_sse(
+                &serde_json::json!({"private": "PRIVATE_BODY_MARKER"}),
+                &mut usage,
+                reqwest::header::HeaderMap::new(),
+                |_frame| Ok(false),
+            )
+            .await
+            .unwrap_err();
+        let diagnostic = crate::failure::provider(&error).expect("provider diagnostic");
+        assert_eq!(
+            diagnostic.reason(),
+            crate::failure::ProviderReason::ResponseTooLarge
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("16 MiB transfer bound"), "{rendered}");
+        assert!(rendered.contains("bytes across"), "{rendered}");
+        assert!(rendered.contains("frames"), "{rendered}");
+        assert!(!rendered.contains("PRIVATE"), "{rendered}");
+    }
+
+    /// Frame terminators split across transport chunks must still yield
+    /// exactly one delivery per frame (#180 ingestion): the frame scan
+    /// resumes a few bytes into the already-scanned prefix, so a "\r\n\r\n"
+    /// straddling two reads is found once, not missed or duplicated.
+    #[tokio::test]
+    async fn frames_split_across_chunk_boundaries_deliver_exactly_once() {
+        let base = serve_sse_split(vec![
+            b"data: one\n\ndata: tw".to_vec(),
+            b"o\n\ndata: done\n\n".to_vec(),
+        ]);
+        let client = sse_client(&base);
+        let mut usage = crate::usage::Usage::default();
+        let mut frames = Vec::new();
+        client
+            .post_sse(
+                &serde_json::json!({"private": "PRIVATE_BODY_MARKER"}),
+                &mut usage,
+                reqwest::header::HeaderMap::new(),
+                |frame| {
+                    frames.push(frame.to_vec());
+                    Ok(frame == b"data: done\n\n")
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            frames,
+            vec![
+                b"data: one\n\n".to_vec(),
+                b"data: two\n\n".to_vec(),
+                b"data: done\n\n".to_vec(),
+            ]
+        );
+    }
+
+    /// The longest terminator ("\r\n\r\n", 4 bytes) split one byte past the
+    /// scan resume point must still be found: the resume keeps back exactly
+    /// the longest-terminator-minus-one bytes.
+    #[tokio::test]
+    async fn crlf_crlf_terminator_straddling_two_reads_is_found() {
+        let base = serve_sse_split(vec![
+            b"data: x\r\n\r".to_vec(),
+            b"\ndata: done\n\n".to_vec(),
+        ]);
+        let client = sse_client(&base);
+        let mut usage = crate::usage::Usage::default();
+        let mut frames = Vec::new();
+        client
+            .post_sse(
+                &serde_json::json!({"private": "PRIVATE_BODY_MARKER"}),
+                &mut usage,
+                reqwest::header::HeaderMap::new(),
+                |frame| {
+                    frames.push(frame.to_vec());
+                    Ok(frame == b"data: done\n\n")
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            frames,
+            vec![b"data: x\r\n\r\n".to_vec(), b"data: done\n\n".to_vec()]
+        );
     }
 }
