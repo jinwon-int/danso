@@ -290,6 +290,45 @@ pub fn run_backup() -> Result<PathBuf, CommandError> {
     )
 }
 
+/// The `backup warning:` lines for the pre-#136 roots this process
+/// resolves: one per stranded root, paths only, never contents (#185).
+/// `main` prints them on stderr after a successful `run_backup`, so the
+/// omission the manifest records as `legacy_state` (#177) is visible
+/// without opening the archive.  A node without a `DANSO_HOME` split
+/// resolves no roots and prints nothing; a deliberately chosen root
+/// (`DANSO_TELEGRAM_DATA_DIR`, `DANSO_MEMORY_DIR`, `memory.dir`) is never
+/// compared, exactly as in the manifest.
+pub fn legacy_stderr_warnings() -> Vec<String> {
+    let Ok(home) = config::home() else {
+        return Vec::new();
+    };
+    let legacy_home = config::legacy_home();
+    let telegram_data_dir = telegram::data_dir_from_env().ok();
+    let memory_dir = config::Config::load(&home.join(config::FILE_NAME))
+        .ok()
+        .and_then(|parsed| parsed.memory.dir);
+    let memory_root = memory::MemoryConfig::root_under(&home, memory_dir);
+    config::legacy_roots(
+        &home,
+        legacy_home.as_deref(),
+        telegram_data_dir.as_deref(),
+        &memory_root,
+    )
+    .iter()
+    .map(stderr_line)
+    .collect()
+}
+
+/// One warning line for one stranded root: the old tree, then the root the
+/// service actually reads.  Paths only — no counts, no contents (#185).
+fn stderr_line(root: &config::LegacyRoot) -> String {
+    format!(
+        "backup warning: {} is not in the snapshot; the service uses {}",
+        root.legacy.display(),
+        root.current.display()
+    )
+}
+
 /// Run `danso restore` after resolving relative CLI paths against the current
 /// directory.  A missing backup path is a usage/cannot-run condition, while a
 /// malformed existing backup is a normal restore failure.
@@ -1750,5 +1789,23 @@ mod tests {
             serde_json::from_slice(&fs::read(backup.join(MANIFEST_FILE_NAME)).expect("manifest"))
                 .expect("json");
         assert_eq!(manifest["components"][2]["warnings"], serde_json::json!([]));
+    }
+
+    /// The stderr line (#185) names both trees and nothing else: paths
+    /// only, no counts or contents, one line per stranded root.
+    #[test]
+    fn stderr_line_names_both_roots_and_nothing_else() {
+        let root = config::LegacyRoot {
+            name: "telegram",
+            legacy: std::path::PathBuf::from("/old-home/.danso/telegram"),
+            current: std::path::PathBuf::from("/new-home/telegram"),
+            current_populated: true,
+        };
+        assert_eq!(
+            stderr_line(&root),
+            "backup warning: /old-home/.danso/telegram is not in the snapshot; \
+             the service uses /new-home/telegram"
+        );
+        assert_eq!(stderr_line(&root).lines().count(), 1, "one line only");
     }
 }
