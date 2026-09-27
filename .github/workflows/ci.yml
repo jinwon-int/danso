@@ -51,6 +51,11 @@ jobs:
           # `ops` gate builds fine by default and breaks only this. Measured —
           # that is exactly how it broke once.
           cargo +1.98.1 check --locked --no-default-features
+          # `wiki` is default-off (issue #121): neither the default build nor
+          # the CLI-only build compiles its wiring, so without this gate a
+          # `crate::` path under the feature breaks only for nodes that ask
+          # for it.
+          cargo +1.98.1 check --locked --features wiki
       - name: Type-check for Android (Termux is a supported host, #157)
         # `check`, not `build`: no device runs here, but the libc surface
         # differs (renameat2 flags are u32 on android, c_int on linux) and a

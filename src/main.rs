@@ -60,6 +60,22 @@ fn main() {
             }
         }
     }
+    // `wiki` is the read-only wiki-agent index surface (§3.1, issue #121).
+    // Like doctor it stays ahead of config and async runtime setup:
+    // reporting an index must not build one, sync one, or touch a network.
+    #[cfg(feature = "wiki")]
+    if std::env::args().nth(1).as_deref() == Some("wiki") {
+        use danso::wiki::WikiArgs;
+        let args = match WikiArgs::try_parse_from(std::env::args_os().skip(1)) {
+            Ok(args) => args,
+            Err(error) => {
+                let code = error.exit_code();
+                error.print().ok();
+                std::process::exit(code);
+            }
+        };
+        std::process::exit(danso::wiki::run(args));
+    }
     // `cron` is the read-only scheduler surface (§6.5): list/describe/due
     // only. Like doctor and service it stays ahead of config and async
     // runtime setup — inspecting the store must not create state or touch a

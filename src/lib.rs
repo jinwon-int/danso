@@ -33,3 +33,8 @@ pub mod tools;
 #[cfg(feature = "ops")]
 pub mod update;
 pub mod usage;
+/// The read-only wiki-agent index surface (`danso wiki status`, §3.1
+/// `danso-wiki`, issue #121). Gated on `wiki`: the feature is opt-in, and a
+/// build without it neither compiles the wiring nor carries the reader.
+#[cfg(feature = "wiki")]
+pub mod wiki;

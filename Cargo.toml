@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/danso-ops", "crates/danso-runtime"]
+members = [".", "crates/danso-ops", "crates/danso-runtime", "crates/danso-wiki"]
 
 [package]
 name = "danso"
@@ -20,6 +20,10 @@ default = ["ops"]
 # worse than carrying a small, dependency-light crate in a CLI-only build.
 ops = []
 telegram = []
+# `wiki` gates the `danso wiki` CLI surface (issue #121). The reader crate is
+# an optional dependency: a build without the feature neither compiles the
+# wiring nor carries bincode, and a CLI-only build stays wiki-free.
+wiki = ["dep:danso-wiki"]
 
 [dependencies]
 anyhow = "1"
@@ -29,6 +33,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # system tzdata, so Termux nodes resolve the same IANA names identically.
 chrono-tz = "0.10"
 danso-ops = { path = "crates/danso-ops" }
+danso-wiki = { path = "crates/danso-wiki", optional = true }
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 libc = "0.2"
