@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex};
 const FIXTURE_KEY: &str = "RWRDmslv0TCmdcfE0s2lpt3hpMuvKCA0wKzLgDP7W81iToI0T/bZXQC7";
 /// `docs/unified-design.md` §6.3.
 const EXIT_UPDATE_AVAILABLE: i32 = 10;
+/// #191 — a record without archive provenance is "cannot tell", its own code.
+const EXIT_CANNOT_COMPARE: i32 = 11;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/release")
@@ -415,8 +417,10 @@ fn two_signed_artifacts_for_one_target_are_not_chosen_between() {
 #[test]
 fn a_record_that_does_not_name_its_archive_is_not_an_update() {
     // `update rollback` writes exactly this record. Reporting it as "update
-    // available" would make a cron wrapper reinstall the release the operator
-    // had just rolled away from.
+    // available" (10) would make a cron wrapper reinstall the release the
+    // operator had just rolled away from, and reporting it as "up to date" (0)
+    // would hide that the node may be serving something else (#191). The
+    // third fact gets its own code: 11, EXIT_CANNOT_COMPARE.
     let temp = tempfile::tempdir().expect("temp");
     let home = temp.path().join("home");
     let dir = release_copy(temp.path());
@@ -444,8 +448,9 @@ fn a_record_that_does_not_name_its_archive_is_not_an_update() {
     let output = check(&home);
     assert_eq!(
         code(&output),
-        0,
-        "acting on 'cannot tell' is the fail-open this command avoids; stderr: {}",
+        EXIT_CANNOT_COMPARE,
+        "cannot-compare is neither 0 ('up to date') nor 10 ('update \
+         available'); stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(report(&output)["result"], "unknown");
