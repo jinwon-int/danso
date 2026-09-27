@@ -19,7 +19,9 @@ use crate::meta::IndexMeta;
 
 /// Bump when the cached representation changes shape. Old caches with a
 /// different `format` are stale by definition and rebuilt, not decoded.
-pub const CACHE_FORMAT: u32 = 1;
+/// 2: `Chunk.split` corrected from a string to the integer the real writer
+/// emits (#121 slice 2) — the field is part of the bincode layout.
+pub const CACHE_FORMAT: u32 = 2;
 
 const CACHE_FILE_NAME: &str = "index.cache";
 
@@ -148,23 +150,19 @@ fn file_size(path: &Path) -> Result<u64> {
     Ok(metadata.len())
 }
 
-/// Create `dir` as 0700, or accept it only if it already is 0700. Never
-/// widens permissions: the query cache holds wiki content and belongs to the
-/// operator.
+/// Create `dir` as 0700 when absent. An existing directory is accepted at
+/// its operator-managed mode: the query cache lives inside the bash-managed
+/// `wiki-cache` tree (shared with `pages/`, `aliases.md`), and the bash sync
+/// keeps that directory at the umask default — refusing it would fail-closed
+/// every query on a real node (#121 slice-2 smoke). The privacy invariant
+/// this crate owns is the 0600 cache *file* that holds the parsed index; a
+/// directory this crate creates is still restricted to 0700.
 fn ensure_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(dir) {
         Ok(metadata) => {
             if !metadata.is_dir() {
                 anyhow::bail!("{} exists and is not a directory", dir.display());
-            }
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode != 0o700 {
-                anyhow::bail!(
-                    "{} exists with mode {:o}; the query cache needs 0700",
-                    dir.display(),
-                    mode
-                );
             }
             Ok(())
         }

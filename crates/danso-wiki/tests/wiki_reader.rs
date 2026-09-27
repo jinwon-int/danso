@@ -36,9 +36,9 @@ fn write_index(dir: &Path, meta_version: u32, manifest_version: u32) {
     std::fs::write(
         dir.join("chunks.jsonl"),
         concat!(
-            r#"{"id":"a-0","path":"pages/a.md","startLine":1,"endLine":10,"heading":"A","headingStack":["A"],"level":1,"split":"heading","bytes":100,"mtime":1758900000.0,"fileHash":"hash-a","snippet":"alpha","terms":{"alpha":1.5},"vector":{"11":0.25},"denseVector":[0.5,0.25],"denseBackend":"jina-api","denseModel":"jina-embeddings-v4","denseDims":2,"denseTask":"retrieval.passage","denseInputRole":"document","unknownChunkKey":[1,2]}"#,
+            r#"{"id":"a-0","path":"pages/a.md","startLine":1,"endLine":10,"heading":"A","headingStack":["A"],"level":1,"split":0,"bytes":100,"mtime":1758900000.0,"fileHash":"hash-a","snippet":"alpha","terms":{"alpha":1.5},"vector":{"11":0.25},"denseVector":[0.5,0.25],"denseBackend":"jina-api","denseModel":"jina-embeddings-v4","denseDims":2,"denseTask":"retrieval.passage","denseInputRole":"document","unknownChunkKey":[1,2]}"#,
             "\n",
-            r#"{"id":"b-0","path":"pages/b.md","startLine":5,"endLine":6,"heading":"B","headingStack":["B"],"level":1,"split":"heading","bytes":200,"mtime":1758900001.0,"fileHash":"hash-b","snippet":"beta","terms":{"beta":0.5},"vector":{}}"#,
+            r#"{"id":"b-0","path":"pages/b.md","startLine":5,"endLine":6,"heading":"B","headingStack":["B"],"level":1,"split":1,"bytes":200,"mtime":1758900001.0,"fileHash":"hash-b","snippet":"beta","terms":{"beta":0.5},"vector":{}}"#,
             "\n"
         ),
     )
@@ -109,6 +109,10 @@ fn chunks_parse_and_keep_unknown_keys() {
     // The real file is ~143 MB of these; the reader must skip nothing and
     // invent nothing — blank lines included.
     assert_eq!(chunks[0].terms.get("alpha"), Some(&1.5));
+    // The writer emits `split` as a small integer (0–5 in the real index);
+    // the reader keeps it verbatim.
+    assert_eq!(chunks[0].split, Some(0));
+    assert_eq!(chunks[1].split, Some(1));
 }
 
 #[test]
@@ -158,6 +162,27 @@ fn a_cache_built_from_other_sources_is_stale_not_fresh() {
         }
         other => panic!("expected stale, got {other:?}"),
     }
+}
+
+#[test]
+fn a_bash_managed_cache_dir_mode_is_accepted_and_the_file_stays_0600() {
+    let temp = tempfile::tempdir().expect("temp");
+    let index = temp.path().join("index");
+    let cache_dir = temp.path().join("cache");
+    write_index(&index, 3, 3);
+    // The real wiki-cache tree is bash-managed and sits at the sync's umask
+    // default; the reader must still be able to add its cache there.
+    std::fs::create_dir_all(&cache_dir).expect("cache dir");
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("loosen dir");
+
+    cache::build(&index, &cache_dir).expect("build into an operator-managed dir");
+    let mode = std::fs::metadata(cache::cache_path(&cache_dir))
+        .expect("cache file")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "the file is the privacy boundary: owner-only");
 }
 
 #[test]
