@@ -291,7 +291,9 @@ impl Candidate {
             "startLine": self.start_line,
             "endLine": self.end_line,
             "snippet": text::redact(&self.snippet),
-            "score": self.score,
+            // The bash payload rounds emitted scores to 6 decimals; ranking
+            // above already happened at full precision.
+            "score": round6(self.score),
             "explain": Value::Object(self.explain.clone()),
             "loadCommand": format!(
                 "wiki-agent load --lines {}:{} {}",
@@ -364,8 +366,9 @@ fn path_allowed(path: &str, include: &[Regex], exclude: &[Regex]) -> bool {
 }
 
 /// `str.splitlines()` — python splits on more boundaries than `\n`, and a
-/// trailing boundary does not produce a final empty line.
-fn py_splitlines(raw: &str) -> Vec<&str> {
+/// trailing boundary does not produce a final empty line. Shared with the
+/// `load --id` resolver, which walks files the same way the bash python did.
+pub(crate) fn py_splitlines(raw: &str) -> Vec<&str> {
     let mut lines = Vec::new();
     let mut start = 0;
     let mut iterator = raw.char_indices();
@@ -501,7 +504,7 @@ fn text_matches(
     deduped
 }
 
-fn collect_markdown(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+pub(crate) fn collect_markdown(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -536,12 +539,22 @@ pub fn run(options: &FindOptions) -> i32 {
 /// One rendered find report: the machine-readable payload plus the
 /// text-fallback matches the text renderer needs. Split from the printing so
 /// the contract tests can assert on the report instead of scraping stdout.
-struct Found {
+/// `prefetch` reuses the same pass in-process (the bash original calls
+/// `cmd_find` as a shell function) and reads `payload()` — a subprocess would
+/// re-parse the 143 MB JSONL for nothing.
+pub struct Found {
     payload: Value,
     text_matches: Vec<TextMatch>,
 }
 
-fn report(options: &FindOptions) -> Result<Found> {
+impl Found {
+    /// The `wiki-agent-find-v1` payload exactly as `--json` prints it.
+    pub fn payload(&self) -> &Value {
+        &self.payload
+    }
+}
+
+pub fn report(options: &FindOptions) -> Result<Found> {
     let started = std::time::Instant::now();
     let settings = Settings::resolve(options)?;
 
