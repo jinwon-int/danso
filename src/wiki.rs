@@ -1,7 +1,7 @@
 //! `danso wiki` — the read-only wiki-agent index surface (§3.1 `danso-wiki`,
-//! issue #121). Slice 1 carried `status`; slice 2 adds `find`, the practical
-//! discovery pass. `prefetch`/`load`/`sync` land behind the same gate in
-//! later slices.
+//! issue #121). Slice 1 carried `status`; slice 2 added `find`; slice 3 adds
+//! `load` and `prefetch`, the read/verify half of the bash tool. `sync`
+//! lands behind the same gate in a later slice.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -77,6 +77,59 @@ pub enum WikiCommand {
         /// Include pages/runbooks/**.
         #[arg(long)]
         runbook: bool,
+    },
+    /// Read the synced Wiki cache: full files, `--lines START:END` ranges,
+    /// or `--id` anchor sections (TM-509, DOC-110, LOG-…). Read-only: it
+    /// never syncs — a page that drifted from the indexed snapshot earns a
+    /// staleness warning, and the real sync is a later slice.
+    Load {
+        /// Directory holding meta.json / manifest.jsonl / chunks.jsonl (the
+        /// staleness warning compares loaded pages against the manifest).
+        #[arg(long, value_name = "DIR")]
+        index_dir: PathBuf,
+        /// Synced wiki cache directory holding pages/ and friends.
+        #[arg(long, value_name = "DIR")]
+        cache_dir: PathBuf,
+        /// 1-indexed inclusive line range; `START:END` (`--lines 5` means
+        /// `5:5`, the bash parameter-expansion default).
+        #[arg(long, value_name = "START:END")]
+        lines: Option<String>,
+        /// Section anchor to resolve against the canonical cache.
+        #[arg(long, value_name = "ANCHOR")]
+        id: Option<String>,
+        /// Cache-relative paths to read, in order.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
+    },
+    /// Budget-capped Wiki context prefetch for agent runtimes: one find
+    /// pass, at most 3 snippet candidates inside a hard character budget.
+    /// Fail-open — retrieval failures still print a payload and exit 0.
+    Prefetch {
+        /// Directory holding meta.json / manifest.jsonl / chunks.jsonl.
+        #[arg(long, value_name = "DIR")]
+        index_dir: PathBuf,
+        /// Node-local cache directory holding (or destined for) index.cache.
+        #[arg(long, value_name = "DIR")]
+        cache_dir: PathBuf,
+        /// Emit the machine-readable wiki-agent-prefetch-v1 payload instead
+        /// of the text rendering.
+        #[arg(long)]
+        json: bool,
+        /// Max snippets (digits; clamped to 3, the bash default).
+        #[arg(long, value_name = "N", default_value = "3")]
+        top: String,
+        /// Hard snippet budget in characters (digits; default 3200).
+        #[arg(long, value_name = "N", default_value = "3200")]
+        budget_chars: String,
+        /// Suppress low-confidence semantic and text candidates.
+        #[arg(long)]
+        abstention: bool,
+        /// Keep candidates regardless of calibrated confidence.
+        #[arg(long, overrides_with = "abstention")]
+        no_abstention: bool,
+        /// The query words; `--` ends option parsing.
+        #[arg(value_name = "WORDS")]
+        query: Vec<String>,
     },
 }
 
@@ -159,5 +212,69 @@ pub fn run(args: WikiArgs) -> i32 {
             };
             danso_wiki::find::run(&options)
         }
+        WikiCommand::Load {
+            index_dir,
+            cache_dir,
+            lines,
+            id,
+            paths,
+        } => danso_wiki::load::run(&danso_wiki::load::LoadOptions {
+            index_dir,
+            cache_dir,
+            lines,
+            id,
+            paths,
+        }),
+        WikiCommand::Prefetch {
+            index_dir,
+            cache_dir,
+            json,
+            top,
+            budget_chars,
+            abstention,
+            no_abstention,
+            query,
+        } => {
+            if query.is_empty() {
+                eprintln!("wiki-agent: prefetch requires a query");
+                return 64;
+            }
+            let Some(top) = parse_digit_option(&top) else {
+                eprintln!("wiki-agent: --top requires a positive integer");
+                return 64;
+            };
+            let Some(budget) = parse_digit_option(&budget_chars) else {
+                eprintln!("wiki-agent: --budget-chars requires a positive integer");
+                return 64;
+            };
+            // The last flag on the command line wins, matching the bash
+            // parser; neither flag given means the env/default decides.
+            let abstention = if abstention {
+                Some(true)
+            } else if no_abstention {
+                Some(false)
+            } else {
+                None
+            };
+            danso_wiki::prefetch::run(&danso_wiki::prefetch::PrefetchOptions {
+                query: query.join(" "),
+                index_dir,
+                cache_dir,
+                json,
+                top: top as usize,
+                budget_chars: budget as usize,
+                abstention,
+            })
+        }
     }
+}
+
+/// The bash digit-string check for `--top`/`--budget-chars`: empty or
+/// non-digit input is the usage exit 64. `0` is a valid digit string — the
+/// prefetch clamps it, exactly like the bash `max(1, min(3, top))`.
+fn parse_digit_option(raw: &str) -> Option<u64> {
+    if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse::<u64>().ok()
 }
