@@ -14,6 +14,9 @@ on:
   schedule:
     # New advisories land without a commit, so audit on a fixed weekly cadence.
     - cron: "0 3 * * 1"
+# Read-only on every trigger. The gate is this job's exit status, not an
+# issue or a check run it would need write access to create; a failed
+# scheduled run is the notification.
 permissions:
   contents: read
 jobs:
@@ -22,10 +25,34 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # Informational advisories (unmaintained/unsound) are gate failures,
-          # not notices: an unmaintained parser reached by untrusted skill
-          # frontmatter is exactly the case this gate exists to catch.
-          denyWarnings: true
+      # cargo-audit directly, not rustsec/audit-check: that action has no
+      # deny-warnings input (the `denyWarnings: true` passed here was dropped
+      # with an "Unexpected input" warning), never fails on an informational
+      # advisory, and reports by creating a check run (push) or an issue
+      # (schedule) -- which `contents: read` forbids, so push and scheduled
+      # runs failed on a permission error instead of on the advisory.
+      - name: Audit Cargo.lock (warnings are failures)
+        run: |
+          set -euo pipefail
+          # The ubuntu runner image ships cargo-audit; install a pinned
+          # release only if an image ever drops it.
+          if ! cargo audit --version >/dev/null 2>&1; then
+            cargo install --locked cargo-audit --version 0.22.2
+          fi
+          cargo audit --version
+          # Informational advisories (unmaintained/unsound/yanked) are gate
+          # failures, not notices: an unmaintained parser reached by untrusted
+          # skill frontmatter is exactly the case this gate exists to catch.
+          #
+          # Ignored advisories, each with its reason and revisit condition:
+          # - RUSTSEC-2025-0141: bincode 1.3.3 is unmaintained. Informational
+          #   only -- no vulnerability, no patched release; upstream declared
+          #   1.3.3 complete and ceased development. Pulled in directly by
+          #   crates/danso-wiki (default-off `wiki` feature) to encode/decode
+          #   danso's own owner-only (0600) index.cache, i.e. bytes danso wrote
+          #   itself, not untrusted input. Revisit when the danso-wiki cache
+          #   format next changes (move to a maintained format such as
+          #   postcard or bitcode and drop this ignore), or immediately if any
+          #   bincode advisory is not informational.
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2025-0141
