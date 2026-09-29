@@ -110,8 +110,8 @@ Waiter abort must never authorize retry or discard an unresolved owner.
    switch/overflow/cancel/retry/crash/cleanup/replay/compaction tests against the
    intended checkout before separately authorized activation. No live calls here.
 7. Review dependency source/license/MSRV/transitive SIMD exposure. CI's existing
-   supply-chain workflow audits the lockfile with denyWarnings; a green advisory
-   scan is not a source audit or production decoder safety approval.
+   supply-chain workflow audits the lockfile with `cargo audit --deny warnings`;
+   a green advisory scan is not a source audit or production decoder safety approval.
 
 ## Validation
 
