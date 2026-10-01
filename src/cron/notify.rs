@@ -357,12 +357,21 @@ pub fn build_owner_text(
     let stdout = stdout.trim();
     let stderr = stderr.trim();
     if !stdout.is_empty() {
-        lines.push(format!("stdout: {}", stdout.replace('\n', " ")));
+        lines.push(format!("stdout: {}", body_excerpt(stdout)));
     }
     if !stderr.is_empty() {
-        lines.push(format!("stderr: {}", stderr.replace('\n', " ")));
+        lines.push(format!("stderr: {}", body_excerpt(stderr)));
     }
     lines.join("\n")
+}
+
+/// ccc `stdout.replace('\n', ' ')[:900]`: flatten to one line, then cut to
+/// 900 characters again. The second cut is what drops the
+/// `[truncated N chars]` marker `redact_for_owner` appended past 900 — ccc's
+/// spool body never carries it, so danso's must not either (found by the
+/// #120 live canary on gwakga: a 930-character danso line vs ccc's 908).
+fn body_excerpt(text: &str) -> String {
+    text.replace('\n', " ").chars().take(900).collect()
 }
 
 fn spool_error(base: &Value, error: String) -> Value {
