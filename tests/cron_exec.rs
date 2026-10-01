@@ -894,3 +894,49 @@ fn command_payload_cwd_is_honored() {
         assert_eq!(result["headless"]["cwd"], json!("/tmp"));
     });
 }
+
+// --- spool text parity with the ccc reference (#120 live canary) ---
+
+/// Every expected text in the fixture was produced by ccc `build_owner_text`
+/// itself (see `_source`). danso must match it byte-for-byte except for the
+/// documented generic title prefix. Found on the gwakga canary: danso kept the
+/// `[truncated N chars]` marker in the body excerpt (930 vs ccc's 908
+/// characters) and measured `short_text` limits in bytes, not characters.
+#[test]
+fn owner_text_matches_the_ccc_reference_byte_for_byte() {
+    let fixture: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cron_owner_text_golden.json"
+        ))
+        .expect("read fixture"),
+    )
+    .expect("fixture JSON");
+    for case in fixture["cases"].as_array().expect("cases") {
+        let name = case["name"].as_str().expect("name");
+        let danso = danso::cron::notify::build_owner_text(
+            case["task_id"].as_str().expect("task_id"),
+            case["run_id"].as_str().expect("run_id"),
+            case["scheduled_at"].as_str().expect("scheduled_at"),
+            case["status"].as_str().expect("status"),
+            &case["headless"],
+        );
+        let expected = case["ccc_text"].as_str().expect("ccc_text").replacen(
+            "agent-cron task ",
+            "danso cron task ",
+            1,
+        );
+        assert_eq!(danso, expected, "case {name}");
+    }
+}
+
+#[test]
+fn short_text_counts_characters_not_bytes() {
+    use danso::cron::commit::short_text;
+    // 400 Hangul syllables = 1200 bytes: within a 900-character limit.
+    let korean = "가".repeat(400);
+    assert_eq!(short_text(&korean, 900), korean);
+    let clipped = short_text(&"가".repeat(1000), 900);
+    assert!(clipped.ends_with("\n[truncated 100 chars]"), "{clipped}");
+    assert_eq!(clipped.chars().filter(|c| *c == '가').count(), 900);
+}

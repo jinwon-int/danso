@@ -339,12 +339,16 @@ pub fn commit_run_state(
     Ok(true)
 }
 
-/// ccc `short_text`: clip an error string for reporting.
+/// ccc `short_text`: clip an error string for reporting. `limit` and the
+/// reported count are **characters** (Python `len(str)`), not bytes: measuring
+/// bytes clipped multi-byte text that was within the limit and reported a
+/// byte count as "chars".
 pub fn short_text(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
+    let chars = text.chars().count();
+    if chars <= limit {
         return text.to_string();
     }
     let mut clipped = text.chars().take(limit).collect::<String>();
-    clipped.push_str(&format!("\n[truncated {} chars]", text.len() - limit));
+    clipped.push_str(&format!("\n[truncated {} chars]", chars - limit));
     clipped
 }
