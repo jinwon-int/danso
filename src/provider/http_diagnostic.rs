@@ -153,17 +153,36 @@ mod tests {
             provider_code,
             retry_after_seconds: None,
         };
-        // Official table: every 429 that resets in hours/days or needs
-        // account action.
+        // Official table (docs.z.ai/api-reference/api-code, rechecked
+        // 2026-10-02): every 429 that resets in hours/days or needs account
+        // action — the full 1316..=1321 window family included, so the
+        // operator table in docs/providers.md cannot drift from the code.
         for code in [
-            1113, 1308, 1309, 1310, 1311, 1313, 1314, 1315, 1316, 1319, 1321,
+            1113, 1308, 1309, 1310, 1311, 1313, 1314, 1315, 1316, 1317, 1318, 1319, 1320, 1321,
         ] {
             assert!(diagnostic(Some(code)).quota_exhausted(), "{code}");
         }
         // Transient 429s stay on the retry schedule; an unclassifiable
-        // body (code omitted) must not fail fast either.
-        for code in [None, Some(1302), Some(1305), Some(1214)] {
+        // body (code omitted) must not fail fast either. 1312 is not in the
+        // official table and sits inside the 1308..=1321 span, so it pins the
+        // gap; 1307/1322 pin the span edges.
+        for code in [
+            None,
+            Some(1302),
+            Some(1305),
+            Some(1214),
+            Some(1307),
+            Some(1312),
+            Some(1322),
+        ] {
             assert!(!diagnostic(code).quota_exhausted(), "{code:?}");
         }
+        // The body parser only surfaces documented codes: an undocumented
+        // 1312 is dropped before classification ever sees it.
+        assert_eq!(code(br#"{"error":{"code":"1312","message":"x"}}"#), None);
+        assert_eq!(
+            code(br#"{"error":{"code":"1317","message":"x"}}"#),
+            Some(1317)
+        );
     }
 }
