@@ -236,10 +236,93 @@ fn with_delivery(base: &Value, delivery: &str) -> Value {
     out
 }
 
-/// ccc `build_owner_text`, minus the fleet-diagnostic classifier (a ccc
-/// fleet-command concept danso does not have — documented divergence). Every
-/// captured line passes through `redact_for_owner` before it leaves this
-/// module.
+/// ccc `_FLEET_DIAGNOSTIC_TOKENS`: fleet command payloads (`adapter-fleet-watch`,
+/// `fleet-doctor-sweep`) emit one diagnostic row per affected node. Only these
+/// exact line-start tokens may be promoted into a notification title — the
+/// rest of each row carries untrusted node names, paths, and free-form
+/// details. The order is fixed so the title shape is deterministic.
+pub const FLEET_DIAGNOSTIC_TOKENS: [&str; 8] = [
+    "DOWN",
+    "UNREACHABLE",
+    "DRIFT",
+    "BOOTPATH",
+    "DUALDOMAIN",
+    "NONCANONICAL",
+    "DEGRADED",
+    "UNVERIFIED",
+];
+
+/// ccc `_FLEET_DIAGNOSTIC_COUNT_MAX`: per-token counts are capped so the title
+/// length stays bounded even if the output cap is raised.
+pub const FLEET_DIAGNOSTIC_COUNT_MAX: usize = 999;
+
+/// ccc `_VALID_TASK_ID` (the store's own id rule): only a well-formed id may
+/// be promoted into the structured alert title.
+fn valid_title_task_id(task_id: &str) -> bool {
+    (1..=96).contains(&task_id.len())
+        && task_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// The diagnostic token a line starts with: the token must be followed by a
+/// space, a tab, or the end of the line (ccc `^(?:TOKENS)(?=[ \t]|$)` under
+/// `re.MULTILINE`, where lines are split on `\n` only).
+fn line_token(line: &str) -> Option<usize> {
+    FLEET_DIAGNOSTIC_TOKENS.iter().position(|token| {
+        line.strip_prefix(token)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+    })
+}
+
+/// ccc `fleet_diagnostic_title`: an allowlist-only fleet alert title for a
+/// non-success run. `stdout`/`stderr` must already have passed through
+/// `redact_for_owner`. No matched line content is copied — only the fixed
+/// token names and bounded occurrence counts leave this classifier.
+pub fn fleet_diagnostic_title(
+    task_id: &str,
+    status: &str,
+    stdout: &str,
+    stderr: &str,
+) -> Option<String> {
+    if status == "success" || !valid_title_task_id(task_id) {
+        return None;
+    }
+    let mut counts = [0usize; FLEET_DIAGNOSTIC_TOKENS.len()];
+    for output in [stdout, stderr] {
+        for line in output.split('\n') {
+            if let Some(index) = line_token(line) {
+                counts[index] = (counts[index] + 1).min(FLEET_DIAGNOSTIC_COUNT_MAX);
+            }
+        }
+    }
+    let signals: Vec<String> = FLEET_DIAGNOSTIC_TOKENS
+        .iter()
+        .zip(counts)
+        .filter(|(_, count)| *count > 0)
+        .map(|(token, count)| format!("{token}={count}"))
+        .collect();
+    if signals.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "danso cron fleet alert for task {task_id}: {}",
+        signals.join(" ")
+    ))
+}
+
+/// ccc `build_owner_text`. Every captured line passes through
+/// `redact_for_owner` before it leaves this module.
+///
+/// A non-success run whose output carries line-start fleet diagnostic tokens
+/// gets the `fleet_diagnostic_title` first line instead of the generic status
+/// line. The classifier reads the whole captured (already `outputMaxBytes`-
+/// capped) output, not the 900-character body excerpt, so a diagnostic row
+/// late in a long watch matrix still raises the alert. ccc reaches the same
+/// result through a `fleetDiagnosticTitle` precomputed by its headless runner,
+/// because its headless fields are re-cut to 4000 characters; danso's
+/// headless document keeps the capped output, so no precomputed title (and
+/// no forged-title validation) is needed.
 pub fn build_owner_text(
     task_id: &str,
     run_id: &str,
@@ -249,6 +332,16 @@ pub fn build_owner_text(
 ) -> String {
     let raw_stdout = headless["stdout"].as_str().unwrap_or_default();
     let raw_stderr = headless["stderr"].as_str().unwrap_or_default();
+    let title = if status == "success" {
+        None
+    } else {
+        fleet_diagnostic_title(
+            task_id,
+            status,
+            &redact_for_owner(raw_stdout, raw_stdout.len() + 1024),
+            &redact_for_owner(raw_stderr, raw_stderr.len() + 1024),
+        )
+    };
     let stdout = redact_for_owner(raw_stdout, 900);
     let stderr = redact_for_owner(raw_stderr, 900);
     let exit_code = headless["exitCode"]
@@ -256,7 +349,7 @@ pub fn build_owner_text(
         .map(|code| code.to_string())
         .unwrap_or_default();
     let mut lines = vec![
-        format!("danso cron task {task_id} finished with status={status}"),
+        title.unwrap_or_else(|| format!("danso cron task {task_id} finished with status={status}")),
         format!("scheduledAt={scheduled_at}"),
         format!("runId={run_id}"),
         format!("exitCode={exit_code}"),
@@ -500,5 +593,180 @@ mod tests {
         for (input, expected) in goldens {
             assert_eq!(&redact_for_owner(input, 4000), expected, "input: {input}");
         }
+    }
+
+    // --- fleet diagnostic titles: ports of ccc agent-cron.test.sh #829 ---
+
+    fn first_line(task_id: &str, status: &str, headless: Value) -> String {
+        build_owner_text(task_id, "run", "2026-01-01T00:00:00Z", status, &headless)
+            .lines()
+            .next()
+            .expect("first line")
+            .to_string()
+    }
+
+    #[test]
+    fn fleet_rows_become_an_allowlist_only_alert_title() {
+        let headless = json!({
+            "exitCode": 1,
+            "stdout": "OK healthy-node (/safe/path)\n\
+                       DOWN private-node free-form detail\n\
+                       UNREACHABLE secret-node credentials=should-not-title\n\
+                       DOWN duplicate-node /private/path\n\
+                       prefix DRIFT ignored\n \
+                       DOWN ignored-leading-space\n\
+                       DOWNSTREAM ignored-prefix\n",
+            "stderr": "DRIFT hidden-node doctor_exit=1 runtime=/home/hidden/ccc-node\n\
+                       BOOTPATH hidden-node unit=/secret/unit runtime=/secret/runtime\n\
+                       DRIFT second-hidden-node api_key=SECRET_LOOKING_VALUE\n",
+        });
+        let text = build_owner_text(
+            "adapter-fleet-watch",
+            "run",
+            "2026-01-01T00:00:00Z",
+            "failed",
+            &headless,
+        );
+        let title = text.lines().next().expect("title");
+        assert_eq!(
+            title,
+            "danso cron fleet alert for task adapter-fleet-watch: \
+             DOWN=2 UNREACHABLE=1 DRIFT=2 BOOTPATH=1"
+        );
+        for leaked in [
+            "private-node",
+            "/private/path",
+            "SECRET_LOOKING_VALUE",
+            "ignored",
+        ] {
+            assert!(!title.contains(leaked), "{leaked} in {title}");
+        }
+        assert!(!text.contains("SECRET_LOOKING_VALUE"), "{text}");
+    }
+
+    #[test]
+    fn every_watcher_category_is_summarized_without_node_details() {
+        for category in ["DUALDOMAIN", "NONCANONICAL", "DEGRADED", "UNVERIFIED"] {
+            let title = first_line(
+                "adapter-fleet-watch",
+                "failed",
+                json!({
+                    "exitCode": 1,
+                    "stdout": format!("{category} private-node /secret/path\n"),
+                    "stderr": format!("{category} second-node\n{category}SUFFIX ignored\n"),
+                }),
+            );
+            assert_eq!(
+                title,
+                format!("danso cron fleet alert for task adapter-fleet-watch: {category}=2")
+            );
+            assert!(!title.contains("private-node"), "{title}");
+        }
+        let combined = fleet_diagnostic_title(
+            "adapter-fleet-watch",
+            "failed",
+            "DOWN phone1\nDOWN phone2\nDUALDOMAIN server details\n",
+            "",
+        )
+        .expect("title");
+        assert!(combined.ends_with("DOWN=2 DUALDOMAIN=1"), "{combined}");
+    }
+
+    #[test]
+    fn a_late_row_past_the_body_excerpt_still_raises_the_alert() {
+        for repeats in [45, 180] {
+            let stdout = format!(
+                "{}DOWN phone channel=matrix reason=no-process\n",
+                "OK node channel=telegram\n".repeat(repeats)
+            );
+            let text = build_owner_text(
+                "fleet-doctor-daily",
+                "run",
+                "2026-01-01T00:00:00Z",
+                "failed",
+                &json!({ "exitCode": 1, "stdout": stdout, "stderr": "" }),
+            );
+            let title = text.lines().next().expect("title");
+            assert!(title.ends_with("DOWN=1"), "{repeats}: {title}");
+            // The ordinary body excerpt stays capped and never carries the row.
+            assert!(!text.contains("DOWN phone"), "{repeats}: {text}");
+        }
+    }
+
+    #[test]
+    fn counts_are_capped_per_token() {
+        for token in FLEET_DIAGNOSTIC_TOKENS {
+            let title = fleet_diagnostic_title(
+                "adapter-fleet-watch",
+                "failed",
+                &format!("{token}\n").repeat(1001),
+                "",
+            )
+            .expect("title");
+            assert!(title.ends_with(&format!("{token}=999")), "{title}");
+        }
+    }
+
+    #[test]
+    fn every_non_success_state_is_classified_including_timeout() {
+        let title = first_line(
+            "fleet-doctor-sweep",
+            "timeout",
+            json!({ "exitCode": 124, "stdout": "", "stderr": "UNREACHABLE private-node\n" }),
+        );
+        assert_eq!(
+            title,
+            "danso cron fleet alert for task fleet-doctor-sweep: UNREACHABLE=1"
+        );
+    }
+
+    #[test]
+    fn unrecognized_or_misplaced_tokens_keep_the_generic_title() {
+        let generic = "danso cron task ordinary-task finished with status=failed";
+        for stdout in [
+            "OK node\nprefix DOWN node",
+            " DOWN hidden-node\nDRIFTED hidden-node",
+            // `\r` is not a line terminator for the ccc multiline anchor.
+            "DOWN\r\nDRIFT\r",
+        ] {
+            let title = first_line(
+                "ordinary-task",
+                "failed",
+                json!({ "exitCode": 1, "stdout": stdout, "stderr": "ordinary error" }),
+            );
+            assert_eq!(title, generic, "{stdout:?}");
+        }
+        // A bare token on its own line (end-of-line lookahead) does count.
+        assert!(
+            fleet_diagnostic_title("t", "failed", "DOWN", "")
+                .expect("title")
+                .ends_with("DOWN=1")
+        );
+    }
+
+    #[test]
+    fn success_text_is_unchanged_even_when_output_carries_a_token() {
+        let title = first_line(
+            "adapter-fleet-watch",
+            "success",
+            json!({ "exitCode": 0, "stdout": "DOWN diagnostic-only", "stderr": "" }),
+        );
+        assert_eq!(
+            title,
+            "danso cron task adapter-fleet-watch finished with status=success"
+        );
+    }
+
+    #[test]
+    fn an_invalid_task_id_is_never_promoted_into_the_alert_title() {
+        let title = first_line(
+            "bad id\nINJECTED",
+            "failed",
+            json!({ "exitCode": 1, "stdout": "DOWN hidden-node", "stderr": "" }),
+        );
+        assert!(!title.contains("fleet alert"), "{title}");
+        assert!(fleet_diagnostic_title(&"a".repeat(97), "failed", "DOWN x", "").is_none());
+        assert!(fleet_diagnostic_title(&"a".repeat(96), "failed", "DOWN x", "").is_some());
+        assert!(fleet_diagnostic_title("", "failed", "DOWN x", "").is_none());
     }
 }

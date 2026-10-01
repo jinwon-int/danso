@@ -330,6 +330,50 @@ fn spool_text_is_redacted_before_it_leaves_the_process() {
     });
 }
 
+/// The #120 completion canary in synthetic form: a fleet-watch command task
+/// (`adapter-fleet-watch` shape — `telegram-owner-on-failure`, watch-type exit
+/// codes) whose diagnostic row lands far past the 900-character body excerpt
+/// still spools the ccc-equivalent allowlist-only alert title, and no node
+/// detail from the row reaches the title.
+#[test]
+fn a_fleet_watch_failure_spools_the_fleet_alert_title() {
+    let mut task = base_task("adapter-fleet-watch");
+    task["notify"] = json!("telegram-owner-on-failure");
+    task["payload"]["argv"] = json!([
+        "/bin/sh",
+        "-c",
+        "i=0; while [ $i -lt 180 ]; do echo 'OK node channel=telegram'; i=$((i+1)); done; \
+         echo 'DOWN phone channel=matrix reason=no-process'; \
+         echo 'UNREACHABLE secret-node api_key=SECRET_LOOKING_VALUE' >&2; exit 2"
+    ]);
+    let fixture = make_fixture(json!({ "version": 1, "tasks": [task] }));
+    let store = loaded(&fixture);
+    with_spool(&fixture, || {
+        let (result, _code) = execute(&fixture, &store, "adapter-fleet-watch", AT);
+        assert_eq!(result["status"], json!("failed"));
+        let files = spool_files(&fixture);
+        assert_eq!(files.len(), 1);
+        let record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&files[0]).expect("read spool"))
+                .expect("JSON");
+        let text = record["text"].as_str().expect("text");
+        assert_eq!(
+            text.lines().next(),
+            Some("danso cron fleet alert for task adapter-fleet-watch: DOWN=1 UNREACHABLE=1"),
+            "{text}"
+        );
+        assert!(!text.contains("SECRET_LOOKING_VALUE"), "{text}");
+        assert!(!text.contains("DOWN phone"), "{text}");
+        assert_eq!(
+            record["dedup"],
+            json!(format!(
+                "agent-cron:adapter-fleet-watch:{}:failed",
+                record["runId"].as_str().expect("runId")
+            ))
+        );
+    });
+}
+
 // --- notification policy paths ---
 
 #[test]
