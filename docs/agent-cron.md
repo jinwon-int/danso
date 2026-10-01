@@ -85,6 +85,13 @@ where ccc's fail.
   `keepAfterRun: true`.
 - Unknown timezones and malformed expressions fail closed as
   `invalid-schedule` in the planners.
+- **No system tzdata required.** IANA names resolve against the tz database
+  compiled into the binary (`chrono-tz`), never `/usr/share/zoneinfo`, so a
+  Termux or minimal-container host resolves `Asia/Seoul` exactly like any other
+  node — the failure mode behind ccc's `unknown timezone: Asia/Seoul` on Termux
+  Python. `import` keeps each task's `timezone` verbatim (no conversion to a
+  fixed offset), so DST zones round-trip losslessly. Operator decision
+  2026-09-16 (#120, #33).
 
 ## Payload kinds
 
@@ -111,9 +118,33 @@ year-old occurrence.
 `telegram-chat`, `telegram-chat-on-failure` (+ required `--notify-chat-id`).
 Delivery goes through the notify spool write path (PR3): redacted,
 display-capped entries under the spool directory, delivered by the bridge, not
-by danso. Divergences from ccc, carried since PR3: the redaction pipeline is
+by danso. Divergence from ccc, carried since PR3: the redaction pipeline is
 static, so the ccc `blocked-redaction-unavailable` delivery state is
-unreachable here, and there is no fleet-diagnostic title classifier.
+unreachable here.
+
+### Fleet alert titles
+
+A fleet command payload (`adapter-fleet-watch`, `fleet-doctor-sweep`) prints
+one diagnostic row per affected node. For a **non-success** run, the redacted
+stdout/stderr are scanned for the exact line-start tokens `DOWN`,
+`UNREACHABLE`, `DRIFT`, `BOOTPATH`, `DUALDOMAIN`, `NONCANONICAL`, `DEGRADED`,
+and `UNVERIFIED` (token followed by a space, a tab, or the end of the line).
+If any are present the first line becomes
+
+```
+danso cron fleet alert for task <id>: DOWN=2 UNREACHABLE=1
+```
+
+with tokens in that fixed order and each count capped at 999. Only the
+validated task id and the counts reach the title — node names, paths, and the
+rest of each row never do. The scan covers the whole captured output (already
+bounded by `outputMaxBytes`), not the 900-character body excerpt, so a row late
+in a long watch matrix still raises the alert. Successful runs, outputs without
+a recognized token, and ids outside `^[A-Za-z0-9_.-]{1,96}$` keep the generic
+`danso cron task <id> finished with status=<status>` line. This is ccc
+`fleet_diagnostic_title` (#829) with the danso title prefix; ccc's precomputed
+`fleetDiagnosticTitle` headless field is not needed because danso's headless
+document keeps the capped output instead of re-cutting it to 4000 characters.
 
 ## SIGPIPE (documented divergence)
 

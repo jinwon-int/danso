@@ -593,16 +593,22 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
 ccc `agent-cron` 저장소 스키마 v1을 그대로 이식한다(파일 호환, `danso cron
 import` 가능). 저장 위치 `$DANSO_HOME/cron/tasks.json`, 잠금 `cron/locks/<id>.lock`.
 
-- 스케줄: 5필드 cron(숫자·범위·목록·step, DOW 0/7=일요일), `@hourly|daily|weekly|monthly|yearly`, `every <N>m|h|d`(anchorAt 위상), `at <ISO>`(1회, `keepAfterRun`). 작업별 IANA 시간대(`chrono-tz` 대신 시스템 tzdata 파싱은 과대; **UTC와 고정 오프셋만** 1차 지원, IANA는 후속으로 명시).
+- 스케줄: 5필드 cron(숫자·범위·목록·step, DOW 0/7=일요일), `@hourly|daily|weekly|monthly|yearly`, `every <N>m|h|d`(anchorAt 위상), `at <ISO>`(1회, `keepAfterRun`). 작업별 **IANA 시간대를 1차부터 지원**한다 — `chrono-tz`가 바이너리에 내장한 tzdb만 쓰고 시스템 tzdata는 읽지 않는다(Termux 등 tzdata 부재 환경에서도 동일 동작). 알 수 없는 이름은 조용한 UTC 폴백 없이 fail-closed(`invalid-schedule`), `import`는 `timezone`을 그대로 보존한다(고정 오프셋 변환 금지). (운영자 결정 2026-09-16, #120·#33 — 아래 §10 5항에서 이동)
 - 잠금: `O_EXCL` 0600 JSON(`acquiredAt, pid, bootId, runId`). 스테일 판정은
   `boot_id` 변경 또는 opt-in `lockTimeoutSec` 두 가지뿐. 상태 커밋 실패 잡은
-  `persist-failed` 격리로 남고 `danso cron lock <id> --release --run-id`로만 해제.
-- 페이로드 종류: `prompt`(danso 런, `allowedTools`·`permissionMode`→`admit` 정책,
-  `no-tools` 옵션), `command`(argv, cwd, timeout, 출력 상한), **`memory-drain`**
-  (내장, #87(a)의 외부 트리거를 대체), `doctor`, `update-check`.
+  `persist-failed` 격리로 남고 `danso cron lock <id> --action release --run-id <R>`로만 해제.
+- 페이로드 종류(구현됨): `prompt`(danso 서브프로세스 런; `allowedTools`·`permissionMode`를
+  선언한 잡은 내려줄 정책 표면이 아직 없으므로 `unsupported-tool-policy`로 fail-closed),
+  `command`(argv, cwd, timeout, 출력 상한). **후속:** `memory-drain`(내장, #87(a)의
+  외부 트리거를 대체), `doctor`, `update-check`는 각 러너가 생길 때 추가한다
+  (#120 PR3에서 범위 밖으로 명시).
 - 알림: `notify` ∈ `none|telegram-owner|telegram-owner-on-failure|telegram-chat…`
-  → 푸시 스풀 기록. redaction 모듈 로드 실패는 `blocked-redaction-unavailable`로
-  아무것도 쓰지 않는다.
+  → 푸시 스풀 기록. redaction은 정적 링크라 ccc의 `blocked-redaction-unavailable`은
+  도달 불가이며, 대신 잔여 자격증명 형상이 남으면 본문 전체를 마커로 접는다.
+  실패 런의 출력에 행 시작 fleet 진단 토큰(`DOWN`·`UNREACHABLE`·`DRIFT`·`BOOTPATH`·
+  `DUALDOMAIN`·`NONCANONICAL`·`DEGRADED`·`UNVERIFIED`)이 있으면 첫 줄을 토큰별 개수만
+  담은 `danso cron fleet alert for task <id>: …` 제목으로 바꾼다(ccc #829 이식,
+  `docs/agent-cron.md` "Fleet alert titles").
 - 실행: `danso cron tick [--max-runs N] [--dry-run]`을 systemd 타이머(분 단위)가
   호출하거나, 서비스 모드에서는 브리지 프로세스가 내장 tick 태스크로 돌린다.
   둘을 동시에 켜면 잠금이 중복 실행을 막지만 doctor가 경고한다.
@@ -687,7 +693,7 @@ $DANSO_HOME (0700)
 | B5. 파일·스풀 | 문서 송수신, 푸시 스풀 소비, `/restart` | 워크스페이스 밖 확인 흐름, 스풀 형식 호환 |
 | C. 운영 | `config check/import-ccc`, `doctor`, `audit`, `service`, `update`, `cron`(memory-drain 포함), `backup`, 사용량 미터 | 새 환경에서 문서만으로 설치→서비스→재시작→복구 재현. #87(a) 트리거를 `cron`으로 대체 |
 | D. 시험 노드 전환 | 공명 노드 1대 ccc→danso 전환·복귀 리허설 | 전환 절차와 관찰 결과 기록, 확대 여부 결정 |
-| E. 후속 | 텍스트 스트리밍, 음성, Wiki 소비자, 스킬 파이프라인, 외부 CI 대기, 임베딩, IANA 시간대, `/revert` 대체 | 기능별 이슈 |
+| E. 후속 | 텍스트 스트리밍, 음성, Wiki 소비자, 스킬 파이프라인, 외부 CI 대기, 임베딩, `/revert` 대체 | 기능별 이슈 (IANA 시간대는 2026-09-16 결정으로 C단계 `cron`에 편입, §6.5) |
 
 각 슬라이스는 #33 원칙대로 설치 의존성·기동 시간·상주 메모리·장애 복구 동작을
 PR 본문에 기록한다.
@@ -704,9 +710,11 @@ PR 본문에 기록한다.
    아니면 폐기.
 4. **승인 훅의 v0 표면 변경.** `ToolExecutor::admit`은 코어 계약 변경이다(A단계에서 기본 허용으로 추가됨). CLI 기본은
    불변이지만 v0 문서의 "승인 UI 없음" 문구를 수정해야 한다.
-5. **cron 시간대.** IANA tzdata 파싱을 1차에서 뺀다(UTC·고정 오프셋만). 기존
-   ccc 잡이 `Asia/Seoul`을 쓰므로 import 시 `+09:00`으로 변환하되 DST 없는
-   지역만 안전하다.
+5. ~~**cron 시간대.**~~ **결정됨(2026-09-16, #120·#33):** "UTC·고정 오프셋만
+   1차 지원" 안을 철회하고 `chrono-tz` 내장 tzdb로 IANA 시간대를 1차부터
+   지원한다. 고정 오프셋 변환은 DST 지역에서 손실 변환이라 ccc 스키마 v1
+   파일 호환(라운드트립)과 충돌하고, 시스템 tzdata 의존은 Termux에서
+   `unknown timezone: Asia/Seoul`로 실패했다. 계약은 §6.5에 둔다.
 6. **Termux 대상.** aarch64-linux-android 크로스 빌드와 `bwrap` 부재, systemd
    부재는 §6.4 감시 루프로 대응하지만 실제 검증은 D단계 시험 노드가 Termux일
    때만 가능하다.
