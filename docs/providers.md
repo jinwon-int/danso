@@ -97,10 +97,14 @@ Context-window and maximum-output values are service claims that Danso does not
 verify: out-of-range output caps surface as the provider's own 400 without
 automatic adjustment (issue #69 A). Update the operational table when provider
 documentation changes. The coding-plan quota windows (5h/weekly) are
-operator-managed upstream. A 429 is retryable under the bounded wire retry
-(issue #67 B); once retries are exhausted the run ends with exit code 3 and the
-`DANSO_PROVIDER http_status=429` record is available to the bridge for quota
-bookkeeping. Pass `--provider-retries 0` where a single attempt is preferred.
+operator-managed upstream. A transient 429 is retryable under the bounded wire
+retry (issue #67 B); once retries are exhausted the run ends with exit code 3
+and the `DANSO_PROVIDER http_status=429` record is available to the bridge for
+quota bookkeeping. Pass `--provider-retries 0` where a single attempt is
+preferred. Z.AI quota/subscription 429s are **not** retried at all — they fail
+the turn on the first response (#180 part 2; see
+[Optional Z.AI HTTP diagnostics](#optional-zai-http-diagnostics) and
+[Z.AI 429 operator actions](#zai-429-operator-actions)).
 
 `scripts/danso-glm` execs danso with the flash profile above; `ZAI_API_KEY`
 must exist in the environment and `DANSO_GLM_MODEL` optionally swaps the
@@ -441,3 +445,39 @@ Transient 429s (1302 request rate, 1305 overload) and 429s without an
 allowlisted code keep the normal retry schedule. `next_flush_time` appears
 only inside the provider's prose and is not parsed or emitted; consumers
 render the resume expectation from `provider_code` alone.
+
+### Z.AI 429 operator actions
+
+What to do when a turn ends with `DANSO_HTTP` `http_status=429`. The turn has
+already failed (exit code 3) and nothing danso does will recover it: either
+wait for the window to reset or take the account action below, then re-run.
+Meanings follow the official table
+(https://docs.z.ai/api-reference/api-code, checked 2026-10-02); the
+"Retry in danso" column is the `HttpDiagnostic::quota_exhausted` contract.
+
+| `provider_code` | Official meaning | Retry in danso | Recovers by | Operator action |
+| --- | --- | --- | --- | --- |
+| 1302 | Request rate limit | Yes (bounded schedule) | Seconds | None. If it persists past the schedule, lower concurrency on the shared key. |
+| 1305 | Service temporarily overloaded | Yes (bounded schedule) | Seconds–minutes | None. Re-run later; this is provider-side. |
+| 1308 | Usage limit for a `{number}{unit}` window | No — fails fast | Window reset (`next_flush_time` in the provider prose) | Wait for the reset. |
+| 1310 | Weekly/monthly limit exhausted | No — fails fast | Weekly/monthly reset | Wait, or move the lane to another provider/key. Check whether other nodes share the key before re-running fleet-wide. |
+| 1316 / 1318 / 1320 | 5-hour window exhausted (1316: extra-usage balance insufficient; 1318/1320: extra usage blocked by the monthly spend limit) | No — fails fast | 5-hour window reset | Wait. Inferred from the message wording (not verified against a live account): topping up the extra-usage balance may restore access sooner for 1316, and raising the monthly spend limit for 1318/1320. |
+| 1317 / 1319 / 1321 | 7-day window exhausted (same balance/spend-limit split as above) | No — fails fast | 7-day window reset | As above, on a 7-day horizon — usually move the lane instead of waiting. |
+| 1113 | Insufficient balance / no resource package | No — fails fast | **Account action only** | Recharge or buy a resource package. |
+| 1309 | GLM Coding Plan expired | No — fails fast | **Account action only** | Renew the subscription (z.ai/subscribe). |
+| 1311 | Plan does not include the requested model | No — fails fast | **Account action only** | Pick a model the plan covers (`--model`), or upgrade the plan. |
+| 1313 | Fair Usage Policy throttle | No — fails fast | **Account action only** | Submit the restore request the provider message points to; review the fleet's request pattern on that key first so the throttle does not recur. |
+| 1314 | Enterprise package expired | No — fails fast | **Account action only** | Contact the enterprise administrator. |
+| 1315 | Key limited to enterprise coding-package scenarios | No — fails fast | **Account action only** | Replace the key with one for the matching product type. |
+| (none) | 429 with no recognised code | Yes (bounded schedule) | Unknown | Treat as transient; if it repeats, capture `DANSO_HTTP` records across nodes before changing anything. |
+
+Rules of thumb:
+
+- "Account action only" codes never clear by waiting. Re-running the same
+  lane before the action only burns another failed turn.
+- `next_flush_time` is deliberately not parsed (it lives only in provider
+  prose and the wire records stay body-free), so a reset *time* is not
+  available from danso — render the reset *class* from `provider_code`.
+- One shared key across nodes means one shared quota. When a quota code
+  appears, check the same time window on the other nodes before assuming a
+  per-node problem.
