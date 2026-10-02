@@ -17,7 +17,7 @@ license = "MIT"
 # All of it is local computation; nothing here dials out.
 [dependencies]
 anyhow = "1"
-bincode = "1.3"
+bincode = "3.0"
 blake2 = "0.11"
 libc = "0.2"
 regex = "1"
