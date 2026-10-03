@@ -49,6 +49,16 @@ weakening them weakens the signature.
 The self-test workflow therefore does **not** run on `pull_request`. A job that
 holds the secret must not be editable by the same unreviewed branch that runs it.
 
+For the same reason no workflow supplies that review. The repository keeps
+"Allow GitHub Actions to create and approve pull requests" off: with it on, a
+branch that edits a workflow could have that workflow approve the branch.
+Dependabot pull requests, cargo bumps included, are approved by a person like
+any other change; the merge queue and the required `contracts` check still
+apply. An automatic Dependabot approval with `GITHUB_TOKEN` was tried and
+removed — GitHub refuses the review while that setting is off, so the job only
+ever failed (danso #201). `scripts/test_release_signing.py` fails the build if a
+workflow approves a pull request or uses `pull_request_target`.
+
 ## Verifying the stored secret
 
 `.github/workflows/signing-selftest.yml` signs a fixture with the stored secret
