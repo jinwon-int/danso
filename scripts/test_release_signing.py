@@ -26,6 +26,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 PUBLIC_KEY = ROOT / "keys/danso-release.pub"
 WORKFLOW = ROOT / ".github/workflows/signing-selftest.yml"
 RELEASE = ROOT / ".github/workflows/release.yml"
+WORKFLOWS = ROOT / ".github/workflows"
 SECRET_NAME = "MINISIGN_SECRET_KEY"
 
 # The trust root, pinned. Rotating the release key is supposed to be a visible
@@ -183,6 +184,29 @@ def validate_workflow(text):
         if line.strip() and not line.strip().startswith("#")
     )
     assert first == "set -euo pipefail", f"signing step must start with set -euo pipefail, got: {first}"
+
+
+# A workflow must never supply the review that `main` requires. The review
+# rules are the signing boundary (docs/release-signing.md), and the repository
+# keeps "Allow GitHub Actions to create and approve pull requests" off: if a
+# workflow could approve, a branch that edits a workflow could approve itself.
+# `pull_request_target` is refused with it — it runs with a write token on a
+# pull request's behalf, which is the trigger such a job would need (danso #201).
+APPROVAL_PATTERNS = (
+    (r"^\s*pull_request_target\s*:", "pull_request_target runs with a write token on a pull request's behalf"),
+    (r"\bgh\s+pr\s+review\b[^\n]*(\s--approve\b|\s-a\b)", "gh pr review --approve supplies the required review"),
+    (r"addPullRequestReview", "the GraphQL review mutation supplies the required review"),
+    (r"\bAPPROVE\b", "a REST review with event APPROVE supplies the required review"),
+)
+
+
+def validate_no_workflow_approval(name, text):
+    for number, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        for pattern, why in APPROVAL_PATTERNS:
+            if re.search(pattern, line):
+                raise AssertionError(f"{name}:{number}: {why}")
 
 
 class PublicKeyFile(unittest.TestCase):
@@ -456,6 +480,39 @@ class ReleaseWorkflow(unittest.TestCase):
             )
         )
 
+
+class NoWorkflowApproval(unittest.TestCase):
+    """Every workflow, not only the signing ones: any of them can approve."""
+
+    def test_live_workflows(self):
+        files = sorted(WORKFLOWS.glob("*.y*ml"))
+        self.assertTrue(files)
+        for path in files:
+            validate_no_workflow_approval(path.name, path.read_text())
+
+    def rejects(self, text, fragment):
+        with self.assertRaises(AssertionError) as caught:
+            validate_no_workflow_approval("mutated.yml", text)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_cli_approval_rejected(self):
+        self.rejects('      - run: gh pr review "$PR" --approve --body ok\n', "gh pr review --approve")
+        self.rejects('      - run: gh pr review "$PR" -a\n', "gh pr review --approve")
+
+    def test_graphql_approval_rejected(self):
+        self.rejects("      - run: gh api graphql -f query='mutation { addPullRequestReview }'\n", "GraphQL")
+
+    def test_rest_approval_rejected(self):
+        self.rejects('      - run: gh api repos/o/r/pulls/1/reviews -f event=APPROVE\n', "event APPROVE")
+
+    def test_pull_request_target_rejected(self):
+        self.rejects("on:\n  pull_request_target:\n    types: [opened]\n", "pull_request_target")
+
+    def test_comment_mentioning_approval_allowed(self):
+        validate_no_workflow_approval("ok.yml", "# a workflow must not gh pr review --approve\non:\n  push:\n")
+
+    def test_comment_review_allowed(self):
+        validate_no_workflow_approval("ok.yml", '      - run: gh pr review "$PR" --comment --body hi\n')
 
 
 if __name__ == "__main__":
