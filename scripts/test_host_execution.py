@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Real default host execution; synthetic credentials and loopback providers only."""
+import errno
 import json
 import os
 from pathlib import Path
@@ -308,6 +309,83 @@ class Host(unittest.TestCase):
         self.assertEqual(p.returncode, 2, p.stderr)
         self.assertEqual(len(self.requests), before)
 
+
+    # Issue #206: --prompt-file carries the prompt outside argv.
+    def prompt_file_cli(self, *extra, stdin=b''):
+        argv = [str(e2e.BIN), '--cwd', str(self.repo), '--session', str(self.session),
+                '--model', 'fixture-model', *extra]
+        return subprocess.run(argv, env=self.env, input=stdin, capture_output=True, timeout=15)
+
+    def user_texts(self):
+        def text(content):
+            if isinstance(content, str):
+                return content
+            return ''.join(block.get('text', '') for block in content)
+        wire = [text(m['content']) for m in self.requests[-1]['messages'] if m['role'] == 'user']
+        journal = [text(e['message']['content'])
+                   for e in map(json.loads, self.session.read_text().splitlines())
+                   if e.get('message', {}).get('role') == 'user']
+        return wire, journal
+
+    def test_prompt_file_and_stdin_take_the_positional_prompt_path(self):
+        prompt = 'PROMPT_FILE_SENTINEL ' + 'p' * (60 * 1024) + '\nend'
+        path = self.root / 'prompt.md'
+        path.write_text(prompt)
+        self.final()
+        p = self.prompt_file_cli('-p', '--prompt-file', str(path))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.decode().strip(), 'done')
+        self.assertEqual(self.user_texts(), ([prompt], [prompt]))
+        self.assertNotIn(b'PROMPT_FILE_SENTINEL', p.stderr)
+        self.session.unlink()
+        self.final()
+        p = self.prompt_file_cli('-p', '--prompt-file', '-', stdin=prompt.encode())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.user_texts(), ([prompt], [prompt]))
+        self.assertEqual(len(self.requests), 2)
+
+    def test_prompt_file_over_argv_limit_reaches_the_shared_prompt_cap(self):
+        # 140 KiB cannot be one argv element (MAX_ARG_STRLEN, E2BIG). Through
+        # the file it starts and meets the same cap a positional prompt does.
+        prompt = 'OVERSIZED_PROMPT_SENTINEL ' + 'q' * (140 * 1024)
+        with self.assertRaises(OSError) as raised:
+            self.prompt_file_cli('-p', '--', prompt)
+        self.assertEqual(raised.exception.errno, errno.E2BIG)
+        path = self.root / 'prompt.md'
+        path.write_text(prompt)
+        via_file = self.prompt_file_cli('-p', '--prompt-file', str(path))
+        via_stdin = self.prompt_file_cli('-p', '--prompt-file', '-', stdin=prompt.encode())
+        positional = self.prompt_file_cli('-p', '--', 'r' * (64 * 1024 + 1))
+        for p in (via_file, via_stdin, positional):
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn(b'prompt must be 1..65536 bytes', p.stderr)
+            self.assertIn(b'"category":"configuration"', p.stderr)
+            self.assertNotIn(b'OVERSIZED_PROMPT_SENTINEL', p.stdout + p.stderr)
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.session.exists())
+
+    def test_prompt_file_fails_closed_before_session_or_provider(self):
+        secret = b'PROMPT_FILE_SECRET'
+        path = self.root / 'prompt.md'
+        cases = [(('--prompt-file', str(self.root / 'missing.md')), b'', b'cannot open prompt file'),
+                 (('--prompt-file', str(self.root)), b'', b'cannot read prompt file'),
+                 (('--prompt-file', str(path)), b'', b'is not valid UTF-8'),
+                 (('--prompt-file', '-'), secret + b'\xff', b'prompt file stdin is not valid UTF-8'),
+                 (('--prompt-file', '-'), b' \n', b'prompt file stdin is empty'),
+                 (('--prompt-file', '-', '--', 'positional'), secret, b'cannot be used with')]
+        path.write_bytes(secret + b'\xc3\x28')
+        for extra, stdin, expected in cases:
+            p = self.prompt_file_cli('-p', *extra, stdin=stdin)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn(expected, p.stderr)
+            self.assertIn(b'"category":"configuration"', p.stderr)
+            self.assertNotIn(secret, p.stdout + p.stderr)
+        path.write_text('\n')
+        p = self.prompt_file_cli('-p', '--prompt-file', str(path))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn(b'is empty', p.stderr)
+        self.assertEqual(self.requests, [])
+        self.assertFalse(self.session.exists())
 
 class LongTask(providers.Fixture):
     """Cross-process long-task checks against the real native CLI."""
