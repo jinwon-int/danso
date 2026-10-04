@@ -12,8 +12,14 @@ durable message boundaries (issue #98 a). Setting `DANSO_PROVIDER_STREAM=1`
 opts the runtime into provider SSE ingestion (issue #98 b): deltas stream to
 the sink as they arrive, the boundary emits only the completion marker, and
 the final answer is not re-printed after it was streamed.
-The original three paths are tested against local HTTP fixtures. Real account/model
-acceptance remains pending; no API access is inferred from a model name.
+The original three paths are tested against local HTTP fixtures. Real-account
+use so far is GLM only: the ccc-node#1913 fleet canary ran `glm-5.3-flash`
+(Z.AI coding endpoint, `DANSO_PROVIDER_STREAM` on) for real turns on one node
+from 2026-09-22 to 2026-09-25 — 24 of 36 turns succeeded, and the canary was
+judged a fail on the two causes split out into #180 (the SSE 1 MiB response cap
+and Z.AI quota 429s, both addressed there). No real-account acceptance has
+been recorded for `anthropic` or `openai`; no API access is inferred from a
+model name.
 
 | Provider | Wire API | Credential environment variable | Base URL environment variable | Default base (suffix appended) |
 | --- | --- | --- | --- | --- |

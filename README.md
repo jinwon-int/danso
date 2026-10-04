@@ -20,6 +20,16 @@ target/release/danso --cwd /path/to/repo --trust-project \
   --model YOUR_ANTHROPIC_MODEL -p 'Explain this repository'
 ```
 
+To install the built binary for a node — the resident service, `doctor` and
+the rest of the operator commands below expect `danso` on `PATH` — copy it
+with `install -m 0755 target/release/danso /usr/local/bin/danso`. Signed
+release artifacts are verified first as described in
+[release signing](docs/release-signing.md); a local or PR build has no
+signature to check. Configuration lives in `$DANSO_HOME/config.toml`
+(`$HOME/.danso/config.toml` by default); check it with `danso config check`.
+A from-scratch run of these steps in a container with no Python or Node is
+recorded in [the fresh-environment reproduction](docs/fresh-environment.md).
+
 Requires Rust 1.98.1 to build. Running the binary requires Linux 5.3+ with
 procfs/pidfd support and `/bin/bash`; no bubblewrap, Python, Node or Docker is
 needed for the default CLI. Host tools use the current user’s
