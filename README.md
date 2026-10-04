@@ -34,6 +34,10 @@ this changes child tool `HOME`/`PATH` only and never changes provider
 authentication or context discovery. Bubblewrap rejects the option.
 Without `-p`, stdout is JSONL. Reuse the session path to continue a completed
 linear conversation. An uncertain interrupted tool requires manual recovery.
+Pass a large prompt with `--prompt-file PATH` (or `--prompt-file -` for
+stdin) instead of the positional argument to stay clear of the 128 KiB argv
+limit; it is checked and recorded exactly like a positional prompt. See
+[the v0 contract](docs/v0.md#run).
 
 See [the v0 contract](docs/v0.md) for trust/discovery subsets, exit codes,
 budgets, recovery behavior, fixture provenance and offline test commands.

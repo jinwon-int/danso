@@ -681,7 +681,7 @@ fn main() {
         }
         return;
     }
-    let args = match Args::try_parse() {
+    let mut args = match Args::try_parse() {
         Ok(args) => args,
         Err(e) => {
             let code = e.exit_code();
@@ -715,6 +715,15 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+    // `--task-status` ignores a positional prompt, so it never reads
+    // `--prompt-file` either. Every other mode resolves the file here, before
+    // the run config exists, so the prompt takes the positional path (#206).
+    if let Err(error) = args.resolve_prompt_file(std::io::stdin().lock()) {
+        eprintln!("run refused: {error}");
+        failure::report(Kind::Configuration, 2);
+        report_usage(&Usage::default());
+        std::process::exit(2);
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

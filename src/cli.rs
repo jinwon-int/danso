@@ -1,5 +1,47 @@
 use clap::{Parser, ValueEnum};
-use std::path::PathBuf;
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
+
+/// Memory guard for `--prompt-file`: at most this many bytes are read before
+/// the content is handed to the run. It is not the prompt cap; the run checks
+/// the prompt exactly as it checks a positional one (issue #206).
+pub const PROMPT_FILE_READ_LIMIT: u64 = 1024 * 1024;
+
+/// Read a `--prompt-file` source. `-` selects `stdin`. Errors name the
+/// source and the failure only, never any of the content read.
+pub fn read_prompt_file(path: &Path, stdin: impl Read) -> Result<String, String> {
+    let (source, bytes) = if path.as_os_str() == "-" {
+        ("stdin".to_string(), read_bounded(stdin, "stdin")?)
+    } else {
+        let source = path.display().to_string();
+        let file = std::fs::File::open(path)
+            .map_err(|error| format!("cannot open prompt file {source}: {error}"))?;
+        let bytes = read_bounded(file, &source)?;
+        (source, bytes)
+    };
+    let prompt =
+        String::from_utf8(bytes).map_err(|_| format!("prompt file {source} is not valid UTF-8"))?;
+    if prompt.trim().is_empty() {
+        return Err(format!("prompt file {source} is empty"));
+    }
+    Ok(prompt)
+}
+
+fn read_bounded(reader: impl Read, source: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(PROMPT_FILE_READ_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read prompt file {source}: {error}"))?;
+    if bytes.len() as u64 > PROMPT_FILE_READ_LIMIT {
+        return Err(format!(
+            "prompt file {source} exceeds {PROMPT_FILE_READ_LIMIT} bytes"
+        ));
+    }
+    Ok(bytes)
+}
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Mode {
     Json,
@@ -16,7 +58,15 @@ pub enum SandboxArg {
 #[command(version, about = "Headless worker harness with Pi session interchange")]
 pub struct Args {
     /// Prompt for this run. Use -- to separate a prompt beginning with '-'.
+    /// For a prompt too large for argv, use --prompt-file.
     pub prompt: Option<String>,
+    /// Read the prompt from a UTF-8 file instead of argv ('-' reads stdin).
+    /// Avoids the per-argument exec limit (E2BIG at 128 KiB); the prompt is
+    /// then checked and recorded exactly like a positional one, including
+    /// the 65536-byte prompt cap. Missing, unreadable, non-UTF-8 or empty
+    /// input fails before any session or provider work.
+    #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+    pub prompt_file: Option<PathBuf>,
     #[arg(long, default_value = ".")]
     pub cwd: PathBuf,
     /// JSONL v3 path outside the workspace. Existing linear sessions resume.
@@ -163,6 +213,14 @@ pub struct Args {
 }
 
 impl Args {
+    /// Replace `--prompt-file` with the prompt it names, so everything after
+    /// this point sees one prompt regardless of how it was supplied.
+    pub fn resolve_prompt_file(&mut self, stdin: impl Read) -> Result<(), String> {
+        if let Some(path) = self.prompt_file.take() {
+            self.prompt = Some(read_prompt_file(&path, stdin)?);
+        }
+        Ok(())
+    }
     /// Resolve the execution backend from the flags that select it. The
     /// deprecated alias is read here rather than inferred from --sandbox's
     /// default, so changing that default cannot silently invert its meaning.
@@ -328,6 +386,89 @@ mod tests {
                 .unwrap()
                 .follow_up
         );
+    }
+
+    fn parse_without_prompt(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut argv = vec!["danso", "--session", "/tmp/s.jsonl", "--model", "m"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv)
+    }
+
+    /// Issue #206: the file replaces argv for the prompt and nothing else.
+    #[test]
+    fn prompt_file_conflicts_with_positional_and_resolves_into_the_prompt() {
+        let error = match try_parse(&["--prompt-file", "/tmp/p.md"]) {
+            Err(error) => error,
+            Ok(_) => panic!("a positional prompt and --prompt-file must conflict"),
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt.md");
+        let large = format!("{}\nend", "x".repeat(200 * 1024));
+        std::fs::write(&path, &large).unwrap();
+        let mut args = parse_without_prompt(&["--prompt-file", path.to_str().unwrap()]).unwrap();
+        args.resolve_prompt_file(std::io::empty()).unwrap();
+        assert!(args.prompt_file.is_none());
+        assert_eq!(args.config().prompt, large);
+
+        let mut args = parse_without_prompt(&["--prompt-file", "-"]).unwrap();
+        args.resolve_prompt_file("from stdin\n".as_bytes()).unwrap();
+        assert_eq!(args.config().prompt, "from stdin\n");
+
+        // Without the flag, the positional prompt is untouched and stdin is
+        // never read.
+        let mut args = parse(&[]);
+        args.resolve_prompt_file("must not be read".as_bytes())
+            .unwrap();
+        assert_eq!(args.config().prompt, "a prompt");
+
+        // Resume follow-ups take their message from the file the same way.
+        let mut args =
+            parse_without_prompt(&["--resume-task", "--task-followup", "--prompt-file", "-"])
+                .unwrap();
+        args.resolve_prompt_file("follow up".as_bytes()).unwrap();
+        assert_eq!(args.config().prompt, "follow up");
+    }
+
+    #[test]
+    fn prompt_file_fails_closed_without_echoing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.md");
+        let error = read_prompt_file(&missing, std::io::empty()).unwrap_err();
+        assert!(error.contains("cannot open prompt file"), "{error}");
+
+        let error = read_prompt_file(dir.path(), std::io::empty()).unwrap_err();
+        assert!(error.contains("cannot read prompt file"), "{error}");
+
+        let secret = "SECRET_PROMPT_SENTINEL";
+        let invalid = [secret.as_bytes(), b"\xff\xfe"].concat();
+        let path = dir.path().join("invalid.md");
+        std::fs::write(&path, &invalid).unwrap();
+        let error = read_prompt_file(&path, std::io::empty()).unwrap_err();
+        assert!(error.ends_with("is not valid UTF-8"), "{error}");
+        assert!(!error.contains(secret));
+        let error = read_prompt_file(Path::new("-"), invalid.as_slice()).unwrap_err();
+        assert_eq!(error, "prompt file stdin is not valid UTF-8");
+
+        for empty in ["", " \n\t\n"] {
+            std::fs::write(&path, empty).unwrap();
+            let error = read_prompt_file(&path, std::io::empty()).unwrap_err();
+            assert!(error.ends_with("is empty"), "{error}");
+            let error = read_prompt_file(Path::new("-"), empty.as_bytes()).unwrap_err();
+            assert_eq!(error, "prompt file stdin is empty");
+        }
+
+        let oversized = format!("{secret}{}", "y".repeat(PROMPT_FILE_READ_LIMIT as usize));
+        std::fs::write(&path, &oversized).unwrap();
+        let error = read_prompt_file(&path, std::io::empty()).unwrap_err();
+        assert!(error.contains("exceeds 1048576 bytes"), "{error}");
+        assert!(!error.contains(secret));
+
+        // A refused file leaves the parsed arguments without a prompt.
+        let mut args = parse_without_prompt(&["--prompt-file", "-"]).unwrap();
+        assert!(args.resolve_prompt_file("".as_bytes()).is_err());
+        assert!(args.prompt.is_none());
     }
 
     #[test]
