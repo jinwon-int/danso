@@ -195,6 +195,30 @@ On a host with no systemd the restart is simply not scheduled
 (`systemd_run_unavailable`) and the service keeps running. There is no fallback
 — Termux restarts through `service run --supervise`.
 
+## Running without systemd (`--supervise`)
+
+Where there is no systemd (Termux, a container), `danso service install`
+installs nothing and prints the Termux:Boot equivalent instead. The service
+is then run in the foreground under its own supervisor, with the same
+`config.toml` and environment as above:
+
+```
+danso service run --data-dir <state-root> --supervise
+```
+
+Keep it running however the host keeps a foreground process alive (a
+Termux:Boot script, `setsid ... &`). The supervisor restarts a crashed
+service — including one the OOM killer sent `SIGKILL` — and gives up on a
+crash loop rather than spinning. Ready is the same check as on systemd:
+`danso service status --data-dir <state-root>` exits 0 with
+`Bot status: available`. `danso doctor` inspects the running node read-only.
+
+Stop it with `danso service stop --data-dir <state-root>` (`Bot stop:
+drained`, exit 0); the supervisor treats an operator stop as final and exits
+too, without starting a replacement. A fresh-container run of exactly these
+commands, with measured times and resident memory, is in
+[fresh-environment.md](fresh-environment.md).
+
 ## Hosts without a user session
 
 `systemctl --user` needs `$XDG_RUNTIME_DIR` and a session bus. On a headless

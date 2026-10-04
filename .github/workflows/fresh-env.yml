@@ -1,0 +1,43 @@
+name: Fresh environment
+# Roadmap #33 stage C (issue #204): install -> service -> recover from the docs
+# alone, in a digest-pinned container with no Python, Node or ccc-node. The
+# harness and its loopback fakes run here on the host; only the release binary
+# built below goes into the container. See docs/fresh-environment.md.
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  fresh-env:
+    # 22.04 for the same glibc floor release.yml builds against; the
+    # container's own glibc is newer, which is the direction nodes face.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Harness self-test (fakes and table, no docker)
+        run: python3 scripts/fresh_env.py --self-test
+      - name: Build the release binary
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal
+          cargo +1.98.1 build --release --locked
+      - name: Reproduce in a fresh container
+        run: |
+          set -euo pipefail
+          python3 scripts/fresh_env.py --bin target/release/danso \
+            --summary "$GITHUB_STEP_SUMMARY" --json fresh-env.json
+      - name: Keep the measured rows
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fresh-env
+          path: fresh-env.json
+          if-no-files-found: ignore
