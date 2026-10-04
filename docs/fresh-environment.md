@@ -66,22 +66,23 @@ skipping it silently.
 
 ## Measured
 
-Not yet measured: the PR that added the harness was written on a runner with
-neither docker nor cargo, so the first figures come from the `Fresh
-environment` CI run, which prints this table and attaches it to the run
-summary. Replace the placeholders with that run's values (and its run link)
-when it is green.
+First measured by the `Fresh environment` CI run
+[37203423774](https://github.com/jinwon-int/danso/actions/runs/37203423774)
+(GitHub-hosted `ubuntu-22.04`, release build of PR #205 head `afbb7ed`).
+The harness was written on a runner with neither docker nor cargo, so these
+are the first real figures; every run prints the same table to its log and
+step summary, and later runs may differ slightly in timing.
 
 | Step | Check | Exit | Wall s | Ready s | RSS (danso) | Result | Notes |
 | --- | --- | ---: | ---: | ---: | ---: | --- | --- |
-| 1 | preflight: no python/node/ccc-node, ldd | | | | | measured in CI | |
-| 2 | install binary (signature: n/a, unreleased PR build) | | | | | measured in CI | |
-| 2 | config.toml per docs + `danso config check` | | | | | measured in CI | |
-| 3 | provider auth: print-mode turn on loopback fake | | | | | measured in CI | |
-| 4 | `danso service install` on a host without systemd | | | | | measured in CI | |
-| 4 | `service run --supervise` -> available | | | | | measured in CI | |
-| 4 | `danso doctor` against the running service | | | | | measured in CI | |
-| 4 | `danso service stop` -> supervisor exits | | | | | measured in CI | |
+| 1 | preflight: no python/node/ccc-node, ldd | 0 | 0.118 |  |  | pass | absent: python3, python, node, nodejs, ccc-node; 5 ldd entries |
+| 2 | install binary (signature: n/a, unreleased PR build) | 0 | 0.024 |  |  | pass | no signed manifest exists for a PR build; minisign -V -H (docs/release-signing.md) applies to Release artifacts only |
+| 2 | config.toml per docs + `danso config check` | 0 | 0.026 |  |  | pass | valid; set_keys=4 |
+| 3 | provider auth: print-mode turn on loopback fake | 0 | 0.025 |  | 8.0 MiB | pass | usage line present: requests=1 totalTokens=18 |
+| 4 | `danso service install` on a host without systemd | 0 | 0.025 |  |  | pass | prints the Termux:Boot equivalent, installs nothing |
+| 4 | `service run --supervise` -> available | 0 | 0.108 | 0.108 | 10.8 MiB (supervisor 7.2 MiB) | pass | ready = `danso service status` exit 0 (Bot status: available) |
+| 4 | `danso doctor` against the running service | 0 | 0.025 |  |  | pass | ok=8 warn=2 fail=0 (home.layout, memory.store) |
+| 4 | `danso service stop` -> supervisor exits | 0 | 0.107 |  |  | pass | Bot stop: drained; supervisor and service gone |
 | 5 | Telegram module: single turn + token lock | | | | | pending part 2 (#204) | |
 | 6 | memory: write, search, inject, survives restart | | | | | pending part 2 (#204) | |
 | 7 | cron: one scheduled run + failure spool | | | | | pending part 2 (#204) | |
