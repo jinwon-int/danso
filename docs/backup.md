@@ -148,3 +148,27 @@ Exit codes are:
   `backup failed: write_failed` or `restore failed: target_not_empty`.
 - `2`: the command could not run, including an unresolvable home, missing
   `--target`, or a backup path that does not exist.
+
+## Starting from a restored target
+
+A restored target is laid out like a `$DANSO_HOME` (`config.toml`,
+`memory/`), except that the conversation records sit at
+`<target>/conversations/`: the layout of a Telegram data directory, not of
+`$DANSO_HOME/telegram/`. To serve from it, make the target both roots:
+
+```sh
+export DANSO_HOME=/srv/new-danso-state
+export DANSO_TELEGRAM_DATA_DIR=/srv/new-danso-state
+danso config check
+danso service run --data-dir /srv/new-danso-state --supervise   # or the systemd unit
+```
+
+Before starting, stop any service still using the same bot token elsewhere.
+The token lock is per data directory, so it does not refuse a restored copy
+([telegram.md](telegram.md)). The token file named by `telegram.token_file`
+is not in the snapshot, so it must exist on the new host, owner-only, at that
+path. Session journals (`<data-dir>/journals/`) are not in the snapshot either,
+so a restored chat's session pointer names a journal that is not there. Its
+first turn is refused (`Turn could not start`) until the chat sends `/new`.
+This is a known gap (K2 in [fresh-environment.md](fresh-environment.md)),
+not intended behaviour.

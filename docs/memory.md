@@ -141,7 +141,9 @@ never duplicated, never automatic.
 
 ## Distill pipeline (§4.5–§4.7, M4)
 
-`danso run --memory read-write` registers a pending extraction job on a
+A headless run with `--memory read-write` (`danso --cwd … --session … -p …
+--memory read-write`; there is no `run` subcommand, "`danso run`" on this
+page means that invocation) registers a pending extraction job on a
 final answer or turn-budget exhaustion (`--memory-distill queue|inline|off`;
 inline drains one job after the run). `danso memory distill --session
 <path>` enqueues explicitly; `danso memory drain` claims pending jobs and
@@ -267,7 +269,8 @@ added together to estimate spend.
 
 ## Diagnostics (§6.4, M5)
 
-`danso memory check --json` reports body-free scope state: record counts
+`danso memory check` (always JSON; it takes no `--json` flag) reports
+body-free scope state: record counts
 (open/closed/needs-human/constraints), journal pending/dead counters, the
 cooldown state, rollback head/action counts, and file presence. The audit
 ledger `state/audit.jsonl` records `MemoryCommit` and `DistillJob` events
@@ -368,7 +371,8 @@ scope: `--scope global|shared|private-<32 hex>`. Configuration errors exit 2;
 runtime refusals exit 1. Read rules (§7): a private scope reads its own tree
 plus `shared`; `shared` and `global` never open another tree.
 
-`danso run` gains `--memory off|read|read-write` (read-write registers
+The headless run (`danso --cwd … --session … -p …`; `danso run` above is
+shorthand for it, not a subcommand) gains `--memory off|read|read-write` (read-write registers
 pending distill jobs; extraction runs via drain), `--memory-distill
 queue|inline|off`, `--memory-refresh per-run|per-request` (per-request
 re-assembles the context right after each compaction through a
