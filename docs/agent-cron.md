@@ -118,7 +118,11 @@ year-old occurrence.
 `telegram-chat`, `telegram-chat-on-failure` (+ required `--notify-chat-id`).
 Delivery goes through the notify spool write path (PR3): redacted,
 display-capped entries under the spool directory, delivered by the bridge, not
-by danso. Divergence from ccc, carried since PR3: the redaction pipeline is
+by danso. The spool directory is `DANSO_AGENT_CRON_PUSH_SPOOL`, else
+`DANSO_PUSH_SPOOL`, else `$DANSO_HOME/telegram/spool`; each run that notifies
+writes one owner-only `<ts>-<task id>-<run id>.json` there, and `run`/`tick
+--json` report its path as `notification.spoolPath`. An `-on-failure` mode
+writes nothing for a successful run. Divergence from ccc, carried since PR3: the redaction pipeline is
 static, so the ccc `blocked-redaction-unavailable` delivery state is
 unreachable here.
 

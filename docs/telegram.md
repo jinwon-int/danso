@@ -37,7 +37,9 @@ which layer is supplying each key (`sources`: `env:<NAME>`, `file` or
   `DANSO_TELEGRAM_FOLLOWUP_CAP` bounds the durable per-chat follow-up queue
   (default `5`).
 - `DANSO_TELEGRAM_WORKSPACE` (or `core.workspace`) selects the absolute
-  workspace. If omitted, the current directory is used.
+  workspace. If omitted, the current directory is used. The directory must
+  already exist: danso does not create it, and the service refuses to start
+  (`Telegram workspace does not exist`, exit 1) before it polls.
 - `DANSO_TELEGRAM_MEMORY_SCOPE` (or `memory.scope`) selects the memory route
   used by turns and explicit memory commands (`global` by default; `shared`
   or `private-<32 lowercase hex>` are also valid). `DANSO_MEMORY_DIR` (or
@@ -96,6 +98,10 @@ One consumer owns a bot token at a time. Startup takes an exclusive kernel
 lock on `.telegram-token.lock` below the data directory and holds it for the
 service lifetime. A second consumer exits without polling. The lock file may
 remain after shutdown; ownership is the live kernel lock, not file deletion.
+The lock lives in the data directory, so it only sees consumers of that
+directory: a second node home or a restored copy (another `DANSO_HOME` or
+`DANSO_TELEGRAM_DATA_DIR`) holding the same token is not refused. Stop the old
+consumer before starting one from another directory.
 
 ## Turns and persistence
 
