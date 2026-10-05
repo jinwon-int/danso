@@ -9,8 +9,15 @@ use super::{
     TelegramConfig, TelegramFoundation, Update, ensure_private_dir,
     store::{ConversationRecord, ConversationStore, UsageRecord},
 };
-use crate::settings::{self, Layered};
-use anyhow::{Context, Result, bail, ensure};
+use crate::channel::{
+    runner::{InProcessRunner, ProgressEvent, TurnControls, TurnOutcome},
+    settings::{RunSettings, validate_effort, validate_model},
+};
+
+/// Names this channel in the shared run settings and runner error text.
+const CHANNEL_LABEL: &str = "Telegram";
+use crate::settings::Layered;
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use danso_ops::{
     health::{
@@ -22,49 +29,18 @@ use danso_ops::{
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering},
     },
-    thread,
     time::{Duration, Instant},
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 
 const JOURNALS_DIR: &str = "journals";
-const DEFAULT_MAX_TURNS: u32 = 48;
-const DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
-const DEFAULT_PROVIDER_TIMEOUT_SECONDS: u64 = 180;
-const DEFAULT_TOOL_TIMEOUT_SECONDS: u64 = 900;
-const DEFAULT_PROVIDER_RETRIES: u32 = 3;
-const DEFAULT_HEARTBEAT_SECONDS: u64 = 60;
-const DEFAULT_FOLLOWUP_CAP: usize = 5;
-const MAX_HEARTBEAT_SECONDS: u64 = 3600;
-const MAX_FOLLOWUP_CAP: u64 = 100;
 const HEALTH_FILE_NAME: &str = "health.json";
-const TASK_WALL_ENV: [&str; 6] = [
-    "DANSO_TASK_WALL_SECONDS",
-    "DANSO_TASK_TIMEOUT_SECONDS",
-    "DANSO_TELEGRAM_TASK_WALL_SECONDS",
-    "DANSO_TELEGRAM_TASK_TIMEOUT_SECONDS",
-    "DANSO_TELEGRAM_TIMEOUT_SECONDS",
-    "DANSO_TIMEOUT_SECONDS",
-];
-const TASK_STAGE_ENV: [&str; 2] = [
-    "DANSO_TASK_STAGE_REQUESTS",
-    "DANSO_TELEGRAM_TASK_STAGE_REQUESTS",
-];
-const TASK_REQUESTS_ENV: [&str; 2] = [
-    "DANSO_TASK_MAX_REQUESTS",
-    "DANSO_TELEGRAM_TASK_MAX_REQUESTS",
-];
-const TASK_TOKENS_ENV: [&str; 2] = ["DANSO_TASK_MAX_TOKENS", "DANSO_TELEGRAM_TASK_MAX_TOKENS"];
-const TASK_REPEAT_ENV: [&str; 2] = [
-    "DANSO_TASK_REPEAT_LIMIT",
-    "DANSO_TELEGRAM_TASK_REPEAT_LIMIT",
-];
 
 const TASK_USAGE: &str = "Usage: /task <prompt>";
 const TASK_PAUSE_USAGE: &str = "Usage: /task_pause";
@@ -84,338 +60,6 @@ const TASK_PAUSE_REQUESTED: &str = "pause requested; takes effect at the next sa
     about = "Run the Telegram single-turn service using environment configuration"
 )]
 pub struct TelegramArgs {}
-
-#[derive(Clone)]
-struct RunSettings {
-    provider: String,
-    default_model: String,
-    default_effort: Option<String>,
-    workspace: PathBuf,
-    trust_project: bool,
-    no_tools: bool,
-    max_turns: u32,
-    timeout_seconds: u64,
-    provider_timeout_seconds: u64,
-    tool_timeout_seconds: u64,
-    provider_retries: u32,
-    max_output_tokens: Option<u32>,
-    compact_at_bytes: Option<usize>,
-    heartbeat_seconds: u64,
-    followup_cap: usize,
-    memory_mode: crate::memory::MemoryMode,
-    memory_root: PathBuf,
-    memory_scope: String,
-    task_limits: crate::long_task::Limits,
-}
-
-impl RunSettings {
-    fn from_env() -> Result<Self> {
-        Self::resolve(&Layered::load()?)
-    }
-
-    /// Environment first, then `config.toml`, then the default (#136). The
-    /// file keys mirror the environment names; an error names the source
-    /// that actually supplied the value.
-    fn resolve(layered: &Layered) -> Result<Self> {
-        let provider = settings::resolve_string(
-            layered,
-            settings::aliases("provider.name"),
-            "provider.name",
-            |c| c.provider.name.clone(),
-        )?
-        .map(|(value, _)| value)
-        .unwrap_or_else(|| settings::DEFAULT_PROVIDER.to_string());
-        ensure!(
-            ["anthropic", "openai", "openai-codex", "glm"].contains(&provider.as_str()),
-            "unsupported Telegram provider"
-        );
-
-        let model_names = settings::model_env_names(&provider);
-        let default_model = settings::resolve_string(
-            layered,
-            &model_names,
-            "provider.model",
-            |c| c.provider.model.clone(),
-        )?
-        .map(|(value, _)| value)
-        .context(
-            "DANSO_TELEGRAM_MODEL, the normal Danso model environment, or provider.model in config.toml is required",
-        )?;
-        validate_model(&default_model)?;
-
-        let default_effort = settings::resolve_string(
-            layered,
-            settings::aliases("provider.reasoning_effort"),
-            "provider.reasoning_effort",
-            |c| c.provider.reasoning_effort.clone(),
-        )?
-        .map(|(value, _)| value);
-        validate_effort(default_effort.as_deref(), &provider)?;
-
-        let workspace = settings::resolve_string(
-            layered,
-            settings::aliases("core.workspace"),
-            "core.workspace",
-            |c| c.core.workspace.as_ref().map(|p| p.display().to_string()),
-        )?
-        .map(|(value, _)| PathBuf::from(value))
-        .unwrap_or(std::env::current_dir().context("resolve Telegram workspace")?);
-        ensure!(
-            workspace.is_absolute(),
-            "Telegram workspace must be an absolute path"
-        );
-        let workspace = workspace
-            .canonicalize()
-            .context("Telegram workspace does not exist")?;
-        ensure!(
-            workspace.is_dir() && workspace.parent().is_some(),
-            "Telegram workspace must be a non-root directory"
-        );
-
-        let max_turns = settings::resolve_u32(
-            layered,
-            settings::aliases("core.max_turns"),
-            "core.max_turns",
-            |c| c.core.max_turns,
-            DEFAULT_MAX_TURNS,
-            1,
-            128,
-        )?;
-        let timeout_seconds = settings::resolve_u64(
-            layered,
-            settings::aliases("core.timeout_seconds"),
-            "core.timeout_seconds",
-            |c| c.core.timeout_seconds,
-            DEFAULT_TIMEOUT_SECONDS,
-            1,
-            3600,
-        )?;
-        let provider_timeout_seconds = settings::resolve_u64(
-            layered,
-            settings::aliases("provider.timeout_seconds"),
-            "provider.timeout_seconds",
-            |c| c.provider.timeout_seconds,
-            DEFAULT_PROVIDER_TIMEOUT_SECONDS,
-            1,
-            300,
-        )?;
-        let tool_timeout_seconds = settings::resolve_u64(
-            layered,
-            settings::aliases("core.tool_timeout_seconds"),
-            "core.tool_timeout_seconds",
-            |c| c.core.tool_timeout_seconds,
-            DEFAULT_TOOL_TIMEOUT_SECONDS,
-            1,
-            crate::tools::HOST_TOOL_TIMEOUT_MAX_SECONDS,
-        )?;
-        let provider_retries = settings::resolve_u32(
-            layered,
-            settings::aliases("provider.retries"),
-            "provider.retries",
-            |c| c.provider.retries,
-            DEFAULT_PROVIDER_RETRIES,
-            0,
-            5,
-        )?;
-        let max_output_tokens = settings::resolve_optional_u32(
-            layered,
-            settings::aliases("provider.max_output_tokens"),
-            "provider.max_output_tokens",
-            |c| c.provider.max_output_tokens,
-        )?;
-        let compact_at_bytes = settings::env_optional_usize(&[
-            "DANSO_TELEGRAM_COMPACT_AT_BYTES",
-            "DANSO_COMPACT_AT_BYTES",
-        ])?;
-        let heartbeat_seconds = settings::resolve_u64(
-            layered,
-            settings::aliases("telegram.heartbeat_seconds"),
-            "telegram.heartbeat_seconds",
-            |c| c.telegram.heartbeat_seconds,
-            DEFAULT_HEARTBEAT_SECONDS,
-            0,
-            MAX_HEARTBEAT_SECONDS,
-        )?;
-        let followup_cap = settings::resolve_u64(
-            layered,
-            &["DANSO_TELEGRAM_FOLLOWUP_CAP"],
-            "(none)",
-            |_| None,
-            DEFAULT_FOLLOWUP_CAP as u64,
-            0,
-            MAX_FOLLOWUP_CAP,
-        )? as usize;
-        // `memory.mode` decides whether a turn carries the managed memory
-        // block (#209). `off` stays the default, so a node that never set it
-        // keeps sending exactly what it sent before; `memory.scope` and
-        // `memory.dir` below pick the route only once it is on.
-        let memory_mode = match settings::resolve_string(
-            layered,
-            settings::aliases("memory.mode"),
-            "memory.mode",
-            |c| c.memory.mode.clone(),
-        )?
-        .map(|(value, _)| value)
-        .as_deref()
-        {
-            None | Some("off") => crate::memory::MemoryMode::Off,
-            Some("read") => crate::memory::MemoryMode::Read,
-            Some("read-write") => crate::memory::MemoryMode::ReadWrite,
-            Some(_) => {
-                bail!("DANSO_TELEGRAM_MEMORY_MODE or memory.mode must be off, read, or read-write")
-            }
-        };
-        let memory_scope = settings::resolve_string(
-            layered,
-            settings::aliases("memory.scope"),
-            "memory.scope",
-            |c| c.memory.scope.clone(),
-        )?
-        .map(|(value, _)| value)
-        .unwrap_or_else(|| "global".to_string());
-        ensure!(
-            crate::memory::valid_scope(&memory_scope),
-            "DANSO_TELEGRAM_MEMORY_SCOPE or memory.scope must be global, shared, or private-<32 hex>"
-        );
-        let memory_root = crate::memory::MemoryConfig::resolve_root(
-            layered.config().and_then(|c| c.memory.dir.clone()),
-        )?;
-        ensure!(
-            memory_root.is_absolute(),
-            "DANSO_MEMORY_DIR or memory.dir must be an absolute path"
-        );
-        let task_limits = task_limits_from_env()?;
-
-        Ok(Self {
-            provider,
-            default_model,
-            default_effort,
-            workspace,
-            trust_project: settings::env_bool(
-                &["DANSO_TELEGRAM_TRUST_PROJECT", "DANSO_TRUST_PROJECT"],
-                false,
-            )?,
-            no_tools: settings::env_bool(&["DANSO_TELEGRAM_NO_TOOLS", "DANSO_NO_TOOLS"], false)?,
-            max_turns,
-            timeout_seconds,
-            provider_timeout_seconds,
-            tool_timeout_seconds,
-            provider_retries,
-            max_output_tokens,
-            compact_at_bytes,
-            heartbeat_seconds,
-            followup_cap,
-            memory_mode,
-            memory_root,
-            memory_scope,
-            task_limits,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn config(
-        &self,
-        prompt: String,
-        session: PathBuf,
-        model: String,
-        effort: Option<String>,
-        long_task: Option<crate::runtime::LongTaskRun>,
-        pause_requested: Option<Arc<AtomicBool>>,
-        cancellation_reason: Arc<AtomicU8>,
-    ) -> crate::app::RunConfig {
-        let timeout_seconds = long_task
-            .map(|task| task.limits.wall_seconds)
-            .unwrap_or(self.timeout_seconds);
-        crate::app::RunConfig {
-            prompt,
-            cwd: self.workspace.clone(),
-            session,
-            model,
-            provider: self.provider.clone(),
-            reasoning_effort: effort.or_else(|| self.default_effort.clone()),
-            trust_project: self.trust_project,
-            no_tools: self.no_tools,
-            system_context_file: None,
-            memory: crate::memory::MemoryConfig {
-                mode: self.memory_mode,
-                root: Some(self.memory_root.clone()),
-                scope: self.memory_scope.clone(),
-                max_bytes: crate::memory::snapshot::SNAPSHOT_MAX_BYTES_DEFAULT,
-                ..Default::default()
-            },
-            memory_refresh: crate::memory::RefreshMode::PerRun,
-            memory_distill: crate::memory::DistillMode::Queue,
-            backend: crate::app::Backend::Host,
-            max_turns: self.max_turns,
-            max_output_tokens: self.max_output_tokens,
-            glm_thinking: None,
-            glm_endpoint: None,
-            provider_retries: self.provider_retries,
-            continuation_limit: 0,
-            stream_requests: false,
-            report_progress: false,
-            repeat_limit: 0,
-            compact_at_bytes: self.compact_at_bytes,
-            timeout_seconds,
-            provider_timeout_seconds: self.provider_timeout_seconds,
-            tool_timeout_seconds: self.tool_timeout_seconds,
-            tool_home: None,
-            long_task,
-            task_progress: false,
-            pause_requested,
-            cancellation_reason: Some(cancellation_reason),
-        }
-    }
-}
-
-fn task_limits_from_env() -> Result<crate::long_task::Limits> {
-    let limits = crate::long_task::Limits {
-        wall_seconds: configured_u64(
-            &TASK_WALL_ENV,
-            crate::long_task::MAX_WALL_SECONDS,
-            1,
-            crate::long_task::MAX_WALL_SECONDS,
-        )?,
-        stage_requests: configured_u64(
-            &TASK_STAGE_ENV,
-            crate::long_task::DEFAULT_STAGE_REQUESTS,
-            crate::long_task::MIN_STAGE_REQUESTS,
-            crate::long_task::MAX_STAGE_REQUESTS,
-        )?,
-        max_requests: configured_u64(
-            &TASK_REQUESTS_ENV,
-            crate::long_task::DEFAULT_MAX_REQUESTS,
-            crate::long_task::MIN_MAX_REQUESTS,
-            crate::long_task::MAX_MAX_REQUESTS,
-        )?,
-        max_tokens: configured_u64(
-            &TASK_TOKENS_ENV,
-            crate::long_task::DEFAULT_MAX_TOKENS,
-            crate::long_task::MIN_MAX_TOKENS,
-            crate::long_task::MAX_MAX_TOKENS,
-        )?,
-        repeat_limit: configured_u64(
-            &TASK_REPEAT_ENV,
-            crate::long_task::DEFAULT_REPEAT_LIMIT,
-            crate::long_task::MIN_REPEAT_LIMIT,
-            crate::long_task::MAX_REPEAT_LIMIT,
-        )?,
-    };
-    limits.validate()?;
-    Ok(limits)
-}
-
-fn configured_u64(names: &[&str], default: u64, min: u64, max: u64) -> Result<u64> {
-    settings::resolve_u64(
-        &Layered::without_file(),
-        names,
-        "(none)",
-        |_| None,
-        default,
-        min,
-        max,
-    )
-}
 
 fn atomic_write_health(path: &std::path::Path, payload: &[u8]) -> Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
@@ -464,104 +108,6 @@ fn atomic_write_health(path: &std::path::Path, payload: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
-}
-
-fn validate_model(model: &str) -> Result<()> {
-    ensure!(!model.trim().is_empty(), "Telegram model must not be empty");
-    ensure!(model.len() <= 4096, "Telegram model is too long");
-    ensure!(
-        model
-            .chars()
-            .all(|character| !character.is_control() && !character.is_whitespace()),
-        "Telegram model must be one non-whitespace token"
-    );
-    Ok(())
-}
-
-fn validate_effort(effort: Option<&str>, provider: &str) -> Result<()> {
-    let Some(effort) = effort else {
-        return Ok(());
-    };
-    ensure!(
-        ["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort),
-        "Telegram effort is invalid"
-    );
-    ensure!(
-        provider != "anthropic",
-        "reasoning effort is unsupported by the Anthropic adapter"
-    );
-    Ok(())
-}
-
-struct TelegramSink {
-    final_text: Option<String>,
-    paused: bool,
-    progress: mpsc::UnboundedSender<ProgressEvent>,
-    tool_started: Option<(String, Instant)>,
-}
-
-impl TelegramSink {
-    fn new(progress: mpsc::UnboundedSender<ProgressEvent>) -> Self {
-        Self {
-            final_text: None,
-            paused: false,
-            progress,
-            tool_started: None,
-        }
-    }
-
-    fn final_text(self) -> Result<String> {
-        self.final_text
-            .context("completed Telegram turn did not produce a final answer")
-    }
-
-    fn paused(&self) -> bool {
-        self.paused
-    }
-}
-
-impl crate::contracts::EventSink for TelegramSink {
-    fn emit(&mut self, event: crate::contracts::Event<'_>) -> Result<()> {
-        match event {
-            crate::contracts::Event::FinalAnswer(message) => {
-                let mut text = crate::contracts::text_blocks(message).join("");
-                if text.is_empty()
-                    && let Some(content) = message["content"].as_str()
-                {
-                    text = content.to_string();
-                }
-                ensure!(!text.is_empty(), "final Telegram answer is empty");
-                self.final_text = Some(text);
-            }
-            crate::contracts::Event::ToolStarted(name) => {
-                self.tool_started = Some((safe_tool_name(name), Instant::now()));
-            }
-            crate::contracts::Event::ToolSettled { .. } => {
-                if let Some((name, started)) = self.tool_started.take() {
-                    let elapsed_seconds = started.elapsed().as_secs();
-                    let _ = self.progress.send(ProgressEvent::ToolFinished {
-                        name,
-                        elapsed_seconds,
-                    });
-                }
-            }
-            crate::contracts::Event::Task(progress) if progress["state"] == "paused" => {
-                self.paused = true;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-}
-
-struct TurnOutcome {
-    text: Option<String>,
-    usage: UsageRecord,
-    paused: bool,
-}
-
-enum ProgressEvent {
-    ToolFinished { name: String, elapsed_seconds: u64 },
 }
 
 struct ActiveTurn {
@@ -628,11 +174,6 @@ impl ActiveTurn {
     }
 }
 
-struct TurnHandle {
-    receiver: oneshot::Receiver<Result<TurnOutcome>>,
-    progress: mpsc::UnboundedReceiver<ProgressEvent>,
-}
-
 struct PreparedTurn {
     active: Arc<ActiveTurn>,
     session_id: String,
@@ -640,247 +181,6 @@ struct PreparedTurn {
     effort: Option<String>,
     prompt: String,
     long_task: Option<crate::runtime::LongTaskRun>,
-}
-
-/// A root-owned in-process adapter. danso-runtime exposes the same
-/// provider-neutral runner for external embedders; the root binary cannot
-/// depend on that crate because that crate intentionally depends on this
-/// core package. This adapter keeps the Telegram binary on the same
-/// app::run path without introducing a cyclic Cargo dependency.
-struct InProcessRunner {
-    journals: PathBuf,
-    settings: RunSettings,
-}
-
-impl InProcessRunner {
-    fn new(journals: PathBuf, settings: RunSettings) -> Result<Self> {
-        ensure_private_dir(&journals)?;
-        ensure!(
-            !journals.starts_with(&settings.workspace),
-            "Telegram journals must be outside the workspace"
-        );
-        Ok(Self { journals, settings })
-    }
-
-    fn journal_path(&self, session_id: &str) -> PathBuf {
-        self.journals.join(format!("{session_id}.jsonl"))
-    }
-
-    fn require_session_file(&self, session_id: &str) -> Result<PathBuf> {
-        let parsed =
-            uuid::Uuid::parse_str(session_id).context("invalid Telegram session pointer")?;
-        ensure!(
-            parsed.hyphenated().to_string() == session_id,
-            "invalid Telegram session pointer"
-        );
-        let path = self.journal_path(session_id);
-        let metadata =
-            std::fs::symlink_metadata(&path).context("Telegram session pointer has no journal")?;
-        ensure!(
-            metadata.is_file(),
-            "Telegram session journal must be a regular file"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            ensure!(
-                metadata.uid() == unsafe { libc::geteuid() }
-                    && metadata.nlink() == 1
-                    && metadata.mode() & 0o077 == 0,
-                "Telegram session journal has unsafe ownership or permissions"
-            );
-        }
-        Ok(path)
-    }
-
-    fn new_session(&self) -> Result<String> {
-        for _ in 0..8 {
-            let session_id = uuid::Uuid::new_v4().hyphenated().to_string();
-            let path = self.journal_path(&session_id);
-            if std::fs::symlink_metadata(&path).is_ok() {
-                continue;
-            }
-            let session = crate::session::Session::open(&path, &self.settings.workspace)?;
-            drop(session);
-            return Ok(session_id);
-        }
-        bail!("could not allocate a Telegram session")
-    }
-
-    fn session_status(&self, session_id: &str) -> Result<serde_json::Value> {
-        let journal = self.require_session_file(session_id)?;
-        crate::session::Session::read_status(&journal)
-    }
-
-    /// Read only the two journal timestamps needed for `/history`. The
-    /// parser never retains or returns message values, and malformed stamps
-    /// become the fixed `unknown` label rather than being echoed.
-    fn session_timestamps(&self, session_id: &str) -> Result<SessionTimestamps> {
-        let journal = self.require_session_file(session_id)?;
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options.open(journal)?;
-        ensure!(file.metadata()?.len() <= 16 * 1024 * 1024);
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        let mut total_bytes = 0_u64;
-        let mut started_at = None;
-        let mut updated_at = None;
-        loop {
-            line.clear();
-            let read = reader.read_line(&mut line)?;
-            if read == 0 {
-                break;
-            }
-            total_bytes = total_bytes
-                .checked_add(read as u64)
-                .context("Telegram session journal size overflow")?;
-            ensure!(total_bytes <= 16 * 1024 * 1024);
-            let entry: JournalTimestamp<'_> = serde_json::from_str(&line)?;
-            let Some(raw) = entry.timestamp else {
-                continue;
-            };
-            let timestamp = safe_timestamp(raw);
-            if started_at.is_none() {
-                started_at = Some(timestamp.clone());
-            }
-            updated_at = Some(timestamp);
-        }
-        Ok(SessionTimestamps {
-            started_at: started_at.unwrap_or_else(|| "unknown".to_string()),
-            updated_at: updated_at.unwrap_or_else(|| "unknown".to_string()),
-        })
-    }
-
-    fn start_turn(
-        &self,
-        active: Arc<ActiveTurn>,
-        session_id: String,
-        model: String,
-        effort: Option<String>,
-        prompt: String,
-        long_task: Option<crate::runtime::LongTaskRun>,
-    ) -> Result<TurnHandle> {
-        let parsed =
-            uuid::Uuid::parse_str(&session_id).context("invalid Telegram session pointer")?;
-        ensure!(
-            parsed.hyphenated().to_string() == session_id,
-            "invalid Telegram session pointer"
-        );
-        validate_model(&model)?;
-        validate_effort(effort.as_deref(), &self.settings.provider)?;
-        let journal = self.require_session_file(&session_id)?;
-        let config = self.settings.config(
-            prompt,
-            journal,
-            model,
-            effort,
-            long_task,
-            Some(Arc::clone(&active.pause_requested)),
-            Arc::clone(&active.cancellation_reason),
-        );
-        let (sender, receiver) = oneshot::channel();
-        let (progress_sender, progress_receiver) = mpsc::unbounded_channel();
-        let cancel = Arc::clone(&active.cancel);
-        let completed = Arc::clone(&active);
-        let thread_name = format!("danso-telegram-turn-{}", &session_id[..8]);
-        let _thread = thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_turn(config, cancel, progress_sender)
-                }))
-                .unwrap_or_else(|_| {
-                    Err(anyhow::anyhow!(
-                        "Telegram turn panicked; journal retained. No automatic replay."
-                    ))
-                });
-                completed.completed.store(true, Ordering::Release);
-                let _ = sender.send(result);
-            })
-            .context("could not start Telegram turn")?;
-        Ok(TurnHandle {
-            receiver,
-            progress: progress_receiver,
-        })
-    }
-}
-
-struct SessionTimestamps {
-    started_at: String,
-    updated_at: String,
-}
-
-#[derive(serde::Deserialize)]
-struct JournalTimestamp<'a> {
-    #[serde(borrow)]
-    timestamp: Option<&'a str>,
-}
-
-fn safe_timestamp(raw: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|timestamp| {
-            timestamp
-                .with_timezone(&chrono::Utc)
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        })
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-fn run_turn(
-    config: crate::app::RunConfig,
-    cancel: Arc<Notify>,
-    progress: mpsc::UnboundedSender<ProgressEvent>,
-) -> Result<TurnOutcome> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("could not start Telegram turn runtime")?;
-    let mut usage = crate::usage::Usage::default();
-    let mut sink = TelegramSink::new(progress);
-    let result = runtime.block_on(async {
-        tokio::select! {
-            biased;
-            _ = cancel.notified() => Err(anyhow::anyhow!("Telegram turn cancelled")),
-            result = tokio::time::timeout(
-                Duration::from_secs(config.timeout_seconds),
-                crate::app::run(&config, &mut sink, &mut usage),
-            ) => match result {
-                Ok(result) => result,
-                Err(_) => {
-                    if let Some(reason) = &config.cancellation_reason {
-                        let _ = reason.compare_exchange(
-                            0,
-                            3,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        );
-                    }
-                    Err(anyhow::anyhow!("Telegram turn timed out"))
-                }
-            },
-        }
-    });
-    let paused = sink.paused();
-    if !paused {
-        result?;
-    }
-    let text = if paused {
-        None
-    } else {
-        Some(sink.final_text()?)
-    };
-    let usage = UsageRecord::from_summary(&usage.summary())?;
-    Ok(TurnOutcome {
-        text,
-        usage,
-        paused,
-    })
 }
 
 struct ChatState {
@@ -1088,7 +388,7 @@ impl TelegramService {
     pub fn from_env() -> Result<Self> {
         let layered = Layered::load()?;
         let telegram = TelegramConfig::resolve(&layered)?;
-        let settings = RunSettings::resolve(&layered)?;
+        let settings = RunSettings::resolve(&layered, CHANNEL_LABEL)?;
         Self::from_config(telegram, settings)
     }
 
@@ -1097,7 +397,11 @@ impl TelegramService {
         let journals = foundation.conversations.data_dir().join(JOURNALS_DIR);
         let data_dir = foundation.conversations.data_dir().to_path_buf();
         ensure_private_dir(&journals)?;
-        let runner = Arc::new(InProcessRunner::new(journals, settings.clone())?);
+        let runner = Arc::new(InProcessRunner::new(
+            journals,
+            settings.clone(),
+            CHANNEL_LABEL,
+        )?);
         let inner = ServiceInner {
             api: foundation.api,
             access: foundation.access,
@@ -1651,7 +955,7 @@ impl TelegramService {
                     if command.invalid_shape {
                         Some("Usage: /model [model-name]".to_string())
                     } else if let Some(model) = command.argument {
-                        match validate_model(&model) {
+                        match validate_model(&model, CHANNEL_LABEL) {
                             Ok(()) => {
                                 record.provider = Some(self.inner.settings.provider.clone());
                                 record.model = Some(model.clone());
@@ -1682,7 +986,11 @@ impl TelegramService {
                             record.effort = None;
                             Some("Reasoning effort reset to the service default.".to_string())
                         } else {
-                            match validate_effort(Some(&effort), &self.inner.settings.provider) {
+                            match validate_effort(
+                                Some(&effort),
+                                &self.inner.settings.provider,
+                                CHANNEL_LABEL,
+                            ) {
                                 Ok(()) => {
                                     record.provider = Some(self.inner.settings.provider.clone());
                                     record.effort = Some(effort.clone());
@@ -2111,8 +1419,15 @@ impl TelegramService {
             .await;
             return Ok(());
         }
+        let settled = Arc::clone(&prepared.active);
+        let controls = TurnControls {
+            cancel: Arc::clone(&prepared.active.cancel),
+            pause_requested: Arc::clone(&prepared.active.pause_requested),
+            cancellation_reason: Arc::clone(&prepared.active.cancellation_reason),
+            on_settled: Box::new(move || settled.completed.store(true, Ordering::Release)),
+        };
         let handle = match self.inner.runner.start_turn(
-            Arc::clone(&prepared.active),
+            controls,
             prepared.session_id,
             prepared.model,
             prepared.effort,
@@ -2618,25 +1933,6 @@ fn split_message(text: &str, limit: usize) -> Vec<String> {
     parts
 }
 
-fn safe_tool_name(name: &str) -> String {
-    let mut safe: String = name
-        .split(|character: char| {
-            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
-        })
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .filter(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-        })
-        .take(64)
-        .collect();
-    if safe.is_empty() {
-        safe.push_str("unknown");
-    }
-    safe
-}
-
 fn format_progress(active: &ActiveTurn, last_tool: Option<&(String, u64)>) -> String {
     let elapsed_seconds = active.started_at.elapsed().as_secs();
     match last_tool {
@@ -2681,6 +1977,7 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::runner::safe_tool_name;
 
     #[test]
     fn commands_accept_bot_suffix_and_reject_extra_arguments() {
