@@ -43,6 +43,8 @@ flowchart TD
 | `failure.rs` | Typed failure categories and body-free CLI error records | Inferring causes from provider text or authorizing retries |
 | `usage.rs`, `output.rs` | Normalized usage, event rendering, usage prefixes | Authorization or execution policy |
 | `config.rs` | `$DANSO_HOME/config.toml` parsing, shape/range validation, body-free `config check` | Applying values to a run (the CLI stays flag-driven until the bridge stage) |
+| `channel/` | What every chat channel shares (#213): run settings from env/`config.toml`, the in-process turn runner and its session journals, the private data-directory rule, per-turn usage counters | Any channel API, progress rendering, commands, or access control |
+| `telegram/` | The Telegram adapter: Bot API transport, token lock, allowlist, conversation records, progress edits, follow-up queue, commands | Run settings or turn execution (it calls `channel/`) |
 | `crates/danso-runtime` | Provider-neutral `AgentEvent` vocabulary, `AgentSession`/`TurnRunner` traits, `ChannelSink`, in-process runner with cancel/pause | Telegram, scheduling, HTTP servers, or any change to the core loop |
 
 The workspace split and the module plan are in [the unified design](unified-design.md).

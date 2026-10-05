@@ -62,41 +62,7 @@ pub fn data_dir_from_env() -> Result<PathBuf> {
 /// directory. This is kept here so the lock and store share one filesystem
 /// boundary without coupling Telegram to the memory module.
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    ensure!(path.is_absolute(), "Telegram data paths must be absolute");
-    let missing = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            ensure!(metadata.is_dir(), "Telegram data path must be a directory");
-            false
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(error) => return Err(error.into()),
-    };
-
-    if missing {
-        std::fs::create_dir_all(path)
-            .with_context(|| format!("create Telegram data directory: {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-        }
-    }
-
-    let metadata = std::fs::symlink_metadata(path)?;
-    ensure!(metadata.is_dir(), "Telegram data path must be a directory");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        ensure!(
-            metadata.uid() == unsafe { libc::geteuid() },
-            "Telegram data directory must be owned by the current user"
-        );
-        ensure!(
-            metadata.mode() & 0o777 == 0o700,
-            "Telegram data directory must have mode 0700"
-        );
-    }
-    Ok(())
+    crate::channel::ensure_private_dir(path, "Telegram")
 }
 
 /// Environment-only configuration for the Telegram service. Provider settings

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod backup;
+pub(crate) mod channel;
 pub mod compaction;
 pub mod config;
 pub mod context;
