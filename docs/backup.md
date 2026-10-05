@@ -23,6 +23,7 @@ backup-<timestamp>/
   memory/<scope>/state/...
   memory/<scope>/memories/...
   conversations/...
+  journals/...
 ```
 
 `memory/` is assembled from `DANSO_MEMORY_DIR`, else the configured
@@ -33,16 +34,19 @@ category: running without it would silently drop the `telegram.token_file`
 exclusion and the configured memory root. (A missing `config.toml` was
 already refused as `config_unreadable`, since the config component is
 required.) Only valid scope directories and their
-`state/` and `memories/` trees are captured. `conversations/` is present when
+`state/` and `memories/` trees are captured. `conversations/` and `journals/` are present when
 `DANSO_TELEGRAM_DATA_DIR` (or the Telegram resolver's `$DANSO_HOME/telegram`
-default) resolves; it contains that directory's `conversations` tree.
+default) resolves; they contain that directory's `conversations` tree and the
+session journals (`journals/<session-id>.jsonl`) its records point at, so a
+restored chat continues its session (#210). Journals hold the conversation
+text, as the memory component holds facts: treat a backup as private data.
 
 Only regular files are copied. Symlinks, unreadable entries, incomplete
 layouts, and bounded-scan conditions are omitted and represented by fixed
 warning categories in the manifest. Directory scans are limited to 4096
 entries per directory and a fixed nesting bound. Backup files and directories
 are owner-only. `config.toml` is required; an unavailable config is a backup
-failure, while unreadable memory or conversation entries are recorded as
+failure, while unreadable memory, conversation or journal entries are recorded as
 warnings.
 
 The manifest is JSON and contains no state bodies:
@@ -71,6 +75,12 @@ The manifest is JSON and contains no state bodies:
       "file_count": 1,
       "byte_count": 789,
       "warnings": []
+    },
+    {
+      "name": "journals",
+      "file_count": 1,
+      "byte_count": 2048,
+      "warnings": []
     }
   ],
   "exclusions": [
@@ -87,7 +97,11 @@ of counts, modes, relative component layout, and fixed categories. The fixed
 warning categories are `missing`, `unreadable`, `layout`, `scan_bound`, and
 `legacy_state`.
 
-`legacy_state` on the `memory` or `conversations` component means the
+A backup written before #210 has no `journals` component and restores as
+before; a `danso` older than #210 refuses a backup that has one as
+`invalid_backup`, like any other unknown component.
+
+`legacy_state` on the `memory`, `conversations` or `journals` component means the
 snapshot is complete for the root the service uses, but that root is the
 `$DANSO_HOME` default and the pre-#136 location (`$HOME/.danso/memory` or
 `$HOME/.danso/telegram`) still holds entries which are **not** in the
@@ -152,9 +166,9 @@ Exit codes are:
 ## Starting from a restored target
 
 A restored target is laid out like a `$DANSO_HOME` (`config.toml`,
-`memory/`), except that the conversation records sit at
-`<target>/conversations/`: the layout of a Telegram data directory, not of
-`$DANSO_HOME/telegram/`. To serve from it, make the target both roots:
+`memory/`), except that the conversation records and their journals sit at
+`<target>/conversations/` and `<target>/journals/`: the layout of a Telegram
+data directory, not of `$DANSO_HOME/telegram/`. To serve from it, make the target both roots:
 
 ```sh
 export DANSO_HOME=/srv/new-danso-state
@@ -167,8 +181,8 @@ Before starting, stop any service still using the same bot token elsewhere.
 The token lock is per data directory, so it does not refuse a restored copy
 ([telegram.md](telegram.md)). The token file named by `telegram.token_file`
 is not in the snapshot, so it must exist on the new host, owner-only, at that
-path. Session journals (`<data-dir>/journals/`) are not in the snapshot either,
-so a restored chat's session pointer names a journal that is not there. Its
-first turn is refused (`Turn could not start`) until the chat sends `/new`.
-This is a known gap (K2 in [fresh-environment.md](fresh-environment.md)),
-not intended behaviour.
+path. The session journals are restored with the records, so a restored chat's
+first turn continues the session it had at backup time; no `/new` is needed.
+A backup taken while a turn is running can catch that turn's journal
+mid-write; stop the service before `danso backup` for a consistent snapshot
+(the fresh-environment run does).

@@ -40,8 +40,17 @@ which layer is supplying each key (`sources`: `env:<NAME>`, `file` or
   workspace. If omitted, the current directory is used. The directory must
   already exist: danso does not create it, and the service refuses to start
   (`Telegram workspace does not exist`, exit 1) before it polls.
+- `DANSO_TELEGRAM_MEMORY_MODE` (or `memory.mode`) decides whether a turn
+  carries the managed memory block: `off` (the default) sends none, `read`
+  assembles the snapshot once per turn and injects it like the headless
+  `--memory read`, and `read-write` additionally records working state and
+  queues the turn's journal for distillation, as the headless
+  `--memory read-write` does (`danso memory drain` extracts it; the turn never
+  waits).
+  Leaving it unset keeps a node's provider requests exactly as they were.
 - `DANSO_TELEGRAM_MEMORY_SCOPE` (or `memory.scope`) selects the memory route
-  used by turns and explicit memory commands (`global` by default; `shared`
+  used by turns once `memory.mode` is on, and by the explicit memory commands
+  (`/distill`, `/memory_promote`) regardless (`global` by default; `shared`
   or `private-<32 lowercase hex>` are also valid). `DANSO_MEMORY_DIR` (or
   `memory.dir`, else `$DANSO_HOME/memory`) selects the absolute memory root;
   `doctor` and `backup` resolve it in the same order, so they inspect the

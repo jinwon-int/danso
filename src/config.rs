@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 pub const FILE_NAME: &str = "config.toml";
 
 /// Keys the file declares that no command reads yet (#136). Each is either
-/// waiting on its feature (`cron.*` on #120, `memory.mode/refresh/distill`
+/// waiting on its feature (`cron.*` on #120, `memory.max_bytes/refresh/distill`
 /// and `telegram.memory_mode` on the native-memory switch, `core.sandbox`,
 /// `core.tool_home`, `core.long_task`, `provider.base_url/endpoint/thinking/
 /// auth_file` on `danso run` consuming the file) or has no reader planned
@@ -36,7 +36,6 @@ pub const UNREAD_KEYS: &[&str] = &[
     "provider.endpoint",
     "provider.thinking",
     "provider.auth_file",
-    "memory.mode",
     "memory.max_bytes",
     "memory.refresh",
     "memory.distill",
@@ -680,7 +679,7 @@ public_key = "RWQbf5jrBubDWDWgYNOyi1nYm+uTycGKIGfh+oOVB09ocmmx8o4mAj8w"
         for key in [
             "core.sandbox",
             "provider.endpoint",
-            "memory.mode",
+            "memory.max_bytes",
             "cron.store",
             "service.unit",
         ] {
@@ -692,6 +691,7 @@ public_key = "RWQbf5jrBubDWDWgYNOyi1nYm+uTycGKIGfh+oOVB09ocmmx8o4mAj8w"
         for key in [
             "provider.model",
             "telegram.token_file",
+            "memory.mode",
             "memory.scope",
             "update.public_key",
         ] {

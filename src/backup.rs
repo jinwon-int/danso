@@ -26,11 +26,14 @@ pub const TEMP_PREFIX: &str = ".tmp-";
 
 const MEMORY_DIR_NAME: &str = "memory";
 const CONVERSATIONS_DIR_NAME: &str = "conversations";
+/// The Telegram session journals the conversation records point at (#210).
+const JOURNALS_DIR_NAME: &str = "journals";
 const HEALTH_FILE_NAME: &str = "health.json";
 const TOKEN_LOCK_FILE_NAME: &str = ".telegram-token.lock";
 const CONFIG_COMPONENT: &str = "config";
 const MEMORY_COMPONENT: &str = "memory";
 const CONVERSATIONS_COMPONENT: &str = "conversations";
+const JOURNALS_COMPONENT: &str = "journals";
 const EXCLUSIONS: [&str; 3] = [
     "telegram.token_file",
     "telegram.token_lock",
@@ -437,9 +440,20 @@ pub fn create_at(
     )?;
     let mut components = vec![config_component, memory_component];
     if let Some(data_dir) = telegram_data_dir {
-        components.push(build_conversations_component(
+        components.push(build_telegram_component(
             data_dir,
+            CONVERSATIONS_DIR_NAME,
+            CONVERSATIONS_COMPONENT,
             &temp_path.join(CONVERSATIONS_DIR_NAME),
+            token_path.as_deref(),
+        )?);
+        // A conversation record names its session by id; without the journal
+        // the restored chat's first turn is refused until `/new` (#210).
+        components.push(build_telegram_component(
+            data_dir,
+            JOURNALS_DIR_NAME,
+            JOURNALS_COMPONENT,
+            &temp_path.join(JOURNALS_DIR_NAME),
             token_path.as_deref(),
         )?);
     }
@@ -447,16 +461,19 @@ pub fn create_at(
     // archived: name it in the component it belongs to, as a fixed category
     // like every other omission.  `doctor` spells out the paths.
     for root in config::legacy_roots(home, legacy_home, telegram_data_dir, &memory_root) {
-        let name = if root.name == memory::DEFAULT_DIR_NAME {
-            MEMORY_COMPONENT
+        let names: &[&str] = if root.name == memory::DEFAULT_DIR_NAME {
+            &[MEMORY_COMPONENT]
         } else {
-            CONVERSATIONS_COMPONENT
+            &[CONVERSATIONS_COMPONENT, JOURNALS_COMPONENT]
         };
-        if let Some(component) = components.iter_mut().find(|c| c.name == name)
-            && !component.warnings.iter().any(|w| w == WARNING_LEGACY_STATE)
+        for component in components
+            .iter_mut()
+            .filter(|c| names.contains(&c.name.as_str()))
         {
-            component.warnings.push(WARNING_LEGACY_STATE.to_string());
-            component.warnings.sort();
+            if !component.warnings.iter().any(|w| w == WARNING_LEGACY_STATE) {
+                component.warnings.push(WARNING_LEGACY_STATE.to_string());
+                component.warnings.sort();
+            }
         }
     }
 
@@ -621,8 +638,12 @@ fn build_memory_component(
     Ok(builder.finish(MEMORY_COMPONENT, None))
 }
 
-fn build_conversations_component(
+/// One tree below the Telegram data directory (`conversations/` or
+/// `journals/`), copied with the same exclusions and warning categories.
+fn build_telegram_component(
     data_dir: &Path,
+    tree_name: &str,
+    component_name: &'static str,
     destination: &Path,
     token_path: Option<&Path>,
 ) -> Result<ManifestComponent, CommandError> {
@@ -632,14 +653,14 @@ fn build_conversations_component(
         Ok(_) => {}
         Err(MetadataFailure::Missing) => {
             builder.warning(WARNING_MISSING);
-            return Ok(builder.finish(CONVERSATIONS_COMPONENT, None));
+            return Ok(builder.finish(component_name, None));
         }
         Err(_) => {
             builder.warning(WARNING_UNREADABLE);
-            return Ok(builder.finish(CONVERSATIONS_COMPONENT, None));
+            return Ok(builder.finish(component_name, None));
         }
     }
-    let source = data_dir.join(CONVERSATIONS_DIR_NAME);
+    let source = data_dir.join(tree_name);
     match regular_directory_metadata(&source) {
         Ok(_) => copy_tree(
             &source,
@@ -652,7 +673,7 @@ fn build_conversations_component(
         Err(MetadataFailure::Missing) => builder.warning(WARNING_MISSING),
         Err(_) => builder.warning(WARNING_UNREADABLE),
     }
-    Ok(builder.finish(CONVERSATIONS_COMPONENT, None))
+    Ok(builder.finish(component_name, None))
 }
 
 fn copy_tree(
@@ -995,12 +1016,16 @@ fn preflight_backup(backup_dir: &Path) -> Result<RestorePreflight, CommandError>
                     0,
                 )?;
             }
-            CONVERSATIONS_COMPONENT => {
-                let source = backup_dir.join(CONVERSATIONS_DIR_NAME);
+            CONVERSATIONS_COMPONENT | JOURNALS_COMPONENT => {
+                let tree = if manifest_component.name == JOURNALS_COMPONENT {
+                    JOURNALS_DIR_NAME
+                } else {
+                    CONVERSATIONS_DIR_NAME
+                };
                 scan_restore_directory(
-                    &source,
+                    &backup_dir.join(tree),
                     &mut component,
-                    PathBuf::from(CONVERSATIONS_DIR_NAME),
+                    PathBuf::from(tree),
                     configured_token_name.as_deref(),
                     0,
                 )?;
@@ -1070,8 +1095,13 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), CommandError> {
     }
     let mut names = BTreeSet::new();
     for component in &manifest.components {
-        if ![CONFIG_COMPONENT, MEMORY_COMPONENT, CONVERSATIONS_COMPONENT]
-            .contains(&component.name.as_str())
+        if ![
+            CONFIG_COMPONENT,
+            MEMORY_COMPONENT,
+            CONVERSATIONS_COMPONENT,
+            JOURNALS_COMPONENT,
+        ]
+        .contains(&component.name.as_str())
             || !names.insert(component.name.clone())
             || component
                 .warnings
@@ -1120,7 +1150,9 @@ fn validate_backup_root_entries(
             || (name.as_os_str() == OsStr::new(MEMORY_DIR_NAME)
                 && allowed.contains(MEMORY_COMPONENT))
             || (name.as_os_str() == OsStr::new(CONVERSATIONS_DIR_NAME)
-                && allowed.contains(CONVERSATIONS_COMPONENT));
+                && allowed.contains(CONVERSATIONS_COMPONENT))
+            || (name.as_os_str() == OsStr::new(JOURNALS_DIR_NAME)
+                && allowed.contains(JOURNALS_COMPONENT));
         if !allowed_name {
             return Err(CommandError::failed(CATEGORY_INVALID_BACKUP));
         }
@@ -1501,6 +1533,8 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("file mode");
     }
 
+    const FIXTURE_JOURNAL: &str = "0b9f7d8e-1c2a-4e3b-9a5d-6f7e8d9c0b1a.jsonl";
+
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let root = tempdir().expect("temp root");
         let home = root.path().join("home");
@@ -1515,6 +1549,10 @@ mod tests {
         private_file(
             &telegram.join(CONVERSATIONS_DIR_NAME).join("1.json"),
             b"message body\n",
+        );
+        private_file(
+            &telegram.join(JOURNALS_DIR_NAME).join(FIXTURE_JOURNAL),
+            b"journal body\n",
         );
         let token = root.path().join("telegram.token");
         private_file(&token, b"TEST_TOKEN_SECRET_MARKER");
@@ -1572,6 +1610,11 @@ mod tests {
                 .expect("source conversation"),
             fs::read(backup.join(CONVERSATIONS_DIR_NAME).join("1.json"))
                 .expect("backup conversation")
+        );
+        assert_eq!(
+            fs::read(telegram.join(JOURNALS_DIR_NAME).join(FIXTURE_JOURNAL))
+                .expect("source journal"),
+            fs::read(backup.join(JOURNALS_DIR_NAME).join(FIXTURE_JOURNAL)).expect("backup journal")
         );
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(backup.join(MANIFEST_FILE_NAME)).expect("manifest"))
@@ -1678,6 +1721,67 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(dir_mode, 0o700);
+        // #210: the journal a conversation record points at comes back at
+        // the data-directory layout the restored target is served from.
+        assert_eq!(
+            fs::read(target.join(JOURNALS_DIR_NAME).join(FIXTURE_JOURNAL))
+                .expect("restored journal"),
+            b"journal body\n"
+        );
+        let journal = report
+            .components
+            .iter()
+            .find(|c| c.name == JOURNALS_COMPONENT)
+            .expect("journals in the report");
+        assert_eq!((journal.file_count, journal.byte_count), (1, 13));
+    }
+
+    /// An archive written before #210 has no `journals` component; it must
+    /// still restore exactly as it did.
+    #[test]
+    fn a_backup_without_journals_still_restores() {
+        let (_root, home, telegram, backups) = fixture();
+        let backup = create_at(&home, &backups, Some(&telegram), None).expect("backup");
+        fs::remove_dir_all(backup.join(JOURNALS_DIR_NAME)).expect("drop journals tree");
+        let path = backup.join(MANIFEST_FILE_NAME);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("manifest")).expect("json");
+        manifest["components"]
+            .as_array_mut()
+            .expect("components")
+            .retain(|c| c["name"] != JOURNALS_COMPONENT);
+        fs::write(&path, serde_json::to_vec(&manifest).expect("json")).expect("manifest");
+
+        let target = backups.join("restore-old");
+        let report = restore_at(&target, &backup, false).expect("restore");
+        assert!(
+            report
+                .components
+                .iter()
+                .all(|c| c.name != JOURNALS_COMPONENT)
+        );
+        assert!(!target.join(JOURNALS_DIR_NAME).exists());
+        assert!(target.join(CONVERSATIONS_DIR_NAME).join("1.json").is_file());
+    }
+
+    /// A `journals/` tree the manifest does not list is an unexpected entry,
+    /// like any other: restore refuses it rather than planting it.
+    #[test]
+    fn an_unlisted_journals_tree_is_refused() {
+        let (_root, home, telegram, backups) = fixture();
+        let backup = create_at(&home, &backups, Some(&telegram), None).expect("backup");
+        let path = backup.join(MANIFEST_FILE_NAME);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("manifest")).expect("json");
+        manifest["components"]
+            .as_array_mut()
+            .expect("components")
+            .retain(|c| c["name"] != JOURNALS_COMPONENT);
+        fs::write(&path, serde_json::to_vec(&manifest).expect("json")).expect("manifest");
+        let target = backups.join("restore-unlisted");
+        let error = restore_at(&target, &backup, false).expect_err("unlisted tree");
+        assert_eq!(error.category(), CATEGORY_INVALID_BACKUP);
+        assert!(!target.exists());
     }
 
     #[test]

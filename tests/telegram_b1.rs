@@ -389,6 +389,7 @@ impl Environment {
             "DANSO_TELEGRAM_COMPACT_AT_BYTES",
             "DANSO_TELEGRAM_HEARTBEAT_SECONDS",
             "DANSO_TELEGRAM_FOLLOWUP_CAP",
+            "DANSO_TELEGRAM_MEMORY_MODE",
             "DANSO_TELEGRAM_MEMORY_SCOPE",
             "DANSO_MEMORY_DIR",
             "DANSO_TASK_WALL_SECONDS",
@@ -1075,6 +1076,71 @@ async fn distill_reports_enqueue_and_already_pending_without_transcript_content(
             .any(|text| text.contains(memory_root_text.as_str()))
     );
     drop(environment);
+}
+
+/// #209: `memory.mode` reaches the service turn. With `read` the provider
+/// request carries the managed block and the stored fact; left unset (`off`)
+/// the same turn on the same store carries neither.
+#[tokio::test]
+async fn memory_mode_read_injects_the_managed_block_into_service_turns() {
+    const MARKER: &str = "ccc-node:codex-memory:begin";
+    const FACT: &str = "Release notes on this node are bilingual (telegrammemorycanary).";
+    let _lock = environment_lock().await;
+    let root = tempfile::tempdir().expect("test state");
+    pin_private_mode(root.path());
+    let memory_root = root.path().join("memory");
+    let memory = |args: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_danso"))
+            .arg("memory")
+            .args(args)
+            .env("DANSO_MEMORY_DIR", &memory_root)
+            .output()
+            .expect("run danso memory");
+        assert!(
+            output.status.success(),
+            "danso memory {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    memory(&["init", "--scope", "global"]);
+    memory(&["add", "--kind", "constraint", "--text", FACT]);
+
+    let bodies = |provider: &LoopbackServer| -> Vec<String> {
+        provider
+            .requests
+            .lock()
+            .expect("fixture request lock")
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect()
+    };
+
+    for (mode, injected) in [(None, false), (Some("read"), true)] {
+        let bot = LoopbackServer::bot(None);
+        let provider = LoopbackServer::anthropic(None);
+        let environment = Environment::new("anthropic", &bot, "fixture-model", root.path());
+        environment.set_provider_base("anthropic", &provider);
+        environment.set("DANSO_MEMORY_DIR", memory_root.as_os_str());
+        if let Some(mode) = mode {
+            environment.set("DANSO_TELEGRAM_MEMORY_MODE", mode);
+        }
+        let service = TelegramService::from_env().expect("Telegram service config");
+        service
+            .handle_update(update(1, 42, "What should I keep in mind?"))
+            .await
+            .expect("turn");
+        wait_for_message(&bot, "fixture answer").await;
+        let bodies = bodies(&provider);
+        assert_eq!(bodies.len(), 1, "mode {mode:?}: one provider request");
+        assert_eq!(
+            bodies[0].contains(MARKER) && bodies[0].contains("telegrammemorycanary"),
+            injected,
+            "mode {mode:?}: managed block present must be {injected}"
+        );
+        drop(service);
+        drop(environment);
+        fs::remove_dir_all(root.path().join("conversations")).ok();
+    }
 }
 
 #[tokio::test]

@@ -12,7 +12,9 @@ The steps are an ordered list: part 1 of #204 (#205) wrote steps 1-4, part 2
 appended steps 5-10 to STEPS and emptied PENDING. Any failed row stops the run
 and fails it. A row tied to a documented code defect (KNOWN_GAPS) passes only
 while that defect reproduces exactly as documented, so a fix cannot go
-unnoticed and a different failure is still a failure.
+unnoticed and a different failure is still a failure. K1 (#209) and K2 (#210)
+are fixed and their rows are ordinary checks now; the table is empty until
+the next defect this reproduction finds.
 
     python3 scripts/fresh_env.py --bin target/release/danso
     python3 scripts/fresh_env.py --self-test      # fakes and table only, no docker
@@ -45,6 +47,13 @@ DANSO_HOME = f'{HOME}/.danso'
 STATE_ROOT = f'{DANSO_HOME}/telegram'      # the documented default state root
 WORKSPACE = '/srv/danso/workspace'          # docs/service-install.md example
 TOKEN_FILE = '/srv/danso/telegram.token'    # docs/service-install.md example
+# docs/release-signing.md "Rehearsing apply and rollback offline": the
+# committed throwaway-key fixture, trusted only by a scratch home.
+RELEASE_FIXTURE = ROOT / 'tests' / 'fixtures' / 'release'
+FIXTURE_DIR = '/srv/danso-release-fixture'
+FIXTURE_ARTIFACT = 'danso-9.9.9-ok.tar.gz'
+REHEARSAL_HOME = '/srv/danso-update-rehearsal'
+EXIT_VERIFICATION_FAILED = 13                # docs/unified-design.md §6.3
 DIST = '/tmp/danso-dist/danso'              # where the unreleased build is copied in
 PROVIDER_KEY = 'fresh-env-fixture-key-not-a-secret'
 BOT_TOKEN = '000000:FRESH-ENV-NOT-A-REAL-TOKEN'
@@ -66,10 +75,8 @@ RESTART_NOTICE = 'Service restarted. The prior turn did not complete'  # docs/te
 PENDING = []
 
 # Code defects the reproduction exposes; docs/fresh-environment.md "Known gaps".
-KNOWN_GAPS = {
-    'K1': 'Telegram service turns run with memory off: no managed memory block reaches the provider',
-    'K2': "backup omits session journals: a restored chat's first turn cannot start until /new",
-}
+# K1 (#209) and K2 (#210) were fixed; their rows now pass as ordinary checks.
+KNOWN_GAPS = {}
 
 # Runs one command inside the container and reports, on its last stderr line,
 # exit code, wall time and the danso process's peak RSS. Slim images have no
@@ -413,6 +420,9 @@ class Container:
         # outside PATH so step 2 is the install, not the copy.
         self.sh(f'mkdir -p {Path(DIST).parent} && mv /tmp/danso {DIST}')
 
+    def copy_in(self, source, destination):
+        docker('cp', str(source), f'{self.name}:{destination}')
+
     def remove(self):
         subprocess.run(['docker', 'rm', '-f', self.name], capture_output=True)
 
@@ -617,10 +627,13 @@ def step_install(ctx):
     row = ctx.row(2, 'config.toml per docs + `danso config check`', 'danso config check')
     # docs/service-install.md "Installing": owner-only token file named from
     # $DANSO_HOME/config.toml; the state root itself is left for danso to create.
+    # docs/telegram.md: `memory.mode = "read"` gives service turns the managed
+    # memory block (#209); step 6 checks a turn's provider request for it.
     config = '\n'.join([
         '[telegram]', f'token_file = "{TOKEN_FILE}"', 'allowed_user_ids = [1]',
         '[provider]', 'model = "fixture-model"',
-        '[core]', f'workspace = "{WORKSPACE}"', ''])
+        '[core]', f'workspace = "{WORKSPACE}"',
+        '[memory]', 'mode = "read"', ''])
     setup = ctx.container.sh(
         'set -e; umask 077; mkdir -p "$1" "$2" "$(dirname "$3")";'
         ' printf "%s\\n" "$4" > "$3"; printf "%s" "$5" > "$2/config.toml"',
@@ -816,16 +829,18 @@ def step_memory(ctx):
     row.note = 'managed block and the fact are in the provider request'
     row.passed = True
 
-    # docs/telegram.md: memory.scope "selects the memory route used by turns".
-    row = ctx.row(6, 'injection: Telegram service turn (known gap K1)',
+    # docs/telegram.md: `memory.mode` (set to "read" in step 2) turns injection
+    # on for service turns; `memory.scope` picks the route (#209, was K1).
+    row = ctx.row(6, 'injection: Telegram service turn (`memory.mode = "read"`)',
                   'getUpdates -> in-process turn; provider request inspected')
     answered, sent, requests = telegram_turn(ctx, row, 'What should I keep in mind on this node?')
     require(row, answered and len(requests) == 1, 'the Telegram turn did not complete: ' + bot_trace(sent))
     body = json.dumps(requests[0])
+    require(row, MEMORY_MARKER in body and MEMORY_TOKEN in body,
+            'the managed memory block with the fact is not in the Telegram turn\'s provider request')
     service_rss(ctx, row)
-    row.note = 'turn answered; no managed memory block in its provider request'
-    known_gap(row, 'K1', MEMORY_MARKER not in body and MEMORY_TOKEN not in body,
-              'the service turn now carries the managed memory block')
+    row.note = 'turn answered; managed block and the fact are in its provider request'
+    row.passed = True
 
     row = ctx.row(6, 'restart (stop, `--supervise`): fact still found',
                   f'danso service stop --data-dir {STATE_ROOT}; danso service run ... --supervise; '
@@ -896,7 +911,8 @@ def step_backup(ctx):
     require(row, snapshot.startswith(f'{DANSO_HOME}/backups/backup-'), 'backup did not print its directory', done)
     manifest = json_out(ctx.container.exec(['cat', f'{snapshot}/manifest.json']))
     names = [c.get('name') for c in manifest.get('components') or []]
-    require(row, sorted(names) == ['config', 'conversations', 'memory'], f'unexpected components: {names}')
+    require(row, sorted(names) == ['config', 'conversations', 'journals', 'memory'],
+            f'unexpected components: {names}')
     leaked = ctx.container.exec(['grep', '-rqF', '-e', BOT_TOKEN, snapshot])
     require(row, leaked.returncode == 1, 'the bot token is in the snapshot', leaked)
     row.note = f'components: {", ".join(names)}; token not in the snapshot'
@@ -927,23 +943,21 @@ def step_backup(ctx):
     row.note = 'config valid; memory fact found; ready = status available'
     row.passed = True
 
-    row = ctx.row(8, 'restored chat: first turn (known gap K2)',
+    # docs/backup.md: the snapshot carries the session journals (#210, was
+    # K2), so the restored chat continues its session instead of being
+    # refused until /new. The step 6 prompt in the request is that history.
+    row = ctx.row(8, 'restored chat: first turn continues the session',
                   'getUpdates -> turn on the restored session pointer')
-    mark, before = len(ctx.bot.sent), len(ctx.provider.requests)
-    start = time.monotonic()
-    ctx.bot.push('Explain this repository')
-
-    def settled():
-        sent = ctx.bot.sent[mark:]
-        return replies(sent) or any(d['method'] == 'editMessageText' and TURN_NOT_STARTED in d['text']
-                                    for d in sent)
-
-    require(row, wait_for(settled, 30),
-            'the restored chat got neither an answer nor a refusal: ' + bot_trace(ctx.bot.sent[mark:]))
-    row.wall_s = time.monotonic() - start
-    row.note = '`Turn could not start`: the restored session pointer has no journal; no provider request'
-    known_gap(row, 'K2', not replies(ctx.bot.sent[mark:]) and len(ctx.provider.requests) == before,
-              'the restored chat was answered without /new')
+    answered, sent, requests = telegram_turn(ctx, row, 'Explain this repository')
+    require(row, not any(d['method'] == 'editMessageText' and TURN_NOT_STARTED in d['text'] for d in sent),
+            'the restored chat was refused (`Turn could not start`): ' + bot_trace(sent))
+    require(row, answered and len(replies(sent)) == 1 and len(requests) == 1,
+            f'expected one answer and one provider request (saw {len(requests)}): ' + bot_trace(sent))
+    require(row, 'What should I keep in mind on this node?' in json.dumps(requests[0]),
+            'the restored turn did not carry the session history from the restored journal')
+    service_rss(ctx, row)
+    row.note = '1 answer, 1 provider request; the request carries the pre-backup history'
+    row.passed = True
 
     row = ctx.row(8, '`/new`, then one turn on the restored home', '/new; getUpdates -> turn -> sendMessage')
     mark = len(ctx.bot.sent)
@@ -1028,14 +1042,61 @@ def step_update(ctx):
     row.note = 'exit 2, no source configured (docs/release-signing.md); nothing fetched'
     row.passed = True
 
-    # docs/release-signing.md: `apply` reads a local --artifact-dir, but only
-    # installs what the release key signed. A PR build has no signed
-    # manifest, and signing one with a stand-in key would be a fake release.
-    row = ctx.row(10, '`update apply` then `update rollback`',
-                  'danso update apply --artifact-dir <dir> --artifact <name>; danso update rollback')
-    row.result = 'not run: doc gap 10'
-    row.note = ('offline by design, but needs a release-key-signed SHA256SUMS; '
-                'a PR build has none and a stand-in key would be a fake release')
+    # docs/release-signing.md "Rehearsing apply and rollback offline" (doc gap
+    # 10): the committed fixture is signed by a throwaway key whose private
+    # half is destroyed. The embedded release key must refuse it; only a
+    # scratch home that names the fixture key in `[update] public_key`
+    # installs it, and rollback returns to the binary that home started with.
+    ctx.container.copy_in(RELEASE_FIXTURE, FIXTURE_DIR)
+    fixture_key = (RELEASE_FIXTURE / 'fixture-key.pub').read_text().splitlines()[1].strip()
+    rehearsal = {'DANSO_HOME': REHEARSAL_HOME}
+    apply_args = ['update', 'apply', '--artifact-dir', FIXTURE_DIR, '--artifact', FIXTURE_ARTIFACT,
+                  '--data-dir', REHEARSAL_HOME, '--json']
+    installed = f'{REHEARSAL_HOME}/bin/danso'
+
+    def installed_version():
+        return ctx.container.exec([installed, '--version']).stdout.strip()
+
+    row = ctx.row(10, '`update apply`: the release key refuses the fixture',
+                  f'DANSO_HOME={REHEARSAL_HOME} danso update apply --artifact-dir <fixture> '
+                  f'--artifact {FIXTURE_ARTIFACT}')
+    seed = ctx.container.sh('set -e; umask 077; mkdir -p "$1/bin"; install -m 0755 /usr/local/bin/danso "$1/bin/danso"',
+                            REHEARSAL_HOME)
+    require(row, seed.returncode == 0, 'seeding the rehearsal home failed', seed)
+    serving = installed_version()
+    require(row, serving.startswith('danso '), f'seeded binary did not report a version: {serving!r}')
+    done = run_danso(ctx, row, apply_args, env=rehearsal)
+    require(row, row.rc == EXIT_VERIFICATION_FAILED,
+            f'expected exit {EXIT_VERIFICATION_FAILED} without the fixture key, got {row.rc}', done)
+    require(row, installed_version() == serving, 'a refused apply changed the installed binary')
+    row.note = f'exit {EXIT_VERIFICATION_FAILED}, installed binary unchanged ({serving})'
+    row.passed = True
+
+    row = ctx.row(10, '`update apply` + `update activate` with the fixture key',
+                  f'[update] public_key = <fixture key> in {REHEARSAL_HOME}/config.toml; '
+                  'danso update apply ...; danso update activate')
+    config = ctx.container.sh('umask 077; printf \'[update]\\npublic_key = "%s"\\n\' "$2" > "$1/config.toml"',
+                              REHEARSAL_HOME, fixture_key)
+    require(row, config.returncode == 0, 'writing the rehearsal config failed', config)
+    done = run_danso(ctx, row, apply_args, env=rehearsal)
+    require(row, row.rc == 0, f'apply exited {row.rc}', done)
+    require(row, installed_version() == 'danso 9.9.9', f'installed: {installed_version()!r}', done)
+    activated = ctx.container.exec(['danso', 'update', 'activate', '--json'], env=rehearsal)
+    require(row, activated.returncode == 0 and json_out(activated).get('result') == 'activated',
+            'activate did not report activated', activated)
+    row.note = 'exit 0; `bin/danso --version` = danso 9.9.9; activate: activated'
+    row.passed = True
+
+    row = ctx.row(10, '`update rollback` -> the seeded binary is back',
+                  f'DANSO_HOME={REHEARSAL_HOME} danso update rollback; danso update activate')
+    done = run_danso(ctx, row, ['update', 'rollback', '--json'], env=rehearsal)
+    require(row, row.rc == 0, f'rollback exited {row.rc}', done)
+    require(row, installed_version() == serving, f'after rollback: {installed_version()!r}', done)
+    same = ctx.container.sh('cmp -s /usr/local/bin/danso "$1"', installed)
+    require(row, same.returncode == 0, 'the rolled-back binary differs from the seeded one', same)
+    activated = ctx.container.exec(['danso', 'update', 'activate', '--json'], env=rehearsal)
+    require(row, activated.returncode == 0, 'activate after rollback failed', activated)
+    row.note = f'exit 0; byte-identical to the seeded binary ({serving}); activate exit 0'
     row.passed = True
 
 
@@ -1229,7 +1290,9 @@ def self_test():
     assert '| 1 | x | 0 | 1.500 |  | 2.0 MiB | FAIL |' in table
     assert '| 6 | g |  |  |  |  | known gap K1 |' in table
     assert not PENDING and 'pending part 2' not in table
-    assert set(KNOWN_GAPS) == {'K1', 'K2'}
+    assert KNOWN_GAPS == {}, 'K1/K2 are fixed; a new gap needs its docs row too'
+    assert (RELEASE_FIXTURE / FIXTURE_ARTIFACT).is_file()
+    assert (RELEASE_FIXTURE / 'fixture-key.pub').read_text().splitlines()[1].startswith('RW')
     assert [s.__name__ for s in STEPS] == ['step_preflight', 'step_install', 'step_provider',
                                            'step_service', 'step_telegram', 'step_memory',
                                            'step_cron', 'step_backup', 'step_crash', 'step_update']
