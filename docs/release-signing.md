@@ -252,6 +252,48 @@ back. The two ways forward are `update rollback`, which supersedes the record
 and swaps the binaries back, and `update activate --retry`, for when the
 failure was environmental.
 
+## Rehearsing apply and rollback offline
+
+`apply` → `activate` → `rollback` can be exercised without a release and
+without the network, against the committed fixture in `tests/fixtures/release`
+(#211). That directory is a complete, correctly signed release whose key is a
+**throwaway**: its private half was destroyed when the fixture was made, so
+nothing new can be signed with it, and the archives contain a shell script, not
+a binary. It is a rehearsal of the install mechanics, not a release, and it
+never becomes one:
+
+* The embedded release key refuses it. Run `apply` against it with no
+  `[update] public_key` and it exits 13 and installs nothing — check that
+  first; a rehearsal that installs without the override is a broken verifier.
+* Only a **scratch** `$DANSO_HOME` trusts it, through `[update] public_key` set
+  to the second line of `fixture-key.pub`. Never put the fixture key in the
+  `config.toml` of a home that serves: that home would then install anything
+  the fixture lists.
+* `apply` installs into `$DANSO_HOME/bin/danso` and keeps the replaced file as
+  `bin/danso.prev`. Seed `bin/danso` with the binary you run, or there is
+  nothing to roll back to.
+
+```sh
+export DANSO_HOME=/srv/danso-update-rehearsal          # scratch, not a serving home
+mkdir -p "$DANSO_HOME/bin"
+install -m 0755 "$(command -v danso)" "$DANSO_HOME/bin/danso"
+danso update apply --artifact-dir <checkout>/tests/fixtures/release \
+  --artifact danso-9.9.9-ok.tar.gz --data-dir "$DANSO_HOME"    # exit 13: refused
+printf '[update]\npublic_key = "%s"\n' "$(sed -n 2p <checkout>/tests/fixtures/release/fixture-key.pub)" \
+  > "$DANSO_HOME/config.toml"
+danso update apply --artifact-dir <checkout>/tests/fixtures/release \
+  --artifact danso-9.9.9-ok.tar.gz --data-dir "$DANSO_HOME"    # exit 0
+"$DANSO_HOME/bin/danso" --version                            # danso 9.9.9
+danso update activate                                        # activated
+danso update rollback                                        # the seeded binary is back
+danso update activate
+```
+
+`--data-dir` points the idle gate at the scratch home, which has no service,
+so it never defers. The fresh-environment run performs exactly this as step 10
+([fresh-environment.md](fresh-environment.md)). Whether a real release
+verifies under the real key is the signing self-test's job, not this one's.
+
 ## The idle gate
 
 Before any of that, `apply` asks whether the service is in the middle of a

@@ -89,6 +89,10 @@ pub const KEY_SOURCES: &[KeySource] = &[
         ],
     },
     KeySource {
+        key: "memory.mode",
+        env: &["DANSO_TELEGRAM_MEMORY_MODE"],
+    },
+    KeySource {
         key: "memory.dir",
         env: &[crate::memory::DIR_ENV],
     },

@@ -102,6 +102,7 @@ struct RunSettings {
     compact_at_bytes: Option<usize>,
     heartbeat_seconds: u64,
     followup_cap: usize,
+    memory_mode: crate::memory::MemoryMode,
     memory_root: PathBuf,
     memory_scope: String,
     task_limits: crate::long_task::Limits,
@@ -244,6 +245,26 @@ impl RunSettings {
             0,
             MAX_FOLLOWUP_CAP,
         )? as usize;
+        // `memory.mode` decides whether a turn carries the managed memory
+        // block (#209). `off` stays the default, so a node that never set it
+        // keeps sending exactly what it sent before; `memory.scope` and
+        // `memory.dir` below pick the route only once it is on.
+        let memory_mode = match settings::resolve_string(
+            layered,
+            settings::aliases("memory.mode"),
+            "memory.mode",
+            |c| c.memory.mode.clone(),
+        )?
+        .map(|(value, _)| value)
+        .as_deref()
+        {
+            None | Some("off") => crate::memory::MemoryMode::Off,
+            Some("read") => crate::memory::MemoryMode::Read,
+            Some("read-write") => crate::memory::MemoryMode::ReadWrite,
+            Some(_) => {
+                bail!("DANSO_TELEGRAM_MEMORY_MODE or memory.mode must be off, read, or read-write")
+            }
+        };
         let memory_scope = settings::resolve_string(
             layered,
             settings::aliases("memory.scope"),
@@ -284,6 +305,7 @@ impl RunSettings {
             compact_at_bytes,
             heartbeat_seconds,
             followup_cap,
+            memory_mode,
             memory_root,
             memory_scope,
             task_limits,
@@ -315,6 +337,7 @@ impl RunSettings {
             no_tools: self.no_tools,
             system_context_file: None,
             memory: crate::memory::MemoryConfig {
+                mode: self.memory_mode,
                 root: Some(self.memory_root.clone()),
                 scope: self.memory_scope.clone(),
                 max_bytes: crate::memory::snapshot::SNAPSHOT_MAX_BYTES_DEFAULT,
