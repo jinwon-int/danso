@@ -88,49 +88,53 @@ skipping it silently.
 ## Measured
 
 All ten steps measured by the `Fresh environment` CI run
+[37300710609](https://github.com/jinwon-int/danso/actions/runs/37300710609)
+(GitHub-hosted `ubuntu-22.04`, release build of PR #212 head `dc6b02d`):
+33 rows, all pass, none a known gap or not run. That run is the first with
+K1 (#209) and K2 (#210) fixed and step 10's offline apply → rollback rehearsal
+(#211). The previous measurement, with K1/K2 still reproducing and step 10's
+second row not run, was run
 [37205989960](https://github.com/jinwon-int/danso/actions/runs/37205989960)
-(GitHub-hosted `ubuntu-22.04`, release build of PR #208 head `59528cd`).
-Steps 1–4 were first measured in run
+(PR #208); steps 1–4 were first measured in run
 [37203423774](https://github.com/jinwon-int/danso/actions/runs/37203423774)
-(PR #205) with matching results. The harness was written on a runner with
-neither docker nor cargo, so CI is where it first ran against a real
-binary; every run prints the same table to its log and step summary, and
-later runs may differ slightly in timing. Rows marked *known gap* pass only
-while the documented defect reproduces exactly (see *Known gaps*).
+(PR #205). Every run prints the same table to its log and step summary, and
+later runs may differ slightly in timing.
 
 | Step | Check | Exit | Wall s | Ready s | RSS (danso) | Result | Notes |
 | --- | --- | ---: | ---: | ---: | ---: | --- | --- |
-| 1 | preflight: no python/node/ccc-node, ldd | 0 | 0.060 |  |  | pass | absent: python3, python, node, nodejs, ccc-node; 5 ldd entries |
-| 2 | install binary (signature: n/a, unreleased PR build) | 0 | 0.022 |  |  | pass | no signed manifest exists for a PR build; minisign -V -H (docs/release-signing.md) applies to Release artifacts only |
-| 2 | config.toml per docs + `danso config check` | 0 | 0.022 |  |  | pass | valid; set_keys=4 |
-| 3 | provider auth: print-mode turn on loopback fake | 0 | 0.022 |  | 7.9 MiB | pass | usage line present: requests=1 totalTokens=18 |
-| 4 | `danso service install` on a host without systemd | 0 | 0.022 |  |  | pass | prints the Termux:Boot equivalent, installs nothing |
-| 4 | `service run --supervise` -> available | 0 | 0.104 | 0.104 | 10.9 MiB (supervisor 7.3 MiB) | pass | ready = `danso service status` exit 0 (Bot status: available) |
-| 4 | `danso doctor` against the running service | 0 | 0.022 |  |  | pass | ok=8 warn=2 fail=0 (home.layout, memory.store) |
-| 4 | `danso service stop` -> supervisor exits | 0 | 0.103 |  |  | pass | Bot stop: drained; supervisor and service gone |
-| 5 | service with an absent `core.workspace` (doc gap 4) | 1 | 0.023 |  | 7.5 MiB | pass | exit 1 before polling: `Telegram workspace does not exist`; not created |
-| 5 | `service run --supervise` -> available | 0 | 0.104 | 0.104 | 10.5 MiB (supervisor 7.0 MiB) | pass | ready = `danso service status` exit 0 (Bot status: available) |
-| 5 | one Telegram turn end to end (fake Bot API) |  | 0.050 |  | 11.6 MiB | pass | 1 progress message, 1 edit(s), 1 answer; 1 provider request |
-| 5 | token lock: second `danso telegram` refused | 1 | 0.022 |  |  | pass | exit 1 (`telegram service failed`), 0 Bot API calls; lock is per data directory (doc gap 5) |
-| 6 | `danso memory init` | 0 | 0.022 |  |  | pass | scope global |
-| 6 | `danso memory add` (constraint fact) | 0 | 0.022 |  | 8.2 MiB | pass | added through the write gates |
-| 6 | `danso memory search --json` finds it | 0 | 0.022 |  | 8.3 MiB | pass | 1 matching result(s) |
-| 6 | injection: `--memory read` print-mode turn | 0 | 0.023 |  | 8.5 MiB | pass | managed block and the fact are in the provider request |
-| 6 | injection: Telegram service turn (known gap K1) |  | 0.050 |  | 11.6 MiB | known gap K1 | turn answered; no managed memory block in its provider request |
-| 6 | restart (stop, `--supervise`): fact still found | 0 | 0.105 | 0.105 | 11.1 MiB (supervisor 7.1 MiB) | pass | records=1 before and after; ready = status available |
-| 7 | `cron add` + `cron tick`: one scheduled run | 0 | 0.066 |  | 9.6 MiB | pass | executed=1; status=success, payload exit 0 |
-| 7 | failing job -> alert spool entry | 1 | 0.066 |  | 9.5 MiB | pass | exit 1, status=failed; /root/.danso/telegram/spool/2026-10-04T13-33-00Z-fresh-fail-fresh-fail-1791120780-373.json (event AgentCronRun, send=false) |
-| 8 | stop the service, `danso backup` | 0 | 0.022 |  | 7.8 MiB | pass | components: config, memory, conversations; token not in the snapshot |
-| 8 | `danso restore --target <new dir>` | 0 | 0.022 |  | 7.9 MiB | pass | restored: config=1, memory=9, conversations=1 |
-| 8 | service from the restored home | 0 | 0.104 | 0.104 | 10.7 MiB (supervisor 7.1 MiB) | pass | config valid; memory fact found; ready = status available |
-| 8 | restored chat: first turn (known gap K2) |  | 0.050 |  |  | known gap K2 | `Turn could not start`: the restored session pointer has no journal; no provider request |
-| 8 | `/new`, then one turn on the restored home |  | 0.100 |  | 11.7 MiB | pass | fresh session pointer; 1 answer, 1 provider request |
-| 9 | turn in flight, `kill -9` the service -> replacement available | 0 | 0.105 | 0.105 | 11.2 MiB (supervisor 7.3 MiB) | pass | pid 458 -> 504 under the same supervisor |
+| 1 | preflight: no python/node/ccc-node, ldd | 0 | 0.108 |  |  | pass | absent: python3, python, node, nodejs, ccc-node; 5 ldd entries |
+| 2 | install binary (signature: n/a, unreleased PR build) | 0 | 0.024 |  |  | pass | no signed manifest exists for a PR build; minisign -V -H (docs/release-signing.md) applies to Release artifacts only |
+| 2 | config.toml per docs + `danso config check` | 0 | 0.025 |  |  | pass | valid; set_keys=5 |
+| 3 | provider auth: print-mode turn on loopback fake | 0 | 0.025 |  | 8.2 MiB | pass | usage line present: requests=1 totalTokens=18 |
+| 4 | `danso service install` on a host without systemd | 0 | 0.025 |  |  | pass | prints the Termux:Boot equivalent, installs nothing |
+| 4 | `service run --supervise` -> available | 0 | 0.108 | 0.108 | 10.8 MiB (supervisor 7.1 MiB) | pass | ready = `danso service status` exit 0 (Bot status: available) |
+| 4 | `danso doctor` against the running service | 0 | 0.025 |  |  | pass | ok=8 warn=2 fail=0 (home.layout, memory.store) |
+| 4 | `danso service stop` -> supervisor exits | 0 | 0.106 |  |  | pass | Bot stop: drained; supervisor and service gone |
+| 5 | service with an absent `core.workspace` (doc gap 4) | 1 | 0.025 |  | 7.6 MiB | pass | exit 1 before polling: `Telegram workspace does not exist`; not created |
+| 5 | `service run --supervise` -> available | 0 | 0.108 | 0.108 | 10.4 MiB (supervisor 7.1 MiB) | pass | ready = `danso service status` exit 0 (Bot status: available) |
+| 5 | one Telegram turn end to end (fake Bot API) |  | 0.050 |  | 11.7 MiB | pass | 1 progress message, 1 edit(s), 1 answer; 1 provider request |
+| 5 | token lock: second `danso telegram` refused | 1 | 0.025 |  |  | pass | exit 1 (`telegram service failed`), 0 Bot API calls; lock is per data directory (doc gap 5) |
+| 6 | `danso memory init` | 0 | 0.025 |  |  | pass | scope global |
+| 6 | `danso memory add` (constraint fact) | 0 | 0.025 |  | 8.4 MiB | pass | added through the write gates |
+| 6 | `danso memory search --json` finds it | 0 | 0.025 |  | 8.8 MiB | pass | 1 matching result(s) |
+| 6 | injection: `--memory read` print-mode turn | 0 | 0.049 |  | 13.8 MiB | pass | managed block and the fact are in the provider request |
+| 6 | injection: Telegram service turn (`memory.mode = "read"`) |  | 0.100 |  | 14.8 MiB | pass | turn answered; managed block and the fact are in its provider request |
+| 6 | restart (stop, `--supervise`): fact still found | 0 | 0.108 | 0.108 | 10.8 MiB (supervisor 7.0 MiB) | pass | records=1 before and after; ready = status available |
+| 7 | `cron add` + `cron tick`: one scheduled run | 0 | 0.072 |  | 9.4 MiB | pass | executed=1; status=success, payload exit 0 |
+| 7 | failing job -> alert spool entry | 1 | 0.073 |  | 9.3 MiB | pass | exit 1, status=failed; /root/.danso/telegram/spool/2026-10-05T11-07-00Z-fresh-fail-fresh-fail-1791198420-380.json (event AgentCronRun, send=false) |
+| 8 | stop the service, `danso backup` | 0 | 0.025 |  | 7.8 MiB | pass | components: config, memory, conversations, journals; token not in the snapshot |
+| 8 | `danso restore --target <new dir>` | 0 | 0.025 |  | 8.1 MiB | pass | restored: config=1, memory=9, conversations=1, journals=1 |
+| 8 | service from the restored home | 0 | 0.108 | 0.108 | 10.6 MiB (supervisor 7.0 MiB) | pass | config valid; memory fact found; ready = status available |
+| 8 | restored chat: first turn continues the session |  | 0.050 |  | 14.6 MiB | pass | 1 answer, 1 provider request; the request carries the pre-backup history |
+| 8 | `/new`, then one turn on the restored home |  | 0.050 |  | 14.9 MiB | pass | fresh session pointer; 1 answer, 1 provider request |
+| 9 | turn in flight, `kill -9` the service -> replacement available | 0 | 0.110 | 0.110 | 10.8 MiB (supervisor 7.2 MiB) | pass | pid 465 -> 528 under the same supervisor |
 | 9 | orphan cleanup: restart notice, no replay, no duplicate effects |  | 0.000 |  |  | pass | restart notice on the interrupted progress message; 1 provider request (no replay); 0 answers; memory records=1 unchanged |
-| 9 | next turn after the crash: exactly one answer |  | 0.100 |  | 12.0 MiB | pass | 1 answer, 1 provider request, same chat and session |
-| 9 | `danso service stop` -> supervisor exits | 0 | 0.103 |  |  | pass | Bot stop: drained; supervisor and service gone |
-| 10 | `danso update check` without a release source | 2 | 0.022 |  |  | pass | exit 2, no source configured (docs/release-signing.md); nothing fetched |
-| 10 | `update apply` then `update rollback` |  |  |  |  | not run: doc gap 10 | offline by design, but needs a release-key-signed SHA256SUMS; a PR build has none and a stand-in key would be a fake release |
+| 9 | next turn after the crash: exactly one answer |  | 0.100 |  | 14.9 MiB | pass | 1 answer, 1 provider request, same chat and session |
+| 9 | `danso service stop` -> supervisor exits | 0 | 0.106 |  |  | pass | Bot stop: drained; supervisor and service gone |
+| 10 | `danso update check` without a release source | 2 | 0.025 |  |  | pass | exit 2, no source configured (docs/release-signing.md); nothing fetched |
+| 10 | `update apply`: the release key refuses the fixture | 13 | 0.025 |  | 7.2 MiB | pass | exit 13, installed binary unchanged (danso 0.1.0) |
+| 10 | `update apply` + `update activate` with the fixture key | 0 | 0.121 |  | 24.1 MiB | pass | exit 0; `bin/danso --version` = danso 9.9.9; activate: activated |
+| 10 | `update rollback` -> the seeded binary is back | 0 | 0.097 |  | 23.9 MiB | pass | exit 0; byte-identical to the seeded binary (danso 0.1.0); activate exit 0 |
 
 For comparison, the systemd path measured on yukson (service-install.md):
 ready in 1.07 s, resident set 8.8 MB.
