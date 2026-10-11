@@ -195,15 +195,24 @@ pub fn report_budget(config: &crate::app::RunConfig, usage: &Usage) {
 /// existing adapters.
 pub fn budget_record(usage: &Usage, requests_total: u32, cap: u32) -> String {
     let (summary_requests, length_stops, continuations) = usage.budget_counts();
+    let compaction = usage.compaction_stats();
+    // danso#217 P5 keys are appended after the original fields so their order
+    // and meaning stay unchanged for existing readers.
     format!(
-        "{{\"version\":1,\"requests_used\":{},\"requests_total\":{},\"summary_requests\":{},\"memory_requests\":{},\"output_tokens_max\":{},\"length_stops\":{},\"continuations\":{}}}",
+        "{{\"version\":1,\"requests_used\":{},\"requests_total\":{},\"summary_requests\":{},\"memory_requests\":{},\"output_tokens_max\":{},\"length_stops\":{},\"continuations\":{},\"compactions\":{},\"compaction_failures\":{},\"summary_input_tokens\":{},\"summary_output_tokens\":{},\"summary_evidence_bytes\":{},\"summary_elided_bytes\":{}}}",
         usage.snapshot().requests,
         requests_total,
         summary_requests,
         usage.memory_requests(),
         cap,
         length_stops,
-        continuations
+        continuations,
+        compaction.compactions,
+        compaction.failures,
+        compaction.summary_input_tokens,
+        compaction.summary_output_tokens,
+        compaction.evidence_bytes,
+        compaction.elided_bytes
     )
 }
 

@@ -707,7 +707,8 @@ pub async fn run(
             guidance.push('\n');
             guidance.push_str(notice);
         }
-        async {
+        let mut compaction_started = false;
+        let compaction_result = async {
             if let Some(limit) = input.compact_at_bytes {
                 let before = provider
                     .request_bytes(&ModelRequest {
@@ -720,6 +721,7 @@ pub async fn run(
                     })
                     .map_err(at(Kind::Provider))?;
                 if before > limit {
+                    compaction_started = true;
                     // The current request and static instructions cannot be summarized
                     // away. Reject impossible budgets before spending summary calls.
                     let latest = crate::compaction::latest_user(&messages)?;
@@ -821,12 +823,16 @@ pub async fn run(
                         messages == compacted,
                         "session store returned inconsistent compacted context"
                     );
+                    usage.record_compaction();
                 }
             }
             Ok::<(), anyhow::Error>(())
         }
-        .await
-        .map_err(at(Kind::Compaction))?;
+        .await;
+        if compaction_result.is_err() && compaction_started {
+            usage.record_compaction_failure();
+        }
+        compaction_result.map_err(at(Kind::Compaction))?;
         remaining -= 1;
         request_sequence += 1;
         sink.emit(Event::Request {
