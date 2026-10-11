@@ -125,12 +125,16 @@ fn budget_record_is_exactly_the_budget_contract() {
     usage.record_memory_request();
     usage.record_memory_request();
     usage.record_length_stop();
+    usage.record_compaction();
+    usage.record_compaction_failure();
+    usage.record_summary_tokens(7, 3);
+    usage.record_compaction_evidence(900, 100);
     usage.add("noop", "silent", TokenUsage::default()).unwrap();
 
     let record = danso::output::budget_record(&usage, 12, 4096);
     assert_eq!(
         record,
-        "{\"version\":1,\"requests_used\":1,\"requests_total\":12,\"summary_requests\":1,\"memory_requests\":2,\"output_tokens_max\":4096,\"length_stops\":1,\"continuations\":0}"
+        "{\"version\":1,\"requests_used\":1,\"requests_total\":12,\"summary_requests\":1,\"memory_requests\":2,\"output_tokens_max\":4096,\"length_stops\":1,\"continuations\":0,\"compactions\":1,\"compaction_failures\":1,\"summary_input_tokens\":7,\"summary_output_tokens\":3,\"summary_evidence_bytes\":900,\"summary_elided_bytes\":100}"
     );
     // It must parse as JSON: the literal is hand-escaped.
     let parsed: Value = serde_json::from_str(&record).unwrap();

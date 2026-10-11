@@ -28,6 +28,28 @@ pub struct Usage {
     continuations: u32,
     /// Body-free timing aggregates (issue #98 e), reported via DANSO_TIMING.
     timing: Timing,
+    /// Compaction accounting for paired evaluation (danso#217 P5), reported
+    /// only via DANSO_BUDGET. Summary tokens stay aggregated in DANSO_USAGE as
+    /// before; these fields break out how much of that came from checkpoints.
+    compaction: CompactionStats,
+}
+
+/// Body-free compaction counters (danso#217 P5): counts, token totals and
+/// byte sizes only — never prompt text, tool output or summaries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompactionStats {
+    /// Checkpoints durably recorded by the runtime.
+    pub compactions: u32,
+    /// Compaction phases that started (threshold exceeded) but ended in error.
+    pub failures: u32,
+    /// Provider-reported input/output tokens of checkpoint summary requests,
+    /// including repair attempts.
+    pub summary_input_tokens: u64,
+    pub summary_output_tokens: u64,
+    /// Serialized summarizer evidence after elision, summed over compactions.
+    pub evidence_bytes: u64,
+    /// Bytes removed from older tool results before summarization (P1).
+    pub elided_bytes: u64,
 }
 
 /// Body-free timing aggregates (issue #98 e): durations in milliseconds and
@@ -164,6 +186,37 @@ impl Usage {
 
     pub fn budget_counts(&self) -> (u32, u32, u32) {
         (self.summary_requests, self.length_stops, self.continuations)
+    }
+
+    /// One checkpoint durably recorded (danso#217 P5).
+    pub fn record_compaction(&mut self) {
+        self.compaction.compactions = self.compaction.compactions.saturating_add(1);
+    }
+
+    /// One compaction phase that started but failed (danso#217 P5).
+    pub fn record_compaction_failure(&mut self) {
+        self.compaction.failures = self.compaction.failures.saturating_add(1);
+    }
+
+    /// Token usage attributed to one checkpoint summary request (danso#217 P5).
+    pub fn record_summary_tokens(&mut self, input: u64, output: u64) {
+        self.compaction.summary_input_tokens =
+            self.compaction.summary_input_tokens.saturating_add(input);
+        self.compaction.summary_output_tokens =
+            self.compaction.summary_output_tokens.saturating_add(output);
+    }
+
+    /// Size of the summarizer evidence and of what P1 elided from it.
+    pub fn record_compaction_evidence(&mut self, evidence_bytes: u64, elided_bytes: u64) {
+        self.compaction.evidence_bytes = self
+            .compaction
+            .evidence_bytes
+            .saturating_add(evidence_bytes);
+        self.compaction.elided_bytes = self.compaction.elided_bytes.saturating_add(elided_bytes);
+    }
+
+    pub fn compaction_stats(&self) -> CompactionStats {
+        self.compaction
     }
 }
 
