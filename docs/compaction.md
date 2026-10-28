@@ -96,8 +96,20 @@ checkpoint; there is no automatic ACK, tool replay or journal repair. A bounded 
   snapshot headroom, and it cannot exceed that selected budget.
 - The current request and static instructions must leave room for a checkpoint.
   Impossible budgets fail before any summary call; they are not silently cut.
-- Historical evidence is fed to the summarizer in consecutive UTF-8-safe
-  fragments, each fitting the same wire budget. No unseen evidence is truncated.
+- Before fragmenting, the summarizer's copy of the history elides **older
+  tool results** (danso#217, after arXiv 2609.20804's finding that cheap
+  elision before LLM summarization gives the best cost profile). The four most
+  recent `toolResult` messages stay verbatim; each older text block longer than
+  about 3.3 KiB keeps its first and last 1536 UTF-8-safe bytes around a marker
+  naming the elided byte count. User, assistant and previous-checkpoint
+  messages, tool ids/names and `isError` are unchanged, and the session
+  journal keeps every original byte. There is no recall tool: the paper found
+  recall of elided content almost unused and without accuracy gain. On the
+  28 × 40 KB synthetic session this cut summary requests at the glm-5.3-flash
+  default threshold from 4 to 2, and one compaction's evidence from
+  1,125,808 to 242,560 bytes (`tests/compaction.rs`).
+- That evidence is fed to the summarizer in consecutive UTF-8-safe fragments,
+  each fitting the same wire budget; fragmenting itself never cuts evidence.
   Every fragment updates the previous checkpoint; at most 32 fragments are
   allowed per compaction.
 - Each intermediate/final checkpoint is limited to one eighth of the threshold,
@@ -106,6 +118,13 @@ checkpoint; there is no automatic ACK, tool replay or journal repair. A bounded 
 - Summary requests have no tools and consume the same `--max-turns` budget as
   action requests. At least one action request is reserved. Usage includes
   summary calls and their tokens; HTTP and whole-run timeouts still apply.
+- `DANSO_BUDGET` breaks compaction out for paired evaluation (danso#217),
+  appended after the original keys: `compactions` (checkpoints recorded),
+  `compaction_failures` (phases that started but failed), `summary_input_tokens`
+  / `summary_output_tokens` (provider-reported, repairs included; still also
+  aggregated in `DANSO_USAGE`), `summary_evidence_bytes` (serialized summarizer
+  evidence after elision) and `summary_elided_bytes`. All are counts or sizes;
+  none carries prompt, tool output or summary text.
 - The journal retains a 16 MiB capacity/import limit; compaction reduces model
   context, not disk usage. An append exceeding capacity stops before writing.
   If a tool has already executed but its result cannot be saved, unresolved-call

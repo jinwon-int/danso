@@ -457,7 +457,12 @@ class Acceptance(unittest.TestCase):
             'version': 1, 'requests_used': 1, 'requests_total': 48,
             'summary_requests': 0, 'memory_requests': 0,
             'output_tokens_max': 16384,
-            'length_stops': 0, 'continuations': 0})
+            'length_stops': 0, 'continuations': 0,
+            # danso#217 P5: compaction accounting appended after the
+            # original keys; a run without compaction reports zeros.
+            'compactions': 0, 'compaction_failures': 0,
+            'summary_input_tokens': 0, 'summary_output_tokens': 0,
+            'summary_evidence_bytes': 0, 'summary_elided_bytes': 0})
 
     def test_cached_stable_block_is_byte_identical_across_requests(self):
         # Two requests (tool turn + final): the marked stable block must be
