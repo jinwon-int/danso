@@ -5,6 +5,7 @@
 //! unbookkept" (degraded) apart from "down" (unavailable), which is the ccc-node
 //! behaviour observed on gongyung 2026-08-11 and which this must preserve.
 
+use crate::clock::Rfc3339;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,7 +36,7 @@ impl ServicePid {
     pub fn for_current_process(argv: &[String]) -> Self {
         Self {
             pid: std::process::id(),
-            started_at: chrono::Utc::now().to_rfc3339(),
+            started_at: crate::clock::now().to_rfc3339(),
             boot_id: super::probe::boot_id().unwrap_or_default(),
             argv_hash: argv_hash(argv),
         }

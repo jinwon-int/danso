@@ -6,6 +6,7 @@
 //! of the image this process is running is the evidence, so it is captured once
 //! at startup and republished on every health write.
 
+use crate::clock::Rfc3339;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
@@ -42,7 +43,7 @@ pub fn current() -> &'static RuntimeGeneration {
             binary_sha256,
             version: env!("CARGO_PKG_VERSION").to_string(),
             exe_path: exe.map(|path| path.display().to_string()),
-            observed_at: chrono::Utc::now().to_rfc3339(),
+            observed_at: crate::clock::now().to_rfc3339(),
         }
     })
 }

@@ -593,7 +593,7 @@ UUID는 서브프로세스/런 시작 **전**에 내구 저장하고, 저장 실
 ccc `agent-cron` 저장소 스키마 v1을 그대로 이식한다(파일 호환, `danso cron
 import` 가능). 저장 위치 `$DANSO_HOME/cron/tasks.json`, 잠금 `cron/locks/<id>.lock`.
 
-- 스케줄: 5필드 cron(숫자·범위·목록·step, DOW 0/7=일요일), `@hourly|daily|weekly|monthly|yearly`, `every <N>m|h|d`(anchorAt 위상), `at <ISO>`(1회, `keepAfterRun`). 작업별 **IANA 시간대를 1차부터 지원**한다 — `chrono-tz`가 바이너리에 내장한 tzdb만 쓰고 시스템 tzdata는 읽지 않는다(Termux 등 tzdata 부재 환경에서도 동일 동작). 알 수 없는 이름은 조용한 UTC 폴백 없이 fail-closed(`invalid-schedule`), `import`는 `timezone`을 그대로 보존한다(고정 오프셋 변환 금지). (운영자 결정 2026-09-16, #120·#33 — 아래 §10 5항에서 이동)
+- 스케줄: 5필드 cron(숫자·범위·목록·step, DOW 0/7=일요일), `@hourly|daily|weekly|monthly|yearly`, `every <N>m|h|d`(anchorAt 위상), `at <ISO>`(1회, `keepAfterRun`). 작업별 **IANA 시간대를 1차부터 지원**한다 — 바이너리에 내장한 tzdb만 쓰고 시스템 tzdata는 읽지 않는다(2026-11 #228부터 `jiff`의 `tzdb-bundle-always`, 그 전에는 `chrono-tz`; 이름은 대소문자까지 정확히 일치해야 한다)(Termux 등 tzdata 부재 환경에서도 동일 동작). 알 수 없는 이름은 조용한 UTC 폴백 없이 fail-closed(`invalid-schedule`), `import`는 `timezone`을 그대로 보존한다(고정 오프셋 변환 금지). (운영자 결정 2026-09-16, #120·#33 — 아래 §10 5항에서 이동)
 - 잠금: `O_EXCL` 0600 JSON(`acquiredAt, pid, bootId, runId`). 스테일 판정은
   `boot_id` 변경 또는 opt-in `lockTimeoutSec` 두 가지뿐. 상태 커밋 실패 잡은
   `persist-failed` 격리로 남고 `danso cron lock <id> --action release --run-id <R>`로만 해제.
@@ -711,7 +711,7 @@ PR 본문에 기록한다.
 4. **승인 훅의 v0 표면 변경.** `ToolExecutor::admit`은 코어 계약 변경이다(A단계에서 기본 허용으로 추가됨). CLI 기본은
    불변이지만 v0 문서의 "승인 UI 없음" 문구를 수정해야 한다.
 5. ~~**cron 시간대.**~~ **결정됨(2026-09-16, #120·#33):** "UTC·고정 오프셋만
-   1차 지원" 안을 철회하고 `chrono-tz` 내장 tzdb로 IANA 시간대를 1차부터
+   1차 지원" 안을 철회하고 내장 tzdb(당시 `chrono-tz`, #228 이후 `jiff` 번들)로 IANA 시간대를 1차부터
    지원한다. 고정 오프셋 변환은 DST 지역에서 손실 변환이라 ccc 스키마 v1
    파일 호환(라운드트립)과 충돌하고, 시스템 tzdata 의존은 Termux에서
    `unknown timezone: Asia/Seoul`로 실패했다. 계약은 §6.5에 둔다.

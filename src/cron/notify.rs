@@ -14,7 +14,7 @@
 
 use crate::cron::store::{NotifyMode, Task};
 use crate::cron::time::fmt_dt;
-use chrono::{DateTime, Utc};
+use danso_ops::clock::{Rfc3339, Timestamp};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -393,7 +393,7 @@ pub fn write_owner_spool(
     scheduled_at: &str,
     status: &str,
     headless: &Value,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> Value {
     let base = notification_base(task);
     if task.notify == NotifyMode::None {
@@ -426,7 +426,7 @@ pub fn write_owner_spool(
         Err(error) => return spool_error(&base, error),
     };
     let text = build_owner_text(task_id, run_id, scheduled_at, status, headless);
-    let ts = fmt_dt(Some(at)).unwrap_or_else(|| Utc::now().to_rfc3339());
+    let ts = fmt_dt(Some(at)).unwrap_or_else(|| danso_ops::clock::now().to_rfc3339());
     let mut payload = json!({
         "version": 1,
         "ts": ts,

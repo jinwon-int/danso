@@ -47,7 +47,7 @@ fn meta(session: &str) -> CommitMeta {
     }
 }
 
-fn now() -> chrono::DateTime<chrono::Utc> {
+fn now() -> danso_ops::clock::Timestamp {
     facts::parse_timestamp("2026-09-08T12:00:00Z").unwrap()
 }
 
@@ -1338,7 +1338,7 @@ fn age_exceeded_jobs_are_dead_lettered_and_counted_in_the_report() {
     let job_id = enqueue_one(&route, &session_path);
 
     // 49 hours later the job is past the 48-hour limit.
-    let later = now() + chrono::Duration::hours(49);
+    let later = now() + danso_ops::clock::SignedDuration::from_hours(49);
     let mut provider = ScriptedExtraction {
         texts: std::collections::VecDeque::new(),
         systems: std::cell::RefCell::new(Vec::new()),

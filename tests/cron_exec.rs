@@ -8,11 +8,11 @@
 //! covered through the policy refusal and the subprocess failure path (the
 //! test binary refuses the harness flags), never a provider call.
 
-use chrono::{DateTime, Utc};
 use danso::cron::locks::{lock_path, read_lock, write_lock_file};
 use danso::cron::run;
 use danso::cron::store::{self, store_path};
 use danso::cron::tick;
+use danso_ops::clock::Timestamp;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -24,7 +24,7 @@ const LATER: &str = "2026-09-25T09:45:00Z";
 /// tests that touch them serialize here.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-fn utc(raw: &str) -> DateTime<Utc> {
+fn utc(raw: &str) -> Timestamp {
     danso::cron::time::parse_utc(Some(raw), "test")
         .expect("parse")
         .expect("non-empty")

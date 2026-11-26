@@ -138,7 +138,7 @@ pub struct StatusInputs<'a> {
 /// Telegram or CLI specifics.
 pub fn determine(
     inputs: &StatusInputs<'_>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::clock::Timestamp,
     is_service_argv: impl Fn(&[String]) -> bool,
 ) -> StatusReport {
     let health = match read_health(inputs.health_path) {
@@ -183,7 +183,7 @@ pub fn determine(
 fn bookkept(
     record: ServicePid,
     health: Option<HealthDocument>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::clock::Timestamp,
 ) -> StatusReport {
     let (state, reason) = match &health {
         Some(doc) if !doc.is_stale(now) => (ServiceState::Available, None),
@@ -267,6 +267,7 @@ fn lock_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Rfc3339;
     use crate::health::{
         ProcessHealth, RunMode, ServiceHealth, TelegramHealth, TurnOccupancy, WorkloadHealth,
     };
@@ -295,7 +296,7 @@ mod tests {
             self.dir.path().join(".telegram-token.lock")
         }
 
-        fn write_health(&self, updated_at: chrono::DateTime<chrono::Utc>) {
+        fn write_health(&self, updated_at: crate::clock::Timestamp) {
             let document = HealthDocument {
                 schema_version: crate::health::HEALTH_SCHEMA_VERSION,
                 started_at: updated_at.to_rfc3339(),
@@ -342,7 +343,7 @@ mod tests {
         }
     }
 
-    fn determine_at(fixture: &Fixture, now: chrono::DateTime<chrono::Utc>) -> StatusReport {
+    fn determine_at(fixture: &Fixture, now: crate::clock::Timestamp) -> StatusReport {
         let (pid_path, health_path, lock_path) = fixture.inputs();
         determine(
             &StatusInputs {
@@ -358,7 +359,7 @@ mod tests {
     #[test]
     fn nothing_on_disk_is_unavailable() {
         let fixture = Fixture::new();
-        let report = determine_at(&fixture, chrono::Utc::now());
+        let report = determine_at(&fixture, crate::clock::now());
         assert_eq!(report.state, "unavailable");
         assert_eq!(report.exit_code(), 2);
         assert!(report.to_text().starts_with("Bot status: unavailable\n"));
@@ -367,7 +368,7 @@ mod tests {
     #[test]
     fn live_pid_with_fresh_health_is_available() {
         let fixture = Fixture::new();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         fixture.write_live_pid();
         fixture.write_health(now);
         let report = determine_at(&fixture, now);
@@ -381,10 +382,11 @@ mod tests {
     #[test]
     fn live_pid_with_stale_health_is_degraded_not_available() {
         let fixture = Fixture::new();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         fixture.write_live_pid();
-        fixture
-            .write_health(now - chrono::Duration::seconds(crate::health::STALE_AFTER_SECONDS + 1));
+        fixture.write_health(
+            now - crate::clock::SignedDuration::from_secs(crate::health::STALE_AFTER_SECONDS + 1),
+        );
         let report = determine_at(&fixture, now);
         assert_eq!(report.state, "degraded");
         assert_eq!(report.exit_code(), 1);
@@ -395,7 +397,7 @@ mod tests {
     fn live_pid_without_health_is_degraded() {
         let fixture = Fixture::new();
         fixture.write_live_pid();
-        let report = determine_at(&fixture, chrono::Utc::now());
+        let report = determine_at(&fixture, crate::clock::now());
         assert_eq!(report.state, "degraded");
         assert_eq!(report.exit_code(), 1);
     }
@@ -405,12 +407,12 @@ mod tests {
         let fixture = Fixture::new();
         let record = ServicePid {
             pid: u32::MAX - 1,
-            started_at: chrono::Utc::now().to_rfc3339(),
+            started_at: crate::clock::now().to_rfc3339(),
             boot_id: probe::boot_id().unwrap_or_default(),
             argv_hash: pidfile::argv_hash(&["danso".to_string()]),
         };
         std::fs::write(fixture.pid_path(), serde_json::to_vec(&record).unwrap()).unwrap();
-        let report = determine_at(&fixture, chrono::Utc::now());
+        let report = determine_at(&fixture, crate::clock::now());
         assert_eq!(report.state, "unavailable");
     }
 
@@ -420,7 +422,7 @@ mod tests {
         // The file is retained on purpose after a stop; only the kernel lock
         // means ownership.
         std::fs::write(fixture.lock_path(), b"").unwrap();
-        let report = determine_at(&fixture, chrono::Utc::now());
+        let report = determine_at(&fixture, crate::clock::now());
         assert_eq!(
             report.state, "unavailable",
             "a leftover lock file must not read as a running service"
@@ -437,7 +439,7 @@ mod tests {
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
-        let report = determine_at(&fixture, chrono::Utc::now());
+        let report = determine_at(&fixture, crate::clock::now());
         assert_eq!(report.state, "degraded");
         assert_eq!(report.exit_code(), 1);
         assert!(
@@ -452,7 +454,7 @@ mod tests {
     fn unparseable_pid_debris_falls_through_to_the_lock() {
         let fixture = Fixture::new();
         std::fs::write(fixture.pid_path(), b"{ not json").unwrap();
-        let report = determine_at(&fixture, chrono::Utc::now());
+        let report = determine_at(&fixture, crate::clock::now());
         assert_eq!(report.state, "unavailable");
         assert_eq!(report.exit_code(), 2);
     }
@@ -461,7 +463,7 @@ mod tests {
     fn unreadable_evidence_is_unverified_never_down() {
         let fixture = Fixture::new();
         std::fs::create_dir(fixture.pid_path()).unwrap();
-        let report = determine_at(&fixture, chrono::Utc::now());
+        let report = determine_at(&fixture, crate::clock::now());
         assert_eq!(report.state, UNVERIFIED);
         assert_eq!(report.exit_code(), 3);
         assert!(
@@ -473,7 +475,7 @@ mod tests {
     #[test]
     fn status_json_always_carries_an_empty_mutations_object() {
         let fixture = Fixture::new();
-        let report = determine_at(&fixture, chrono::Utc::now());
+        let report = determine_at(&fixture, crate::clock::now());
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(
             value["mutations"],

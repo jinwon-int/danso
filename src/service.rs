@@ -268,7 +268,7 @@ pub fn status(data_dir: Option<PathBuf>) -> Result<StatusReport> {
             health_path: &health_path,
             lock_path: &lock_path,
         },
-        chrono::Utc::now(),
+        danso_ops::clock::now(),
         is_service_argv,
     ))
 }
@@ -316,7 +316,8 @@ pub fn supervise(data_dir: Option<PathBuf>) -> Result<i32> {
         // separates that from the service being killed — by the OOM killer
         // above all, which is the likeliest death on the one platform where
         // this loop *is* the restart policy.
-        let stopping = danso_ops::stop::stop_in_progress(&data_dir, child_pid, chrono::Utc::now());
+        let stopping =
+            danso_ops::stop::stop_in_progress(&data_dir, child_pid, danso_ops::clock::now());
         let clean = danso_ops::supervise::is_operator_stop(status.success(), signal, stopping);
         match policy.record(clean, std::time::Instant::now()) {
             danso_ops::Decision::Stop => return Ok(0),
@@ -634,7 +635,7 @@ pub fn restart(
             // system service.
             systemd_run: None,
         },
-        chrono::Utc::now().timestamp(),
+        danso_ops::clock::now().as_second(),
     )
 }
 
@@ -651,7 +652,7 @@ pub fn restart_worker(data_dir: PathBuf, request_id: String, user_scope: bool) -
             // restart of a system service.
             systemctl: None,
         },
-        || chrono::Utc::now().timestamp(),
+        || danso_ops::clock::now().as_second(),
     )
 }
 

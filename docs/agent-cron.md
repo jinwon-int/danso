@@ -86,7 +86,8 @@ where ccc's fail.
 - Unknown timezones and malformed expressions fail closed as
   `invalid-schedule` in the planners.
 - **No system tzdata required.** IANA names resolve against the tz database
-  compiled into the binary (`chrono-tz`), never `/usr/share/zoneinfo`, so a
+  compiled into the binary (`jiff`'s bundled tzdb since #228; `chrono-tz`
+  before), never `/usr/share/zoneinfo`, so a
   Termux or minimal-container host resolves `Asia/Seoul` exactly like any other
   node — the failure mode behind ccc's `unknown timezone: Asia/Seoul` on Termux
   Python. `import` keeps each task's `timezone` verbatim (no conversion to a

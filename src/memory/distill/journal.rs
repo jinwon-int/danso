@@ -5,7 +5,7 @@
 //! scope-wide cooldown file for hard provider classes.
 
 use anyhow::{Result, ensure};
-use chrono::{DateTime, Utc};
+use danso_ops::clock::{Rfc3339, Timestamp};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -51,14 +51,13 @@ impl FailureClass {
     }
 
     /// Retry delay seconds (§4.7 backoff table).
-    pub fn retry_seconds(self, fail_count: u32, now: DateTime<Utc>) -> Option<i64> {
+    pub fn retry_seconds(self, fail_count: u32, now: Timestamp) -> Option<i64> {
         let seconds = match self {
             Self::AuthUnavailable | Self::ModelUnavailable => 6 * 3600,
             Self::RateLimited => 30 * 60,
             Self::QuotaExhausted => {
                 // Next 01:00 UTC.
-                use chrono::Timelike;
-                let now_secs = now.time().num_seconds_from_midnight() as i64;
+                let now_secs = now.as_second().rem_euclid(86_400);
                 if now_secs < 3600 {
                     3600 - now_secs
                 } else {
@@ -116,7 +115,7 @@ pub fn enqueue(
     route: &Route,
     session_path: &std::path::Path,
     trigger: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<EnqueueOutcome> {
     ensure!(
         super::TRIGGERS.contains(&trigger),
@@ -211,12 +210,12 @@ pub struct ClaimOutcome {
 
 /// Claim the oldest runnable job (claim lock held, cooldown respected,
 /// 48h age dead-letter, transcript-change dead-letter, 5-failure cap).
-pub fn claim(route: &Route, now: DateTime<Utc>, timeout_ms: u64) -> Result<Option<ClaimedJob>> {
+pub fn claim(route: &Route, now: Timestamp, timeout_ms: u64) -> Result<Option<ClaimedJob>> {
     Ok(claim_counted(route, now, timeout_ms)?.job)
 }
 
 /// `claim` plus the dead-letter count (§4.7; issue #87 (d)).
-pub fn claim_counted(route: &Route, now: DateTime<Utc>, timeout_ms: u64) -> Result<ClaimOutcome> {
+pub fn claim_counted(route: &Route, now: Timestamp, timeout_ms: u64) -> Result<ClaimOutcome> {
     let mut dead_lettered = 0usize;
     let dir = journal_dir(route);
     if !dir.is_dir() {
@@ -259,7 +258,7 @@ pub fn claim_counted(route: &Route, now: DateTime<Utc>, timeout_ms: u64) -> Resu
             .as_str()
             .and_then(|v| facts::parse_timestamp(v).ok())
             .unwrap_or(now);
-        let age_hours = (now - created_at).num_hours();
+        let age_hours = (now - created_at).as_hours();
         if age_hours > MAX_AGE_HOURS {
             dead_letter(route, &job_id, &record, "age-exceeded")?;
             dead_lettered += 1;
@@ -350,11 +349,12 @@ pub fn record_failure(
     route: &Route,
     job: &ClaimedJob,
     class: FailureClass,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<()> {
     let fail_count = job.record["fail_count"].as_u64().unwrap_or(0) as u32 + 1;
     let retry_seconds = class.retry_seconds(fail_count, now).unwrap_or(900);
-    let retry_after = facts::format_timestamp(now + chrono::Duration::seconds(retry_seconds));
+    let retry_after =
+        facts::format_timestamp(now + danso_ops::clock::SignedDuration::from_secs(retry_seconds));
     let mut record = job.record.clone();
     if let Some(object) = record.as_object_mut() {
         object["fail_count"] = json!(fail_count);

@@ -7,7 +7,7 @@
 
 use crate::cron::store::{RetryPolicySpec, RetryState};
 use crate::cron::time::parse_utc;
-use chrono::{DateTime, Utc};
+use danso_ops::clock::Timestamp;
 
 /// Effective retry policy: every out-of-range or non-integer value falls back
 /// to the documented default (clamped, not rejected — the store validator is
@@ -70,7 +70,7 @@ pub struct RetryView {
 pub fn retry_view(
     state: Option<&RetryState>,
     policy: &RetryPolicy,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> Option<RetryView> {
     let state = state?;
     let attempt = state.attempt;

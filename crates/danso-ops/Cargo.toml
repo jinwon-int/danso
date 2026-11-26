@@ -10,7 +10,10 @@ license = "MIT"
 # `ops` feature; a dependency edge in the other direction would be a cycle.
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Time: jiff replaces chrono/chrono-tz (#228, both unmaintained). Bundled
+# tzdb only (`tzdb-bundle-always`), never the system zoneinfo database (§6.5,
+# #33); `tz-system` only detects the host's own local zone (chrono `Local`).
+jiff = { version = "1", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
 libc = "0.2"
 # Verify-only (no signing) and zero-dependency, from the minisign author.
 # `docs/unified-design.md` §3.2 caps the dependency tree; a full signing crate

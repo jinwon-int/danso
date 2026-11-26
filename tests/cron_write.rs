@@ -9,7 +9,6 @@
 // neither the module nor the binary subcommand these tests drive.
 #![cfg(feature = "ops")]
 
-use chrono::{DateTime, Utc};
 use danso::cron::commit::{
     append_run_history, apply_retry_transition, apply_run_limit, archive_history, commit_run_state,
     history_attempt, run_limit_metadata, write_store_document,
@@ -20,19 +19,20 @@ use danso::cron::locks::{
 };
 use danso::cron::store::{self, RunHistoryItem, store_path};
 use danso::cron::time::{boot_id, parse_utc};
+use danso_ops::clock::Timestamp;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
 const AT: &str = "2026-09-25T09:30:00Z";
 const OTHER_BOOT: &str = "00000000-0000-0000-0000-000000000000";
 
-fn utc(raw: &str) -> DateTime<Utc> {
+fn utc(raw: &str) -> Timestamp {
     parse_utc(Some(raw), "test")
         .expect("parse")
         .expect("non-empty")
 }
 
-fn at() -> DateTime<Utc> {
+fn at() -> Timestamp {
     utc(AT)
 }
 

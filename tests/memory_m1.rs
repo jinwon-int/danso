@@ -53,7 +53,7 @@ fn manual_candidate(text: &str) -> Candidate {
     }
 }
 
-fn pinned_now() -> chrono::DateTime<chrono::Utc> {
+fn pinned_now() -> danso_ops::clock::Timestamp {
     facts::parse_timestamp("2026-09-08T12:00:00Z").unwrap()
 }
 

@@ -245,7 +245,7 @@ fn record_installed(home: &Path, release_dir: &Path, artifact: &str) {
         "schema": "danso.installed-generation.v1",
         "version": "9.9.9",
         "binary_sha256": "0".repeat(64),
-        "installed_at": chrono::Utc::now().to_rfc3339(),
+        "installed_at": danso_ops::clock::rfc3339(danso_ops::clock::now()),
         "source": "release",
         "artifact_name": artifact,
         "artifact_sha256": digest,
@@ -436,7 +436,7 @@ fn a_record_that_does_not_name_its_archive_is_not_an_update() {
             "schema": "danso.installed-generation.v1",
             "version": "9.9.9",
             "binary_sha256": "0".repeat(64),
-            "installed_at": chrono::Utc::now().to_rfc3339(),
+            "installed_at": danso_ops::clock::rfc3339(danso_ops::clock::now()),
             "source": "release",
         }))
         .expect("record"),

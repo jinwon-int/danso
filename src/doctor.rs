@@ -7,8 +7,8 @@
 //! counts; source records, tokens and error text are never rendered.
 
 use anyhow::Result;
-use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Parser;
+use danso_ops::clock::{Rfc3339, Timestamp};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -120,7 +120,7 @@ pub fn run() -> Result<DoctorReport> {
         &home,
         telegram_data_dir.as_deref(),
         legacy_home.as_deref(),
-        Utc::now(),
+        danso_ops::clock::now(),
     ))
 }
 
@@ -133,7 +133,7 @@ pub fn inspect_at(
     home: &Path,
     telegram_data_dir: Option<&Path>,
     legacy_home: Option<&Path>,
-    generated_at: DateTime<Utc>,
+    generated_at: Timestamp,
 ) -> DoctorReport {
     let config_path = home.join(config::FILE_NAME);
     let (config_check, parsed_config) = inspect_config(&config_path);
@@ -161,7 +161,7 @@ pub fn inspect_at(
 
     DoctorReport {
         version: 1,
-        generated_at: generated_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        generated_at: generated_at.to_rfc3339_opts(danso_ops::clock::SecondsFormat::Secs, true),
         summary,
         checks,
     }
@@ -300,7 +300,7 @@ struct HealthStats {
     last_poll_age_seconds: u64,
 }
 
-fn telegram_health(data_dir: Option<&Path>, now: DateTime<Utc>) -> Check {
+fn telegram_health(data_dir: Option<&Path>, now: Timestamp) -> Check {
     let id = "telegram.health";
     let Some(data_dir) = data_dir else {
         return Check::warn(id, "health file missing");
@@ -362,14 +362,12 @@ fn telegram_health(data_dir: Option<&Path>, now: DateTime<Utc>) -> Check {
     }
 }
 
-fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
-    chrono::DateTime::parse_from_rfc3339(raw.trim())
-        .ok()
-        .map(|value| value.with_timezone(&Utc))
+fn parse_timestamp(raw: &str) -> Option<Timestamp> {
+    danso_ops::clock::parse_rfc3339(raw.trim()).ok()
 }
 
-fn age_seconds(now: &DateTime<Utc>, timestamp: &DateTime<Utc>) -> u64 {
-    let seconds = now.timestamp().saturating_sub(timestamp.timestamp());
+fn age_seconds(now: &Timestamp, timestamp: &Timestamp) -> u64 {
+    let seconds = now.as_second().saturating_sub(timestamp.as_second());
     seconds.max(0) as u64
 }
 
@@ -755,7 +753,7 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("fixture mode");
     }
 
-    fn fixture() -> (PathBuf, PathBuf, DateTime<Utc>) {
+    fn fixture() -> (PathBuf, PathBuf, Timestamp) {
         let root = temp_root();
         let home = root.join("home");
         let memory_dir = root.join("memory");
@@ -793,9 +791,7 @@ mod tests {
             &telegram_dir.join(CONVERSATIONS_DIR_NAME).join("1.json"),
             br#"{"chat_id":1}"#,
         );
-        let now = DateTime::parse_from_rfc3339("2026-09-15T00:01:00Z")
-            .expect("fixture time")
-            .with_timezone(&Utc);
+        let now = danso_ops::clock::parse_rfc3339("2026-09-15T00:01:00Z").expect("fixture time");
         (home, telegram_dir, now)
     }
 
@@ -848,7 +844,7 @@ mod tests {
         let root = temp_root();
         let home = root.join("home");
         private_dir(&home);
-        let report = inspect_at(&home, None, None, Utc::now());
+        let report = inspect_at(&home, None, None, danso_ops::clock::now());
         let rendered = serde_json::to_string(&report).expect("report JSON");
         assert!(rendered.contains("config file missing"));
 
@@ -856,7 +852,7 @@ mod tests {
             &home.join(config::FILE_NAME),
             b"[telegram]\ntokn = \"SECRET\"\n",
         );
-        let report = inspect_at(&home, None, None, Utc::now());
+        let report = inspect_at(&home, None, None, danso_ops::clock::now());
         let rendered = serde_json::to_string(&report).expect("report JSON");
         assert!(rendered.contains("config invalid"));
         assert!(!rendered.contains("SECRET"));
@@ -999,7 +995,7 @@ mod tests {
         assert_eq!(count_lines(b"one\ntwo\n"), 2);
         assert_eq!(count_lines(b"one\ntwo"), 2);
         assert_eq!(count_lines(b""), 0);
-        let now = Utc::now();
+        let now = danso_ops::clock::now();
         assert_eq!(age_seconds(&now, &now), 0);
     }
 }

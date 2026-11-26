@@ -6,8 +6,8 @@
 //! a service.  A backup is assembled in a private temporary sibling and is
 //! exposed only by one final rename.
 
-use chrono::{SecondsFormat, Utc};
 use clap::Parser;
+use danso_ops::clock::Rfc3339;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -412,7 +412,8 @@ pub fn create_at(
         .as_ref()
         .and_then(|value| value.telegram.token_file.clone());
 
-    let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let created_at =
+        danso_ops::clock::now().to_rfc3339_opts(danso_ops::clock::SecondsFormat::Nanos, true);
     let backup_name = format!("{BACKUP_PREFIX}{created_at}");
     let backup_path = backup_root.join(&backup_name);
     let temp_path = backup_root.join(format!("{TEMP_PREFIX}{created_at}"));
@@ -1087,7 +1088,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), CommandError> {
         .collect::<Vec<_>>();
     if manifest.version != 1
         || !manifest.created_at.ends_with('Z')
-        || chrono::DateTime::parse_from_rfc3339(&manifest.created_at).is_err()
+        || danso_ops::clock::parse_rfc3339(&manifest.created_at).is_err()
         || !Path::new(&manifest.source_home).is_absolute()
         || manifest.exclusions != expected_exclusions
     {

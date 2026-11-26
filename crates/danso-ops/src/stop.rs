@@ -13,6 +13,7 @@
 //! the pid file — the process gets SIGKILLed mid-teardown and its files survive
 //! to block the next start. (Operator decision 2026-09-16, #118.)
 
+use crate::clock::Rfc3339;
 use crate::probe;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -61,7 +62,7 @@ pub fn begin_stop(data_dir: &Path, pid: u32) -> Result<StopMarkerGuard> {
     let marker = StopMarker {
         schema: STOP_MARKER_SCHEMA.to_string(),
         pid,
-        at: chrono::Utc::now().to_rfc3339(),
+        at: crate::clock::now().to_rfc3339(),
     };
     let payload = serde_json::to_vec(&marker).context("serialize the stop marker")?;
     std::fs::write(&path, payload).context("write the stop marker")?;
@@ -73,7 +74,7 @@ pub fn begin_stop(data_dir: &Path, pid: u32) -> Result<StopMarkerGuard> {
 /// A marker for another pid, an unreadable one, or one older than
 /// [`STOP_MARKER_MAX_AGE_SECS`] does not count: it would otherwise turn every
 /// later crash into a silent shutdown.
-pub fn stop_in_progress(data_dir: &Path, pid: u32, now: chrono::DateTime<chrono::Utc>) -> bool {
+pub fn stop_in_progress(data_dir: &Path, pid: u32, now: crate::clock::Timestamp) -> bool {
     let Ok(raw) = std::fs::read(data_dir.join(STOP_MARKER_FILE)) else {
         return false;
     };
@@ -83,10 +84,10 @@ pub fn stop_in_progress(data_dir: &Path, pid: u32, now: chrono::DateTime<chrono:
     if marker.pid != pid {
         return false;
     }
-    let Ok(at) = chrono::DateTime::parse_from_rfc3339(&marker.at) else {
+    let Ok(at) = crate::clock::parse_rfc3339(&marker.at) else {
         return false;
     };
-    let age = (now - at.with_timezone(&chrono::Utc)).num_seconds();
+    let age = (now - at).as_secs();
     (0..=STOP_MARKER_MAX_AGE_SECS).contains(&age)
 }
 
@@ -246,8 +247,8 @@ fn decide(
 mod stop_marker_tests {
     use super::*;
 
-    fn now() -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc::now()
+    fn now() -> crate::clock::Timestamp {
+        crate::clock::now()
     }
 
     #[test]
@@ -272,7 +273,8 @@ mod stop_marker_tests {
         let stale = StopMarker {
             schema: STOP_MARKER_SCHEMA.to_string(),
             pid: 4242,
-            at: (now() - chrono::Duration::seconds(STOP_MARKER_MAX_AGE_SECS + 1)).to_rfc3339(),
+            at: (now() - crate::clock::SignedDuration::from_secs(STOP_MARKER_MAX_AGE_SECS + 1))
+                .to_rfc3339(),
         };
         std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
         assert!(
@@ -295,7 +297,7 @@ mod stop_marker_tests {
         let ahead = StopMarker {
             schema: STOP_MARKER_SCHEMA.to_string(),
             pid: 7,
-            at: (now() + chrono::Duration::seconds(60)).to_rfc3339(),
+            at: (now() + crate::clock::SignedDuration::from_secs(60)).to_rfc3339(),
         };
         std::fs::write(
             dir.path().join(STOP_MARKER_FILE),

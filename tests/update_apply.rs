@@ -62,7 +62,7 @@ fn apply_with(home: &Path, release: &Path, artifact: &str, extra: &[&str]) -> st
 fn serving(data_dir: &Path, active: u64, oldest_seconds: u64) -> PathBuf {
     std::fs::create_dir_all(data_dir).expect("data dir");
     let document = serde_json::json!({
-        "updated_at": chrono::Utc::now().to_rfc3339(),
+        "updated_at": danso_ops::clock::rfc3339(danso_ops::clock::now()),
         "workload": {
             "active_requests": active,
             "oldest_request_age_seconds": oldest_seconds,

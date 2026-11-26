@@ -54,17 +54,5 @@ jobs:
           #   format next changes (move to a maintained format such as
           #   postcard or bitcode and drop this ignore), or immediately if any
           #   bincode advisory is not informational.
-          # - RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0555 (chrono-tz):
-          #   unmaintained. Informational only -- no vulnerability, no patched
-          #   release. Both are direct dependencies (165 call sites). chrono
-          #   parses RFC3339 timestamps danso wrote itself into its own state,
-          #   marker and manifest files, and chrono-tz parses operator-written
-          #   cron TZ names -- not untrusted input. Migration to jiff and
-          #   removal of these ignores is tracked in #228. Revisit immediately
-          #   if any chrono/chrono-tz advisory is not informational, or if the
-          #   tz data embedded in chrono-tz drifts from IANA for a zone danso
-          #   schedules in.
           cargo audit --deny warnings \
-            --ignore RUSTSEC-2025-0141 \
-            --ignore RUSTSEC-2026-0543 \
-            --ignore RUSTSEC-2026-0555
+            --ignore RUSTSEC-2025-0141

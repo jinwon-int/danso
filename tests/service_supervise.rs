@@ -141,7 +141,7 @@ fn a_kill_that_a_stop_escalated_to_is_not_restarted() {
     let marker = serde_json::json!({
         "schema": "danso.service.stopping.v1",
         "pid": pid,
-        "at": chrono::Utc::now().to_rfc3339(),
+        "at": danso_ops::clock::rfc3339(danso_ops::clock::now()),
     });
     std::fs::write(
         data_dir.join("stopping.json"),

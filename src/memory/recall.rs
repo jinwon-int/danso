@@ -8,9 +8,9 @@
 //! (k=60). BM25/usage stay out by design decision §4.3.
 
 use anyhow::Result;
-use chrono::{
-    DateTime, Datelike, Duration as ChronoDuration, FixedOffset, Local, TimeZone, Timelike, Utc,
-};
+use danso_ops::clock::{SignedDuration, Timestamp};
+use jiff::ZonedDateTime;
+use jiff::tz::{Offset, TimeZone};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -53,7 +53,7 @@ fn age_expiry_forbidden(kind: &str) -> bool {
     matches!(kind, "decision" | "procedure" | "constraint")
 }
 
-pub(crate) fn retention_keeps(record: &FactRecord, now: DateTime<Utc>) -> bool {
+pub(crate) fn retention_keeps(record: &FactRecord, now: Timestamp) -> bool {
     if !record.known_kind {
         return true; // unknown kinds are kept conservatively
     }
@@ -69,7 +69,7 @@ pub(crate) fn retention_keeps(record: &FactRecord, now: DateTime<Utc>) -> bool {
     };
     match facts::parse_timestamp(observed_at) {
         Ok(observed) => {
-            let age_days = (now - observed).num_seconds() as f64 / 86400.0;
+            let age_days = (now - observed).as_secs() as f64 / 86400.0;
             age_days <= ttl
         }
         Err(_) => true,
@@ -92,7 +92,7 @@ pub struct Doc {
     pub snippet: String,
     /// Recency reference: record observed_at for structured docs, file
     /// mtime for memory/state docs (§4.3: never path-derived noise).
-    pub observed: Option<DateTime<Utc>>,
+    pub observed: Option<Timestamp>,
     pub durability: Option<String>,
     pub kind: Option<String>,
     pub review: Option<String>,
@@ -135,7 +135,7 @@ impl Doc {
     /// Valid-time classification (§4.3 / ccc `_temporal_tag`): valid_from is
     /// inclusive, valid_until exclusive; undated and malformed-window facts
     /// are kept conservatively with a body-free signal.
-    fn temporal_status(&self, now: DateTime<Utc>) -> (TemporalStatus, Option<&'static str>) {
+    fn temporal_status(&self, now: Timestamp) -> (TemporalStatus, Option<&'static str>) {
         let from_raw = self.valid_from.as_deref().filter(|v| !v.is_empty());
         let until_raw = self.valid_until.as_deref().filter(|v| !v.is_empty());
         if from_raw.is_none() && until_raw.is_none() {
@@ -198,7 +198,7 @@ fn document(
     let observed = std::fs::symlink_metadata(&path)
         .ok()
         .and_then(|meta| meta.modified().ok())
-        .map(DateTime::<Utc>::from);
+        .and_then(|modified| Timestamp::try_from(modified).ok());
     Some(Doc {
         path: path.display().to_string(),
         source,
@@ -216,7 +216,7 @@ fn document(
 /// Structured docs from the facts file: one record = one document, path
 /// `<facts>#L<n>:<id>` (ccc convention). Rejected and superseded records are
 /// excluded (kept in the file, never in the index); volatile TTLs apply.
-fn structured_docs(route: &Route, now: DateTime<Utc>) -> Result<Vec<Doc>> {
+fn structured_docs(route: &Route, now: Timestamp) -> Result<Vec<Doc>> {
     let facts_file = route.facts_file();
     let file = facts::load(route)?;
     let source = if route.is_legacy() {
@@ -269,7 +269,7 @@ fn structured_docs(route: &Route, now: DateTime<Utc>) -> Result<Vec<Doc>> {
 /// Build the index for a route. A private route additionally reads the
 /// shared tree (§7 read rule); `shared` and `global` never open another
 /// tree. Every source is independently fail-open (§5.1).
-pub fn build_index(route: &Route, now: DateTime<Utc>) -> Result<Vec<Doc>> {
+pub fn build_index(route: &Route, now: Timestamp) -> Result<Vec<Doc>> {
     let mut docs = Vec::new();
     // Iterate routes, not bare directories. The previous shape downgraded the
     // lanes to paths and rebuilt the facts route from `index == 0`, which
@@ -359,11 +359,11 @@ pub fn tokens_for(query: &str) -> Vec<String> {
     tokens
 }
 
-fn recency_boost(observed: Option<DateTime<Utc>>, now: DateTime<Utc>) -> f64 {
+fn recency_boost(observed: Option<Timestamp>, now: Timestamp) -> f64 {
     let Some(observed) = observed else {
         return 0.0;
     };
-    let age_seconds = (now - observed).num_seconds().max(0) as f64;
+    let age_seconds = (now - observed).as_secs().max(0) as f64;
     let window = RECENCY_WINDOW_DAYS * 86400.0;
     (1.0 - age_seconds.min(window) / window).max(0.0)
 }
@@ -413,7 +413,7 @@ struct LaneItem {
     snippet: String,
 }
 
-fn lexical_lane(docs: &[Doc], tokens: &[String], query: &str, now: DateTime<Utc>) -> Vec<LaneItem> {
+fn lexical_lane(docs: &[Doc], tokens: &[String], query: &str, now: Timestamp) -> Vec<LaneItem> {
     let lowered = query.to_lowercase();
     let mut items = Vec::new();
     for (index, doc) in docs.iter().enumerate() {
@@ -449,7 +449,7 @@ fn lexical_lane(docs: &[Doc], tokens: &[String], query: &str, now: DateTime<Utc>
     items
 }
 
-fn fuzzy_lane(docs: &[Doc], query: &str, now: DateTime<Utc>) -> Vec<LaneItem> {
+fn fuzzy_lane(docs: &[Doc], query: &str, now: Timestamp) -> Vec<LaneItem> {
     let grams = char_ngrams(query);
     let mut items = Vec::new();
     for (index, doc) in docs.iter().enumerate() {
@@ -541,33 +541,72 @@ fn round6(value: f64) -> f64 {
 /// Why no as-of instant could be estimated (body-free reasons, ccc rule).
 pub type TimeparseError = &'static str;
 
-fn end_of_day(local: DateTime<FixedOffset>) -> DateTime<Utc> {
-    local
-        .with_hour(23)
-        .and_then(|t| t.with_minute(59))
-        .and_then(|t| t.with_second(59))
-        .and_then(|t| t.with_nanosecond(0))
-        .unwrap_or(local)
-        .with_timezone(&Utc)
+/// `offset`-anchored wall clock (chrono `FixedOffset::with_ymd_and_hms(..)
+/// .single()`): `None` for an impossible calendar date.
+fn fixed_local(
+    offset: Offset,
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<ZonedDateTime> {
+    let date = jiff::civil::Date::new(
+        i16::try_from(year).ok()?,
+        i8::try_from(month).ok()?,
+        i8::try_from(day).ok()?,
+    )
+    .ok()?;
+    let time = jiff::civil::Time::new(
+        i8::try_from(hour).ok()?,
+        i8::try_from(minute).ok()?,
+        i8::try_from(second).ok()?,
+        0,
+    )
+    .ok()?;
+    date.to_datetime(time)
+        .to_zoned_datetime(TimeZone::fixed(offset))
+        .ok()
 }
 
-fn add_months(base: DateTime<FixedOffset>, months: i64) -> Option<DateTime<FixedOffset>> {
-    let offset = *base.offset();
-    let total = base.year() as i64 * 12 + base.month() as i64 - 1 + months;
+/// Same wall-clock date as `local`, at `hour:minute:second.000000000`.
+fn at_time(local: &ZonedDateTime, hour: u32, minute: u32, second: u32) -> Option<ZonedDateTime> {
+    fixed_local(
+        local.offset(),
+        local.year().into(),
+        local.month() as u32,
+        local.day() as u32,
+        hour,
+        minute,
+        second,
+    )
+}
+
+fn shift(local: &ZonedDateTime, by: SignedDuration) -> Option<ZonedDateTime> {
+    local.checked_sub(by).ok()
+}
+
+fn end_of_day(local: ZonedDateTime) -> Timestamp {
+    at_time(&local, 23, 59, 59).unwrap_or(local).timestamp()
+}
+
+fn add_months(base: ZonedDateTime, months: i64) -> Option<ZonedDateTime> {
+    let offset = base.offset();
+    let total = i64::from(base.year()) * 12 + i64::from(base.month()) - 1 + months;
     let year = total.div_euclid(12);
     let month = (total.rem_euclid(12) + 1) as u32;
-    let day = base.day();
+    let day = base.day() as u32;
     let last_day = days_in_month(year as i32, month);
-    offset
-        .with_ymd_and_hms(
-            year as i32,
-            month,
-            day.min(last_day),
-            base.hour(),
-            base.minute(),
-            base.second(),
-        )
-        .single()
+    fixed_local(
+        offset,
+        year as i32,
+        month,
+        day.min(last_day),
+        base.hour() as u32,
+        base.minute() as u32,
+        base.second() as u32,
+    )
 }
 
 fn days_in_month(year: i32, month: u32) -> u32 {
@@ -610,7 +649,7 @@ fn boundary_ok(text: &str, start: usize, end: usize) -> bool {
     !is_digit(before) && !is_digit(after)
 }
 
-fn absolute_hits(text: &str, now: DateTime<FixedOffset>) -> Vec<AbsoluteHit> {
+fn absolute_hits(text: &str, now: ZonedDateTime) -> Vec<AbsoluteHit> {
     let mut hits = Vec::new();
 
     // ISO numeric dates: 2026-03-15 / 2026/3/15 / 2026.3.15 (year 19xx/20xx).
@@ -694,7 +733,7 @@ fn absolute_hits(text: &str, now: DateTime<FixedOffset>) -> Vec<AbsoluteHit> {
             continue;
         }
         hits.push(AbsoluteHit {
-            year: now.year(),
+            year: now.year().into(),
             month: m[1].parse().unwrap_or(0),
             day: m[2].parse().unwrap_or(0),
             span: (whole.start(), whole.end()),
@@ -728,7 +767,7 @@ fn absolute_hits(text: &str, now: DateTime<FixedOffset>) -> Vec<AbsoluteHit> {
         );
         if (1..=12).contains(&month) && (1..=31).contains(&day) {
             hits.push(AbsoluteHit {
-                year: now.year(),
+                year: now.year().into(),
                 month,
                 day,
                 span: (whole.start(), whole.end()),
@@ -807,14 +846,14 @@ fn month_from_name(name: &str) -> Option<u32> {
 /// `temporal.nl_as_of` so a wrong guess is visible, never silent.
 pub fn estimate_as_of(
     query: &str,
-    now: DateTime<FixedOffset>,
-) -> Result<(DateTime<Utc>, String), TimeparseError> {
+    now: &ZonedDateTime,
+) -> Result<(Timestamp, String), TimeparseError> {
     let query = query.trim();
     if query.is_empty() {
         return Err("empty-query");
     }
 
-    let hits = absolute_hits(query, now);
+    let hits = absolute_hits(query, now.clone());
     if !hits.is_empty() {
         let mut distinct: Vec<(i32, u32, u32)> =
             hits.iter().map(|h| (h.year, h.month, h.day)).collect();
@@ -824,19 +863,15 @@ pub fn estimate_as_of(
             return Err("ambiguous-absolute-dates");
         }
         let first = &hits[0];
-        let offset = *now.offset();
+        let offset = now.offset();
         let local = match first.precision {
-            AbsolutePrecision::Day => offset
-                .with_ymd_and_hms(first.year, first.month, first.day, 23, 59, 59)
-                .single(),
-            AbsolutePrecision::Month => offset
-                .with_ymd_and_hms(first.year, first.month, 1, 0, 0, 0)
-                .single()
+            AbsolutePrecision::Day => {
+                fixed_local(offset, first.year, first.month, first.day, 23, 59, 59)
+            }
+            AbsolutePrecision::Month => fixed_local(offset, first.year, first.month, 1, 0, 0, 0)
                 .and_then(|start| add_months(start, 1))
-                .map(|end| end - ChronoDuration::seconds(1)),
-            AbsolutePrecision::Year => offset
-                .with_ymd_and_hms(first.year, 12, 31, 23, 59, 59)
-                .single(),
+                .and_then(|end| shift(&end, SignedDuration::from_secs(1))),
+            AbsolutePrecision::Year => fixed_local(offset, first.year, 12, 31, 23, 59, 59),
         };
         let local = local.ok_or("impossible-calendar-date")?;
         return Ok((end_of_day(local), first.rule.to_string()));
@@ -884,7 +919,7 @@ pub fn estimate_as_of(
         if is_n_rule && n > 3650 {
             return Err("relative-out-of-range");
         }
-        let resolved = resolve_relative(rule, n, now);
+        let resolved = resolve_relative(rule, n, now.clone());
         if let Some(local) = resolved {
             return Ok((end_of_day(local), rule.to_string()));
         }
@@ -894,45 +929,43 @@ pub fn estimate_as_of(
 
 /// Every period resolves to its END instant (docstring rule of the ccc
 /// module): "지난주 시점" asks what was true by the end of last week.
-fn resolve_relative(
-    rule: &str,
-    n: i64,
-    now: DateTime<FixedOffset>,
-) -> Option<DateTime<FixedOffset>> {
+fn resolve_relative(rule: &str, n: i64, now: ZonedDateTime) -> Option<ZonedDateTime> {
     match rule {
-        "ko:그제" => Some(now - ChronoDuration::days(2)),
-        "ko:어제" | "en:yesterday" => Some(now - ChronoDuration::days(1)),
-        "ko:N일전" | "en:Ndaysago" => Some(now - ChronoDuration::days(n)),
-        "ko:N주전" | "en:Nweeksago" => Some(now - ChronoDuration::weeks(n)),
+        "ko:그제" => shift(&now, SignedDuration::from_hours(2 * 24)),
+        "ko:어제" | "en:yesterday" => shift(&now, SignedDuration::from_hours(24)),
+        "ko:N일전" | "en:Ndaysago" => shift(&now, SignedDuration::from_hours(n.checked_mul(24)?)),
+        "ko:N주전" | "en:Nweeksago" => {
+            shift(&now, SignedDuration::from_hours(n.checked_mul(7 * 24)?))
+        }
         "ko:N개월전" | "en:Nmonthsago" => add_months(now, -n),
         "ko:N년전" | "en:Nyearsago" => add_months(now, -12 * n),
         "ko:지난주" | "en:lastweek" => {
-            let days_since_monday = now.weekday().num_days_from_monday() as i64;
-            let monday = now - ChronoDuration::days(days_since_monday);
-            Some(start_of_day(monday)? - ChronoDuration::seconds(1))
+            let days_since_monday = i64::from(now.weekday().to_monday_zero_offset());
+            let monday = shift(&now, SignedDuration::from_hours(days_since_monday * 24))?;
+            shift(&start_of_day(monday)?, SignedDuration::from_secs(1))
         }
         "ko:지난달" | "en:lastmonth" => {
-            let first = (*now.offset())
-                .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
-                .single()?;
-            Some(first - ChronoDuration::seconds(1))
+            let first = fixed_local(
+                now.offset(),
+                now.year().into(),
+                now.month() as u32,
+                1,
+                0,
+                0,
+                0,
+            )?;
+            shift(&first, SignedDuration::from_secs(1))
         }
         "ko:작년" | "en:lastyear" => {
-            let first = (*now.offset())
-                .with_ymd_and_hms(now.year(), 1, 1, 0, 0, 0)
-                .single()?;
-            Some(first - ChronoDuration::seconds(1))
+            let first = fixed_local(now.offset(), now.year().into(), 1, 1, 0, 0, 0)?;
+            shift(&first, SignedDuration::from_secs(1))
         }
         _ => None,
     }
 }
 
-fn start_of_day(local: DateTime<FixedOffset>) -> Option<DateTime<FixedOffset>> {
-    local
-        .with_hour(0)
-        .and_then(|t| t.with_minute(0))
-        .and_then(|t| t.with_second(0))
-        .and_then(|t| t.with_nanosecond(0))
+fn start_of_day(local: ZonedDateTime) -> Option<ZonedDateTime> {
+    at_time(&local, 0, 0, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -945,11 +978,11 @@ pub struct SearchOptions<'a> {
     pub query: &'a str,
     pub as_of: Option<&'a str>,
     pub limit: usize,
-    pub now: DateTime<Utc>,
+    pub now: Timestamp,
 }
 
 impl<'a> SearchOptions<'a> {
-    pub fn new(query: &'a str, now: DateTime<Utc>) -> Self {
+    pub fn new(query: &'a str, now: Timestamp) -> Self {
         Self {
             query,
             as_of: None,
@@ -957,6 +990,14 @@ impl<'a> SearchOptions<'a> {
             now,
         }
     }
+}
+
+/// The host's current local offset as a fixed zone (chrono
+/// `Local::now().fixed_offset()`): later arithmetic never crosses a DST rule.
+fn local_now_fixed() -> ZonedDateTime {
+    let now = ZonedDateTime::now();
+    let offset = now.offset();
+    now.with_time_zone(TimeZone::fixed(offset))
 }
 
 /// Run a search over the route's index and return the ccc-compatible result
@@ -971,7 +1012,7 @@ pub fn search(route: &Route, options: &SearchOptions) -> Result<Value> {
     let mut as_of_raw: Option<String> = options.as_of.map(str::trim).map(str::to_string);
     let mut nl_as_of: Option<Value> = None;
     if as_of_raw.is_none() {
-        match estimate_as_of(options.query, Local::now().fixed_offset()) {
+        match estimate_as_of(options.query, &local_now_fixed()) {
             Ok((instant, rule)) => {
                 as_of_raw = Some(facts::format_timestamp(instant));
                 nl_as_of = Some(json!({ "rule": rule, "iso": as_of_raw.clone().unwrap() }));
@@ -1119,12 +1160,8 @@ mod tests {
 
     /// A pinned +09:00 clock so the local-end-of-period rules are
     /// deterministic on any runner timezone.
-    fn kst(year: i32, month: u32, day: u32, hour: u32) -> DateTime<FixedOffset> {
-        FixedOffset::east_opt(9 * 3600)
-            .unwrap()
-            .with_ymd_and_hms(year, month, day, hour, 0, 0)
-            .single()
-            .unwrap()
+    fn kst(year: i32, month: u32, day: u32, hour: u32) -> ZonedDateTime {
+        fixed_local(Offset::constant(9), year, month, day, hour, 0, 0).unwrap()
     }
 
     #[test]
@@ -1150,13 +1187,13 @@ mod tests {
     #[test]
     fn timeparse_resolves_periods_to_their_end() {
         let now = kst(2026, 9, 8, 10);
-        let (instant, rule) = estimate_as_of("어제 회의 결과", now).unwrap();
+        let (instant, rule) = estimate_as_of("어제 회의 결과", &now).unwrap();
         assert_eq!(rule, "ko:어제");
         assert_eq!(
             facts::parse_timestamp("2026-09-07T23:59:59+09:00").unwrap(),
             instant
         );
-        let (instant, rule) = estimate_as_of("2026-03-15에 무슨 일이", now).unwrap();
+        let (instant, rule) = estimate_as_of("2026-03-15에 무슨 일이", &now).unwrap();
         assert_eq!(rule, "abs:iso-date");
         assert_eq!(
             facts::parse_timestamp("2026-03-15T23:59:59+09:00").unwrap(),
@@ -1167,23 +1204,23 @@ mod tests {
     #[test]
     fn timeparse_prefers_absolute_and_gives_up_on_conflict() {
         let now = kst(2026, 9, 8, 10);
-        let (_, rule) = estimate_as_of("어제 말고 2026-03-15 기준", now).unwrap();
+        let (_, rule) = estimate_as_of("어제 말고 2026-03-15 기준", &now).unwrap();
         assert_eq!(rule, "abs:iso-date");
         assert_eq!(
-            estimate_as_of("2026-03-15와 2026-04-01 사이", now).unwrap_err(),
+            estimate_as_of("2026-03-15와 2026-04-01 사이", &now).unwrap_err(),
             "ambiguous-absolute-dates"
         );
         assert_eq!(
-            estimate_as_of("시간 표현 없음", now).unwrap_err(),
+            estimate_as_of("시간 표현 없음", &now).unwrap_err(),
             "no-time-reference"
         );
-        assert_eq!(estimate_as_of("", now).unwrap_err(), "empty-query");
+        assert_eq!(estimate_as_of("", &now).unwrap_err(), "empty-query");
     }
 
     #[test]
     fn korean_ymd_suppresses_the_yearless_variant() {
         let now = kst(2026, 9, 8, 10);
-        let (_, rule) = estimate_as_of("2024년 3월 15일 상황", now).unwrap();
+        let (_, rule) = estimate_as_of("2024년 3월 15일 상황", &now).unwrap();
         assert_eq!(rule, "abs:ko-ymd");
     }
 
@@ -1191,17 +1228,17 @@ mod tests {
     fn relative_ranges_and_month_ends() {
         let now = kst(2026, 9, 8, 10);
         assert_eq!(
-            estimate_as_of("4000일 전", now).unwrap_err(),
+            estimate_as_of("4000일 전", &now).unwrap_err(),
             "relative-out-of-range"
         );
-        let (instant, rule) = estimate_as_of("지난주 시점", now).unwrap();
+        let (instant, rule) = estimate_as_of("지난주 시점", &now).unwrap();
         assert_eq!(rule, "ko:지난주");
         // 2026-09-08 is a Tuesday; the previous ISO week ended Sunday 23:59:59.
         assert_eq!(
             facts::parse_timestamp("2026-09-06T23:59:59+09:00").unwrap(),
             instant
         );
-        let (instant, _) = estimate_as_of("지난달", now).unwrap();
+        let (instant, _) = estimate_as_of("지난달", &now).unwrap();
         assert_eq!(
             facts::parse_timestamp("2026-08-31T23:59:59+09:00").unwrap(),
             instant

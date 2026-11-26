@@ -8,26 +8,29 @@
 //! the pre-transition offset, which is what Python's `tzinfo` replace
 //! semantics produce for `ZoneInfo`.
 
-use chrono::{
-    DateTime, Duration, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset,
-    TimeZone, Timelike, Utc,
-};
-use chrono_tz::Tz;
+use danso_ops::clock::{SecondsFormat, Timestamp};
+use jiff::civil::{Date, DateTime, Time};
+use jiff::tz::{AmbiguousOffset, Offset, TimeZone};
+use jiff::{RoundMode, TimestampRound, Unit};
 use std::sync::OnceLock;
 
 /// ccc `fmt_dt`: `YYYY-MM-DDTHH:MM:SSZ`, `None` passes through.
-pub fn fmt_dt(dt: Option<DateTime<Utc>>) -> Option<String> {
-    dt.map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+pub fn fmt_dt(dt: Option<Timestamp>) -> Option<String> {
+    dt.map(|dt| danso_ops::clock::rfc3339_opts(dt, SecondsFormat::Secs, true))
 }
 
 /// Floor to the minute, matching Python's `.replace(second=0, microsecond=0)`.
-pub fn truncate_minute(dt: DateTime<Utc>) -> DateTime<Utc> {
-    dt - Duration::seconds(dt.second() as i64)
-        - Duration::nanoseconds(dt.timestamp_subsec_nanos() as i64)
+pub fn truncate_minute(dt: Timestamp) -> Timestamp {
+    dt.round(
+        TimestampRound::new()
+            .smallest(Unit::Minute)
+            .mode(RoundMode::Floor),
+    )
+    .expect("flooring to a minute stays in range")
 }
 
 struct IsoStamp {
-    naive: NaiveDateTime,
+    naive: DateTime,
     offset_sec: Option<i32>,
 }
 
@@ -47,17 +50,37 @@ fn parse_iso(value: &str) -> Result<IsoStamp, ()> {
     if bytes.len() < 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return Err(());
     }
-    let date = NaiveDate::parse_from_str(&text[..10], "%Y-%m-%d").map_err(|_| ())?;
+    let date = parse_date(&text[..10])?;
     let (time_part, offset_sec) = split_offset(text.get(10..).unwrap_or_default())?;
     let time = match time_part {
         Some(core) => parse_time(core)?,
         // Date-only means midnight.
-        None => NaiveTime::MIN,
+        None => Time::midnight(),
     };
     Ok(IsoStamp {
-        naive: date.and_time(time),
+        naive: date.to_datetime(time),
         offset_sec,
     })
+}
+
+/// `YYYY-MM-DD` with four, two and two ASCII digits and a real calendar date.
+fn parse_date(text: &str) -> Result<Date, ()> {
+    let bytes = text.as_bytes();
+    let digits = |range: std::ops::Range<usize>| -> Result<i32, ()> {
+        let part = &bytes[range];
+        if part.iter().all(u8::is_ascii_digit) {
+            std::str::from_utf8(part)
+                .map_err(|_| ())?
+                .parse()
+                .map_err(|_| ())
+        } else {
+            Err(())
+        }
+    };
+    let year = digits(0..4)?;
+    let month = digits(5..7)?;
+    let day = digits(8..10)?;
+    Date::new(year as i16, month as i8, day as i8).map_err(|_| ())
 }
 
 fn split_offset(rest: &str) -> Result<(Option<&str>, Option<i32>), ()> {
@@ -114,7 +137,7 @@ fn parse_offset(text: &str, positive: bool) -> Result<i32, ()> {
     Ok(if positive { total } else { -total })
 }
 
-fn parse_time(text: &str) -> Result<NaiveTime, ()> {
+fn parse_time(text: &str) -> Result<Time, ()> {
     let mut parts = text.split('.');
     let clock = parts.next().ok_or(())?;
     let frac = parts.next();
@@ -149,13 +172,13 @@ fn parse_time(text: &str) -> Result<NaiveTime, ()> {
         }
         Some(_) => return Err(()),
     };
-    NaiveTime::from_hms_nano_opt(hour as u32, minute as u32, second as u32, nanos).ok_or(())
+    Time::new(hour as i8, minute as i8, second as i8, nanos as i32).map_err(|_| ())
 }
 
 /// ccc `parse_dt`: `None`/empty passes through, naive stamps are UTC, and the
 /// result is truncated to the minute. Errors name the field and the raw value
 /// (`{field} is not valid ISO8601: {value}`).
-pub fn parse_utc(value: Option<&str>, field: &str) -> Result<Option<DateTime<Utc>>, String> {
+pub fn parse_utc(value: Option<&str>, field: &str) -> Result<Option<Timestamp>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -169,51 +192,41 @@ pub fn parse_utc(value: Option<&str>, field: &str) -> Result<Option<DateTime<Utc
 }
 
 /// ccc `parse_local_dt`: naive stamps are anchored to `tz`.
-pub fn parse_local(value: &str, tz: Tz, field: &str) -> Result<DateTime<Utc>, String> {
+pub fn parse_local(value: &str, tz: &TimeZone, field: &str) -> Result<Timestamp, String> {
     let raw = value.to_string();
     let stamp = parse_iso(value).map_err(|_| format!("{field} is not valid ISO8601: {raw}"))?;
     let dt = match stamp.offset_sec {
         // An explicit offset pins the wall time: the instant is
         // wall - offset (Python `astimezone(utc)` on an aware datetime).
-        Some(sec) => FixedOffset::east_opt(sec)
-            .ok_or_else(|| format!("{field} is not valid ISO8601: {raw}"))?
-            .from_local_datetime(&stamp.naive)
-            .earliest()
-            .ok_or_else(|| format!("{field} is not valid ISO8601: {raw}"))?
-            .with_timezone(&Utc),
-        None => local_to_utc(tz, stamp.naive),
+        Some(sec) => Offset::from_seconds(sec)
+            .and_then(|offset| offset.to_timestamp(stamp.naive))
+            .map_err(|_| format!("{field} is not valid ISO8601: {raw}"))?,
+        None => local_to_utc(tz, stamp.naive)
+            .ok_or_else(|| format!("{field} is not valid ISO8601: {raw}"))?,
     };
     Ok(truncate_minute(dt))
 }
 
-fn to_utc(stamp: IsoStamp) -> Result<DateTime<Utc>, String> {
-    match stamp.offset_sec {
-        Some(sec) => {
-            let offset =
-                FixedOffset::east_opt(sec).ok_or_else(|| "invalid UTC offset".to_string())?;
-            Ok(offset
-                .from_local_datetime(&stamp.naive)
-                .earliest()
-                .ok_or_else(|| "invalid UTC offset".to_string())?
-                .with_timezone(&Utc))
-        }
-        None => Ok(stamp.naive.and_utc()),
-    }
+fn to_utc(stamp: IsoStamp) -> Result<Timestamp, String> {
+    let offset = match stamp.offset_sec {
+        Some(sec) => Offset::from_seconds(sec).map_err(|_| "invalid UTC offset".to_string())?,
+        None => Offset::UTC,
+    };
+    offset
+        .to_timestamp(stamp.naive)
+        .map_err(|_| "invalid UTC offset".to_string())
 }
 /// Python `naive.replace(tzinfo=tz).astimezone(utc)` for a `ZoneInfo`: the
 /// earliest instant for an ambiguous wall time (fold 0), and the
-/// pre-transition offset for a wall time inside a forward gap. tzdata never
-/// places two transitions within 48 hours, so the offset sampled 48 hours
-/// earlier is the pre-transition one.
-pub fn local_to_utc(tz: Tz, naive: NaiveDateTime) -> DateTime<Utc> {
-    match tz.from_local_datetime(&naive) {
-        LocalResult::Single(dt) => dt.with_timezone(&Utc),
-        LocalResult::Ambiguous(earliest, _) => earliest.with_timezone(&Utc),
-        LocalResult::None => {
-            let before = tz.offset_from_utc_datetime(&(naive - Duration::hours(48)));
-            (naive - before.fix()).and_utc()
-        }
-    }
+/// pre-transition offset for a wall time inside a forward gap. In a fold the
+/// pre-transition offset is also the one that gives the earliest instant, so
+/// both cases use `before`. `None` only outside the supported instant range.
+pub fn local_to_utc(tz: &TimeZone, naive: DateTime) -> Option<Timestamp> {
+    let offset = match tz.to_ambiguous_timestamp(naive).offset() {
+        AmbiguousOffset::Unambiguous { offset } => offset,
+        AmbiguousOffset::Fold { before, .. } | AmbiguousOffset::Gap { before, .. } => before,
+    };
+    offset.to_timestamp(naive).ok()
 }
 
 static BOOT_ID: OnceLock<String> = OnceLock::new();

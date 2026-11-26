@@ -9,7 +9,7 @@
 //! `memory` failure.
 
 use anyhow::{Result, ensure};
-use chrono::{DateTime, Utc};
+use danso_ops::clock::Timestamp;
 use sha2::{Digest, Sha256};
 
 use super::facts::{self, FactRecord};
@@ -46,7 +46,7 @@ pub struct SnapshotOptions<'a> {
     pub max_bytes: usize,
     /// Working-state staleness threshold in days; 0 disables the warning.
     pub stale_days: u32,
-    pub now: DateTime<Utc>,
+    pub now: Timestamp,
 }
 
 /// Read one owner-only document for injection, or `None` when the source is
@@ -92,7 +92,7 @@ fn hostname() -> String {
 /// Eligible facts for the local-hot block: one route's store plus, for a
 /// private route, the shared tree (§7 read rule). Rejected, superseded,
 /// retention-expired, closed and observation records are excluded (§4.4).
-fn eligible_facts(route: &Route, now: DateTime<Utc>) -> Result<Vec<FactRecord>> {
+fn eligible_facts(route: &Route, now: Timestamp) -> Result<Vec<FactRecord>> {
     let mut eligible = Vec::new();
     // §7 dedup: the legacy tree is the source the live tree was migrated
     // from, so ids differ while the text is the same. Dedup on the normalized
@@ -169,7 +169,7 @@ fn local_hot_block(
     route: &Route,
     query: Option<&str>,
     budget: usize,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<String> {
     let heading = "## Local hot memory (task-conditioned cache search)\n";
     let eligible = eligible_facts(route, now)?;
@@ -369,7 +369,7 @@ pub fn assemble(route: &Route, options: &SnapshotOptions) -> Result<String> {
                 .and_then(|meta| meta.modified().ok())
                 .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|elapsed| {
-                    (options.now.timestamp() as u64).saturating_sub(elapsed.as_secs()) / 86400
+                    (options.now.as_second() as u64).saturating_sub(elapsed.as_secs()) / 86400
                 })
                 .unwrap_or(0);
             if age_days >= options.stale_days as u64 {
@@ -408,7 +408,7 @@ pub fn check_forgery(body: &str) -> Result<()> {
 
 /// Render the §5.2 managed block around an assembled snapshot body: audited
 /// markers, body hash, policy header, and the untrusted-data divider.
-pub fn render_managed_block(body: &str, now: DateTime<Utc>) -> Result<String> {
+pub fn render_managed_block(body: &str, now: Timestamp) -> Result<String> {
     check_forgery(body)?;
     let digest = Sha256::digest(body.as_bytes());
     let block = format!(
@@ -489,7 +489,7 @@ pub fn inject_into_context(
     config: &super::MemoryConfig,
     prompt: &str,
     cwd: &std::path::Path,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<()> {
     if config.mode == super::MemoryMode::Off {
         return Ok(());
@@ -667,7 +667,7 @@ mod tests {
         // the 20-day-old fixture reads as 13 days old (time-bomb, 2026-09-14).
         let fixed_now = facts::parse_timestamp("2026-09-08T12:00:00Z").unwrap();
         let old = std::time::UNIX_EPOCH
-            + std::time::Duration::from_secs(fixed_now.timestamp() as u64 - 20 * 86400);
+            + std::time::Duration::from_secs(fixed_now.as_second() as u64 - 20 * 86400);
         std::fs::File::options()
             .write(true)
             .open(&path)
@@ -796,7 +796,14 @@ mod tests {
         write(&route.memories_dir().join("MEMORY.md"), "policy\n");
         let mut ctx = String::from("system base");
         let config = MemoryConfig::default();
-        inject_into_context(&mut ctx, &config, "prompt", dir.path(), Utc::now()).unwrap();
+        inject_into_context(
+            &mut ctx,
+            &config,
+            "prompt",
+            dir.path(),
+            danso_ops::clock::now(),
+        )
+        .unwrap();
         assert_eq!(ctx, "system base", "OFF is byte-identical");
 
         let config = MemoryConfig {
@@ -809,7 +816,14 @@ mod tests {
             refresh: crate::memory::RefreshMode::default(),
             legacy_read: None,
         };
-        inject_into_context(&mut ctx, &config, "prompt", dir.path(), Utc::now()).unwrap();
+        inject_into_context(
+            &mut ctx,
+            &config,
+            "prompt",
+            dir.path(),
+            danso_ops::clock::now(),
+        )
+        .unwrap();
         assert!(ctx.starts_with("system base"));
         assert!(ctx.contains(MANAGED_BEGIN));
         assert!(ctx.contains("snapshot-sha256: `"));

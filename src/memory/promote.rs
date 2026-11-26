@@ -6,7 +6,7 @@
 //! destination id + audit id. Never automatic; explicit operator action.
 
 use anyhow::{Result, ensure};
-use chrono::{DateTime, Utc};
+use danso_ops::clock::Timestamp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -61,7 +61,7 @@ pub fn promote(
     audience_root: &std::path::Path,
     source_scope: &str,
     fact_id: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
     lock_timeout_ms: u64,
 ) -> Result<PromotionResult> {
     ensure!(paths::valid_scope(source_scope), "source scope is invalid");

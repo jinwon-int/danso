@@ -291,7 +291,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
             &args.memory,
             &args.prompt,
             &cwd,
-            chrono::Utc::now(),
+            danso_ops::clock::now(),
         )
         .map_err(at(Kind::Memory))?;
     }
@@ -331,7 +331,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
                 &memory_config,
                 &args.prompt,
                 &cwd_for_refresh,
-                chrono::Utc::now(),
+                danso_ops::clock::now(),
             )?;
             if let Some(caller) = &caller {
                 fresh.push_str(caller);
@@ -555,8 +555,13 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
             _ => "",
         };
         if !trigger.is_empty() {
-            memory::distill::journal::enqueue(route, &session_path, trigger, chrono::Utc::now())
-                .map_err(at(Kind::Memory))?;
+            memory::distill::journal::enqueue(
+                route,
+                &session_path,
+                trigger,
+                danso_ops::clock::now(),
+            )
+            .map_err(at(Kind::Memory))?;
         }
         if run.is_ok() && args.memory_distill == memory::DistillMode::Inline {
             memory::distill::extract::drain(
@@ -565,7 +570,7 @@ pub async fn run(args: &RunConfig, sink: &mut impl EventSink, usage: &mut Usage)
                 usage,
                 1,
                 args.provider_timeout_seconds * 1000,
-                chrono::Utc::now(),
+                danso_ops::clock::now(),
             )
             .await
             .map_err(at(Kind::Memory))?;

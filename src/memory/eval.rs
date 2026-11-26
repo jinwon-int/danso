@@ -441,6 +441,7 @@ mod tests {
 
     #[test]
     fn eval_clock_is_pinned_after_every_fixture_date() {
+        use danso_ops::clock::Rfc3339;
         let now = super::super::facts::parse_timestamp(EVAL_NOW).unwrap();
         assert_eq!(now.to_rfc3339(), "2026-09-08T12:00:00+00:00");
     }

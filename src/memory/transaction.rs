@@ -33,7 +33,7 @@ pub fn absent_hash() -> String {
 }
 
 fn now() -> String {
-    super::facts::format_timestamp(chrono::Utc::now())
+    super::facts::format_timestamp(danso_ops::clock::now())
 }
 
 fn hash(payload: Option<&[u8]>) -> String {

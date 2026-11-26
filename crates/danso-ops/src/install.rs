@@ -62,6 +62,7 @@
 //! reach". The state writer already takes this precaution
 //! ([`crate::update`]); nothing here may be weaker than it.
 
+use crate::clock::Rfc3339;
 use crate::release::{self, Manifest};
 use crate::update::{
     self, GenerationRef, InstalledGeneration, PendingActivation, Source, UPDATE_LOCK_FILE,
@@ -859,7 +860,7 @@ pub(crate) fn log_event(
         danso_home,
         LogLine {
             schema: UPDATE_LOG_SCHEMA,
-            at: chrono::Utc::now().to_rfc3339(),
+            at: crate::clock::now().to_rfc3339(),
             event,
             version: report.map(|r| r.version.as_str()),
             target_sha256: report.map(|r| r.target_sha256.as_str()),
@@ -894,7 +895,7 @@ pub fn log_gate(
         danso_home,
         LogLine {
             schema: UPDATE_LOG_SCHEMA,
-            at: chrono::Utc::now().to_rfc3339(),
+            at: crate::clock::now().to_rfc3339(),
             event,
             version: None,
             target_sha256: None,
@@ -924,7 +925,7 @@ pub(crate) fn log_generation_event(
         danso_home,
         LogLine {
             schema: UPDATE_LOG_SCHEMA,
-            at: chrono::Utc::now().to_rfc3339(),
+            at: crate::clock::now().to_rfc3339(),
             event,
             version,
             target_sha256,

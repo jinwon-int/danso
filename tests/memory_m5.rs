@@ -33,7 +33,7 @@ fn write_private(path: &Path, contents: &str) {
         .unwrap();
 }
 
-fn now() -> chrono::DateTime<chrono::Utc> {
+fn now() -> danso_ops::clock::Timestamp {
     danso::memory::facts::parse_timestamp("2026-09-08T12:00:00Z").unwrap()
 }
 
