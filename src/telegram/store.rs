@@ -3,7 +3,6 @@ use crate::channel::validate_usage;
 
 use super::{client::Update, ensure_private_dir};
 use anyhow::{Context, Result, ensure};
-use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -451,7 +450,7 @@ fn validate_record(record: &ConversationRecord) -> Result<()> {
             "Telegram active task start time is invalid"
         );
         ensure!(
-            DateTime::parse_from_rfc3339(&task.started_at).is_ok(),
+            danso_ops::clock::parse_rfc3339(&task.started_at).is_ok(),
             "Telegram active task start time must be RFC 3339"
         );
     }

@@ -1,6 +1,7 @@
 //! Pi JSONL is interchange; custom operation records gate execution on recovery.
 use crate::contracts::SessionStore;
 use anyhow::{Context, Result, bail, ensure};
+use danso_ops::clock::Rfc3339;
 use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{
@@ -11,10 +12,10 @@ use std::{
 };
 
 pub fn now() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    danso_ops::clock::now().to_rfc3339_opts(danso_ops::clock::SecondsFormat::Millis, true)
 }
 pub fn millis() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    danso_ops::clock::now().as_millisecond()
 }
 
 pub struct Session {

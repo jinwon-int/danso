@@ -274,7 +274,7 @@ pub fn run(args: &MemoryArgs) -> anyhow::Result<Option<Value>> {
             eval_command(mode)
         }
         Command::Distill { session } => {
-            let outcome = journal::enqueue(&route, session, "explicit", chrono::Utc::now())?;
+            let outcome = journal::enqueue(&route, session, "explicit", danso_ops::clock::now())?;
             Ok(Some(match outcome {
                 journal::EnqueueOutcome::Enqueued { job_id } => {
                     json!({ "enqueued": true, "job_id": job_id })
@@ -299,7 +299,7 @@ pub fn run(args: &MemoryArgs) -> anyhow::Result<Option<Value>> {
                 route.root(),
                 from,
                 fact,
-                chrono::Utc::now(),
+                danso_ops::clock::now(),
                 paths::lock_timeout(args.lock_timeout_ms),
             )?;
             Ok(Some(
@@ -354,7 +354,7 @@ struct AddInput<'a> {
 }
 
 fn add(route: &Route, lock_timeout_ms: u64, input: AddInput<'_>) -> anyhow::Result<Option<Value>> {
-    let now = chrono::Utc::now();
+    let now = danso_ops::clock::now();
     let candidate = facts::Candidate {
         kind: input.kind.to_string(),
         text: input.text.trim().to_string(),
@@ -450,7 +450,7 @@ fn search(
         query,
         as_of,
         limit,
-        now: chrono::Utc::now(),
+        now: danso_ops::clock::now(),
     };
     let output = recall::search(route, &options)?;
     if json_output {
@@ -490,7 +490,7 @@ fn close(route: &Route, fact: &str, lock_timeout_ms: u64) -> anyhow::Result<Opti
     match facts::close(
         route,
         fact,
-        chrono::Utc::now(),
+        danso_ops::clock::now(),
         paths::lock_timeout(lock_timeout_ms),
     )? {
         facts::CloseOutcome::Closed => Ok(Some(json!({ "fact": fact, "closed": true }))),
@@ -511,7 +511,7 @@ fn show(route: &Route) -> anyhow::Result<()> {
         query: None,
         max_bytes: snapshot::SNAPSHOT_MAX_BYTES_DEFAULT,
         stale_days: snapshot::STALE_DAYS_DEFAULT,
-        now: chrono::Utc::now(),
+        now: danso_ops::clock::now(),
     };
     let body = snapshot::assemble(route, &options)?;
     print!("{body}");
@@ -558,7 +558,7 @@ fn drain_command(
             &mut usage,
             max_jobs,
             120_000,
-            chrono::Utc::now(),
+            danso_ops::clock::now(),
         )
         .await
     })?;
@@ -593,7 +593,7 @@ fn check(route: &Route) -> anyhow::Result<Option<Value>> {
                 && r.valid_until
                     .as_deref()
                     .and_then(|v| facts::parse_timestamp(v).ok())
-                    .is_none_or(|until| until > chrono::Utc::now())
+                    .is_none_or(|until| until > danso_ops::clock::now())
         })
         .count();
     let closed = records.len() - open;

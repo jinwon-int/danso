@@ -8,7 +8,7 @@ pub mod extract;
 pub mod journal;
 
 use anyhow::{Result, ensure};
-use chrono::{DateTime, Utc};
+use danso_ops::clock::Timestamp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -62,7 +62,7 @@ pub fn build_input(
     session_path: &std::path::Path,
     trigger: &str,
     budget_bytes: usize,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(Value, String, usize)> {
     ensure!(
         TRIGGERS.contains(&trigger),
@@ -115,7 +115,7 @@ pub fn build_input(
         "session journal is missing its session id"
     );
     // Last 7 days, latest 50 (§4.6).
-    let now_ms = now.timestamp_millis();
+    let now_ms = now.as_millisecond();
     let week_ms = 7 * 24 * 3600 * 1000i64;
     messages.retain(|(timestamp, _, _)| *timestamp == 0 || now_ms - timestamp <= week_ms);
     // Newest-first selection (§4.6): the tail of the chronological session

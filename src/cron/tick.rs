@@ -5,7 +5,7 @@
 
 use crate::cron::due::{due_plan, read_only_mutations};
 use crate::cron::store::Store;
-use chrono::{DateTime, Utc};
+use danso_ops::clock::Timestamp;
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -65,12 +65,7 @@ pub fn actions(plan: &Value) -> Vec<Value> {
 }
 
 /// The `--dry-run` plan: what a tick would run, touching nothing.
-pub fn dry_run(
-    store: &Store,
-    store_display: &str,
-    at_raw: Option<&str>,
-    now: DateTime<Utc>,
-) -> Value {
+pub fn dry_run(store: &Store, store_display: &str, at_raw: Option<&str>, now: Timestamp) -> Value {
     let plan = due_plan(store, store_display, at_raw, now);
     json!({
         "ok": plan["ok"].as_bool().unwrap_or(false),
@@ -94,7 +89,7 @@ pub fn execute(
     store: &Store,
     store_display: &str,
     at_raw: Option<&str>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     max_runs: usize,
 ) -> (Value, i32) {
     let plan = due_plan(store, store_display, at_raw, now);

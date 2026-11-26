@@ -815,8 +815,8 @@ fn serving_pid(systemctl: &Path, plan: &WorkerPlan<'_>, receipt: &Receipt) -> Op
     // restart is perfectly well-formed and describes the process that is
     // already gone. One second of slack, as ccc allows, because the two
     // timestamps come from different clocks reading the same wall clock.
-    let published = chrono::DateTime::parse_from_rfc3339(&document.updated_at).ok()?;
-    if published.timestamp() + 1 < receipt.created_at {
+    let published = crate::clock::parse_rfc3339(&document.updated_at).ok()?;
+    if published.as_second() + 1 < receipt.created_at {
         return None;
     }
     if document.service.state != crate::status::ServiceState::Available {
@@ -944,6 +944,7 @@ fn systemctl_output(systemctl: &Path, user_scope: bool, args: &[&str]) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Rfc3339;
 
     fn data_dir() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -1436,9 +1437,7 @@ exit 0
     /// fixture that sets them from one value lets either check be deleted for
     /// free.
     fn publish_health_pids(path: &Path, service_pid: u32, process_pid: u32, at: i64, state: &str) {
-        let written = chrono::DateTime::from_timestamp(at, 0)
-            .unwrap()
-            .to_rfc3339();
+        let written = crate::clock::Timestamp::new(at, 0).unwrap().to_rfc3339();
         let document = serde_json::json!({
             "schema_version": 1,
             "started_at": written,

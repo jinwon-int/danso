@@ -46,6 +46,7 @@
 //! because the evidence and the rollback target are the two things a person
 //! investigating needs and the two things a retry would destroy.
 
+use crate::clock::Rfc3339;
 use crate::health::{HealthDocument, STALE_AFTER_SECONDS};
 use crate::install::UpdateLock;
 use crate::update::{self, Outcome, PendingActivation};
@@ -166,7 +167,7 @@ impl Activation {
 pub fn serving_from_health(
     health_path: Option<&Path>,
     not_before: Option<&str>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::clock::Timestamp,
 ) -> Serving {
     let Some(health_path) = health_path else {
         return Serving::Missing;
@@ -213,11 +214,7 @@ pub fn serving_from_health(
 /// the check is to refuse evidence that cannot be shown to postdate the
 /// activation, and a timestamp nobody can read shows nothing.
 fn written_before(observed: &str, boundary: &str) -> bool {
-    let parse = |value: &str| {
-        chrono::DateTime::parse_from_rfc3339(value)
-            .ok()
-            .map(|stamp| stamp.with_timezone(&chrono::Utc))
-    };
+    let parse = |value: &str| crate::clock::parse_rfc3339(value).ok();
     match (parse(observed), parse(boundary)) {
         (Some(observed), Some(boundary)) => observed < boundary,
         _ => true,
@@ -242,7 +239,7 @@ pub fn serving_for(
     record: &PendingActivation,
     danso_home: &Path,
     health_path: Option<&Path>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::clock::Timestamp,
 ) -> Serving {
     if record.services.is_empty() {
         serving_from_installed_binary(danso_home)
@@ -255,7 +252,7 @@ pub fn serving_for(
 pub fn activate(
     danso_home: &Path,
     health_path: Option<&Path>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::clock::Timestamp,
 ) -> Result<Activation> {
     judge(danso_home, health_path, now, false)
 }
@@ -271,7 +268,7 @@ pub fn activate(
 pub fn retry(
     danso_home: &Path,
     health_path: Option<&Path>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::clock::Timestamp,
 ) -> Result<Activation> {
     judge(danso_home, health_path, now, true)
 }
@@ -279,7 +276,7 @@ pub fn retry(
 fn judge(
     danso_home: &Path,
     health_path: Option<&Path>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::clock::Timestamp,
     rejudge_failed: bool,
 ) -> Result<Activation> {
     let state = update::state_dir(danso_home);
@@ -349,17 +346,15 @@ mod tests {
 
     const NOW: &str = "2026-09-17T00:00:00+00:00";
 
-    fn now() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::parse_from_rfc3339(NOW)
-            .unwrap()
-            .with_timezone(&chrono::Utc)
+    fn now() -> crate::clock::Timestamp {
+        crate::clock::parse_rfc3339(NOW).unwrap()
     }
 
     /// A record whose activation started a minute before `NOW`, so a health
     /// document stamped `NOW` legitimately postdates it.
     fn pending(target: &str, services: Vec<String>) -> PendingActivation {
         let mut record = pending_at(target, services);
-        record.started_at = (now() - chrono::Duration::seconds(60)).to_rfc3339();
+        record.started_at = (now() - crate::clock::SignedDuration::from_secs(60)).to_rfc3339();
         record
     }
 
@@ -556,7 +551,8 @@ mod tests {
     fn the_freshness_window_is_the_health_documents_own() {
         // The record has to predate both documents, or the premature rule
         // decides these cases instead of the freshness rule.
-        let started = (now() - chrono::Duration::seconds(STALE_AFTER_SECONDS + 10)).to_rfc3339();
+        let started = (now() - crate::clock::SignedDuration::from_secs(STALE_AFTER_SECONDS + 10))
+            .to_rfc3339();
         let target = "b".repeat(64);
 
         let fixture = Fixture::new();
@@ -564,7 +560,8 @@ mod tests {
         record.started_at = started.clone();
         fixture.put_pending(&record);
         // Exactly on the boundary, which is inside.
-        let inside = (now() - chrono::Duration::seconds(STALE_AFTER_SECONDS)).to_rfc3339();
+        let inside =
+            (now() - crate::clock::SignedDuration::from_secs(STALE_AFTER_SECONDS)).to_rfc3339();
         write_health(&fixture.health, &inside, Some(&target));
         assert_eq!(fixture.run().exit_code(), 0);
 
@@ -572,7 +569,8 @@ mod tests {
         let mut record = pending(&target, vec!["danso.service".into()]);
         record.started_at = started;
         fixture.put_pending(&record);
-        let outside = (now() - chrono::Duration::seconds(STALE_AFTER_SECONDS + 1)).to_rfc3339();
+        let outside =
+            (now() - crate::clock::SignedDuration::from_secs(STALE_AFTER_SECONDS + 1)).to_rfc3339();
         write_health(&fixture.health, &outside, Some(&target));
         assert_eq!(fixture.run().exit_code(), EXIT_UNVERIFIED);
     }
@@ -585,7 +583,7 @@ mod tests {
         fixture.put_pending(&record);
         // The document the not-yet-restarted process wrote, 10 seconds before
         // the activation began. It is fresh, and it says the old digest.
-        let before = (now() - chrono::Duration::seconds(70)).to_rfc3339();
+        let before = (now() - crate::clock::SignedDuration::from_secs(70)).to_rfc3339();
         write_health(&fixture.health, &before, Some(&"a".repeat(64)));
 
         let outcome = fixture.run();
@@ -617,7 +615,8 @@ mod tests {
         let fixture = Fixture::new();
         let target = "b".repeat(64);
         fixture.put_pending(&pending(&target, vec!["danso.service".into()]));
-        let ahead = (now() + chrono::Duration::seconds(STALE_AFTER_SECONDS + 1)).to_rfc3339();
+        let ahead =
+            (now() + crate::clock::SignedDuration::from_secs(STALE_AFTER_SECONDS + 1)).to_rfc3339();
         write_health(&fixture.health, &ahead, Some(&"a".repeat(64)));
 
         let outcome = fixture.run();
@@ -710,7 +709,8 @@ mod tests {
     #[test]
     fn the_evidence_taxonomy_is_reported_not_flattened() {
         let target = "b".repeat(64);
-        let old = (now() - chrono::Duration::seconds(STALE_AFTER_SECONDS + 1)).to_rfc3339();
+        let old =
+            (now() - crate::clock::SignedDuration::from_secs(STALE_AFTER_SECONDS + 1)).to_rfc3339();
         /// (label, optional (updated_at, digest) for the health document, expected)
         type Case = (&'static str, Option<(String, Option<String>)>, Serving);
         let cases: Vec<Case> = vec![

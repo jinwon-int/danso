@@ -28,10 +28,12 @@ wiki = ["dep:danso-wiki"]
 [dependencies]
 anyhow = "1"
 base64 = "0.23"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# §6.5 (operator decision, issue #33): embedded tzdb via chrono-tz — never the
-# system tzdata, so Termux nodes resolve the same IANA names identically.
-chrono-tz = "0.10"
+# §6.5 (operator decision, issue #33): embedded tzdb — never the system
+# tzdata, so Termux nodes resolve the same IANA names identically. jiff
+# replaces chrono/chrono-tz (#228): bundled tzdb only (`tzdb-bundle-always`), no
+# `tzdb-zoneinfo`, so IANA names never resolve through the system database;
+# `tz-system` only detects the host's local zone (memory recall `Local`).
+jiff = { version = "1", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
 danso-ops = { path = "crates/danso-ops" }
 danso-wiki = { path = "crates/danso-wiki", optional = true }
 clap = { version = "4", features = ["derive"] }

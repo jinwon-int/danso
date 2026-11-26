@@ -1,6 +1,7 @@
 //! Explicit transfer of Codex file credentials and single-writer bounded refresh.
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use danso_ops::clock::Rfc3339;
 use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{
@@ -112,7 +113,7 @@ fn parse_credentials(v: &Value, allow_expired: bool) -> Result<Credentials> {
         .as_i64()
         .context("missing ChatGPT token expiry")?;
     ensure!(
-        allow_expired || exp > chrono::Utc::now().timestamp().saturating_add(60),
+        allow_expired || exp > danso_ops::clock::now().as_second().saturating_add(60),
         "ChatGPT authentication expired or expires within 60 seconds; renew using Codex login then retry explicitly"
     );
     Ok(Credentials {
@@ -338,7 +339,7 @@ pub(super) async fn access(path: &Path, base: &str, timeout: u64) -> Result<(Str
     let _lock = dir.lock()?;
     let mut v = dir.managed()?;
     let old = parse_credentials(&v, true)?;
-    if old.expiry > chrono::Utc::now().timestamp().saturating_add(60) {
+    if old.expiry > danso_ops::clock::now().as_second().saturating_add(60) {
         return Ok((old.token, old.account));
     }
     let refresh = v["tokens"]["refresh_token"]
@@ -421,7 +422,7 @@ pub(super) async fn access(path: &Path, base: &str, timeout: u64) -> Result<(Str
         updated.account == old.account,
         "ChatGPT refresh changed account"
     );
-    v["last_refresh"] = json!(chrono::Utc::now().to_rfc3339());
+    v["last_refresh"] = json!(danso_ops::clock::now().to_rfc3339());
     // The exchange yielded to other processes: re-check ownership before any
     // refreshed token is installed or used for inference. Keep pending on drift.
     ensure!(

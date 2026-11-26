@@ -4,7 +4,7 @@
 //! the rollback transaction. Ephemeral: extraction sessions never journal.
 
 use anyhow::{Result, ensure};
-use chrono::{DateTime, Utc};
+use danso_ops::clock::Timestamp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -142,7 +142,7 @@ pub fn commit_extraction(
     route: &Route,
     context: &CommitContext<'_>,
     extraction: &ValidatedExtraction,
-    now: DateTime<Utc>,
+    now: Timestamp,
     timeout_ms: u64,
 ) -> Result<usize> {
     route.require_writable()?;
@@ -276,7 +276,7 @@ fn render_resume(
     summary: &Value,
     thread_hash: &str,
     trigger: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<Option<String>> {
     // The header is a machine comment; its provenance values must stay
     // bounded single-line labels.
@@ -372,7 +372,7 @@ pub async fn drain(
     usage: &mut crate::usage::Usage,
     max_jobs: usize,
     timeout_ms: u64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<DrainReport> {
     let mut report = DrainReport::default();
     // Delta, not absolute: an inline drain shares the run's `Usage`, which may
@@ -433,7 +433,7 @@ async fn extract_job(
     job: &journal::ClaimedJob,
     provider: &mut impl crate::provider::Provider,
     usage: &mut crate::usage::Usage,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(ValidatedExtraction, String, String)> {
     let prompt_reserved = EXTRACTION_PROMPT.len() + SCHEMA_HINT.len() + 256;
     let (input, transcript_sha256, _bytes) = build_input(

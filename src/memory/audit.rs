@@ -4,7 +4,7 @@
 //! rotates at 1 MiB keeping the newest half.
 
 use anyhow::Result;
-use chrono::Utc;
+use danso_ops::clock::Rfc3339;
 use serde_json::{Value, json};
 
 use super::paths::{self, Route};
@@ -50,7 +50,7 @@ impl Event {
 }
 
 fn timestamp() -> String {
-    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    danso_ops::clock::now().to_rfc3339_opts(danso_ops::clock::SecondsFormat::Secs, true)
 }
 
 /// Append one event, rotating the ledger at 1 MiB (newest half kept).

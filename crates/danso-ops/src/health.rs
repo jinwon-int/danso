@@ -122,16 +122,16 @@ impl HealthDocument {
     /// Seconds since this document was written, or `None` when `updated_at` is
     /// not a timestamp we can read. An unreadable timestamp must not silently
     /// become "fresh".
-    pub fn age_seconds(&self, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
-        let written = chrono::DateTime::parse_from_rfc3339(self.observed_at()).ok()?;
-        Some((now - written.with_timezone(&chrono::Utc)).num_seconds())
+    pub fn age_seconds(&self, now: crate::clock::Timestamp) -> Option<i64> {
+        let written = crate::clock::parse_rfc3339(self.observed_at()).ok()?;
+        Some((now - written).as_secs())
     }
 
     /// Whether the document is too old to be evidence of a serving process.
     ///
     /// A document from the future is not treated as stale: clock adjustment is
     /// not a reason to report a running service as down.
-    pub fn is_stale(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+    pub fn is_stale(&self, now: crate::clock::Timestamp) -> bool {
         match self.age_seconds(now) {
             Some(age) => age > STALE_AFTER_SECONDS,
             None => true,
@@ -142,6 +142,7 @@ impl HealthDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Rfc3339;
 
     fn document(updated_at: &str) -> HealthDocument {
         HealthDocument {
@@ -229,18 +230,21 @@ mod tests {
 
     #[test]
     fn staleness_uses_the_documented_threshold() {
-        let now = chrono::Utc::now();
-        let fresh = document(&(now - chrono::Duration::seconds(STALE_AFTER_SECONDS)).to_rfc3339());
+        let now = crate::clock::now();
+        let fresh = document(
+            &(now - crate::clock::SignedDuration::from_secs(STALE_AFTER_SECONDS)).to_rfc3339(),
+        );
         assert!(!fresh.is_stale(now));
-        let stale =
-            document(&(now - chrono::Duration::seconds(STALE_AFTER_SECONDS + 1)).to_rfc3339());
+        let stale = document(
+            &(now - crate::clock::SignedDuration::from_secs(STALE_AFTER_SECONDS + 1)).to_rfc3339(),
+        );
         assert!(stale.is_stale(now));
     }
 
     #[test]
     fn a_future_timestamp_is_not_stale() {
-        let now = chrono::Utc::now();
-        let skewed = document(&(now + chrono::Duration::seconds(600)).to_rfc3339());
+        let now = crate::clock::now();
+        let skewed = document(&(now + crate::clock::SignedDuration::from_secs(600)).to_rfc3339());
         assert!(
             !skewed.is_stale(now),
             "clock skew must not report a running service as down"
@@ -250,8 +254,8 @@ mod tests {
     #[test]
     fn an_unreadable_timestamp_is_stale() {
         let broken = document("not-a-timestamp");
-        assert!(broken.age_seconds(chrono::Utc::now()).is_none());
-        assert!(broken.is_stale(chrono::Utc::now()));
+        assert!(broken.age_seconds(crate::clock::now()).is_none());
+        assert!(broken.is_stale(crate::clock::now()));
     }
 
     #[test]

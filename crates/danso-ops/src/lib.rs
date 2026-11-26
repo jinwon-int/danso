@@ -13,6 +13,7 @@
 //! * A zombie has exited and cannot poll or hold a lock, so it is not live.
 
 pub mod activate;
+pub mod clock;
 pub mod generation;
 pub mod handoff;
 pub mod health;

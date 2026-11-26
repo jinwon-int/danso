@@ -12,7 +12,7 @@ use crate::cron::commit::short_text;
 use crate::cron::due::{lock_status, read_only_mutations};
 use crate::cron::store::{Task, atomic_write_bytes, locks_dir};
 use crate::cron::time::{boot_id, fmt_dt};
-use chrono::{DateTime, Utc};
+use danso_ops::clock::Timestamp;
 use fs2::FileExt as _;
 use serde_json::{Value, json};
 use std::fs::File;
@@ -141,7 +141,7 @@ pub fn replace_lock_file(path: &Path, payload: &Value) -> Result<(), String> {
     atomic_write_bytes(path, text.as_bytes(), 0o600)
 }
 
-fn lock_payload(task_id: &str, run_id: &str, scheduled_at: &str, at: DateTime<Utc>) -> Value {
+fn lock_payload(task_id: &str, run_id: &str, scheduled_at: &str, at: Timestamp) -> Value {
     json!({
         "taskId": task_id,
         "runId": run_id,
@@ -167,14 +167,14 @@ enum Reclaim {
 
 /// Move a stale lock aside (`<id>.lock.stale.<unix_ts>.<pid>`, ccc names it
 /// the same way) so a fresh `O_EXCL` acquire can proceed.
-fn reclaim_stale(path: &Path, at: DateTime<Utc>) -> Reclaim {
+fn reclaim_stale(path: &Path, at: Timestamp) -> Reclaim {
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     let aside = path.with_file_name(format!(
         "{file_name}.stale.{}.{}",
-        at.timestamp(),
+        at.as_second(),
         std::process::id()
     ));
     match std::fs::rename(path, &aside) {
@@ -194,7 +194,7 @@ pub fn acquire_for_run_guarded(
     task: &Task,
     run_id: &str,
     scheduled_at: &str,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> (bool, Value) {
     let path = lock_path(store_path, task_id);
     let locks = locks_dir(store_path);
@@ -263,7 +263,7 @@ pub fn acquire_for_run(
     task: &Task,
     run_id: &str,
     scheduled_at: &str,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> Result<(bool, Value), String> {
     let _guard = task_flock(store_path, task_id)?;
     Ok(acquire_for_run_guarded(
@@ -300,7 +300,7 @@ pub fn quarantine_persist_failure(
     store_path: &Path,
     task_id: &str,
     run_id: &str,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> Result<Value, String> {
     let _guard = task_flock(store_path, task_id)?;
     let path = lock_path(store_path, task_id);
@@ -354,7 +354,7 @@ pub fn lock_command(
     action: &str,
     run_id: &str,
     scheduled_at: &str,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> Result<(Value, i32), String> {
     let _guard = task_flock(store_path, task_id)?;
     let path = lock_path(store_path, task_id);

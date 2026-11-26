@@ -9,10 +9,9 @@
 //!   timezone; every result is truncated to the minute
 
 use crate::cron::time::{parse_local, truncate_minute};
-use chrono::{
-    DateTime, Datelike, Duration, LocalResult, NaiveDateTime, Offset, TimeZone, Timelike, Utc,
-};
-use chrono_tz::Tz;
+use danso_ops::clock::{SignedDuration, Timestamp};
+use jiff::civil::{DateTime, Time};
+use jiff::tz::{AmbiguousOffset, TimeZone};
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -50,17 +49,21 @@ fn interval_regex() -> &'static Regex {
 }
 
 /// Resolve a task timezone name; unknown names fail closed with the name in
-/// the error (operator decision: embedded `chrono-tz` tzdb, never system
-/// tzdata, and never a silent UTC fallback).
-pub fn resolve_timezone(name: &str) -> Result<Tz, String> {
+/// the error (operator decision: the tzdb embedded in the binary — jiff's
+/// bundled copy, never system tzdata — and never a silent UTC fallback).
+/// Names match exactly, as with the previous `chrono-tz` lookup and Python's
+/// `ZoneInfo`: jiff's own lookup is case-insensitive, so a differently cased
+/// name is refused here rather than silently accepted.
+pub fn resolve_timezone(name: &str) -> Result<TimeZone, String> {
     let label = name.trim();
     let label = if label.is_empty() { "UTC" } else { label };
     if label.eq_ignore_ascii_case("UTC") {
-        return Ok(Tz::UTC);
+        return Ok(TimeZone::UTC);
     }
-    label
-        .parse::<Tz>()
-        .map_err(|_| format!("unknown timezone: {label}"))
+    match jiff::tz::db().get(label) {
+        Ok(tz) if tz.iana_name() == Some(label) => Ok(tz),
+        _ => Err(format!("unknown timezone: {label}")),
+    }
 }
 
 /// One cron field expanded to its value set (`*`, `N`, `N-M`, comma lists,
@@ -128,9 +131,9 @@ impl CronFields {
     /// Cron day semantics: with both day-of-month and day-of-week
     /// restricted, either may match; otherwise the restricted field
     /// (if any) controls. DOW 0/7 are both Sunday.
-    fn day_matches(&self, local: NaiveDateTime) -> bool {
-        let dow = local.weekday().num_days_from_sunday() as i32;
-        let dom_match = self.dom.contains(&(local.day() as i32));
+    fn day_matches(&self, local: DateTime) -> bool {
+        let dow = i32::from(local.weekday().to_sunday_zero_offset());
+        let dom_match = self.dom.contains(&(i32::from(local.day())));
         let dow_match = self.dow.contains(&dow) || (dow == 0 && self.dow.contains(&7));
         if !self.dom_any && !self.dow_any {
             dom_match || dow_match
@@ -139,37 +142,38 @@ impl CronFields {
         }
     }
 
-    fn matches(&self, local: NaiveDateTime) -> bool {
-        self.minute.contains(&(local.minute() as i32))
-            && self.hour.contains(&(local.hour() as i32))
+    fn matches(&self, local: DateTime) -> bool {
+        self.minute.contains(&(i32::from(local.minute())))
+            && self.hour.contains(&(i32::from(local.hour())))
             && self.day_matches(local)
-            && self.month.contains(&(local.month() as i32))
+            && self.month.contains(&(i32::from(local.month())))
     }
 
     /// Earliest naive wall-clock minute after `naive` that could match. A
     /// month mismatch caps at the next local midnight — hops never exceed one
     /// local day, so zone-aware callers can verify each hop against a
     /// constant UTC offset.
-    fn next_candidate_local(&self, naive: NaiveDateTime) -> NaiveDateTime {
-        if !self.month.contains(&(naive.month() as i32)) {
+    fn next_candidate_local(&self, naive: DateTime) -> DateTime {
+        if !self.month.contains(&(i32::from(naive.month()))) {
             return next_local_midnight(naive);
         }
         if !self.day_matches(naive) {
             return next_local_midnight(naive);
         }
-        if !self.hour.contains(&(naive.hour() as i32)) {
+        if !self.hour.contains(&(i32::from(naive.hour()))) {
             let next_hour = self
                 .hour
                 .iter()
                 .copied()
-                .filter(|h| *h > naive.hour() as i32)
+                .filter(|h| *h > i32::from(naive.hour()))
                 .min();
             return match next_hour {
                 Some(hour) => naive
-                    .with_hour(hour as u32)
-                    .expect("valid hour")
-                    .with_minute(0)
-                    .expect("valid minute"),
+                    .with()
+                    .hour(hour as i8)
+                    .minute(0)
+                    .build()
+                    .expect("valid hour and minute"),
                 None => next_local_midnight(naive),
             };
         }
@@ -177,30 +181,46 @@ impl CronFields {
             .minute
             .iter()
             .copied()
-            .filter(|m| *m > naive.minute() as i32)
+            .filter(|m| *m > i32::from(naive.minute()))
             .min();
         match next_minute {
-            Some(minute) => naive.with_minute(minute as u32).expect("valid minute"),
-            None => naive.with_minute(0).expect("valid minute") + Duration::hours(1),
+            Some(minute) => naive
+                .with()
+                .minute(minute as i8)
+                .build()
+                .expect("valid minute"),
+            None => naive
+                .with()
+                .minute(0)
+                .build()
+                .expect("valid minute")
+                .checked_add(SignedDuration::from_hours(1))
+                .expect("valid next hour"),
         }
     }
 }
 
-fn next_local_midnight(naive: NaiveDateTime) -> NaiveDateTime {
+fn next_local_midnight(naive: DateTime) -> DateTime {
     naive
         .date()
-        .succ_opt()
+        .tomorrow()
         .expect("valid successor date")
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight")
+        .to_datetime(Time::midnight())
 }
 
 /// A parsed schedule; `parse_schedule` is the only constructor.
 #[derive(Debug, Clone)]
 pub enum Schedule {
-    Cron { fields: Box<CronFields>, tz: Tz },
-    Interval { seconds: i64 },
-    Once { run_at: DateTime<Utc> },
+    Cron {
+        fields: Box<CronFields>,
+        tz: TimeZone,
+    },
+    Interval {
+        seconds: i64,
+    },
+    Once {
+        run_at: Timestamp,
+    },
 }
 
 impl Schedule {
@@ -241,11 +261,11 @@ pub fn parse_schedule(expr: &str, tz_name: &str) -> Result<Schedule, String> {
         return Ok(Schedule::Interval { seconds });
     }
     if let Some(rest) = expr.strip_prefix("at ") {
-        let run_at = parse_local(rest, tz, "schedule")?;
+        let run_at = parse_local(rest, &tz, "schedule")?;
         return Ok(Schedule::Once { run_at });
     }
     if expr.contains('T') && !expr.contains(' ') {
-        let run_at = parse_local(expr, tz, "schedule")?;
+        let run_at = parse_local(expr, &tz, "schedule")?;
         return Ok(Schedule::Once { run_at });
     }
     let resolved = SHORTHANDS
@@ -292,16 +312,17 @@ pub fn parse_schedule(expr: &str, tz_name: &str) -> Result<Schedule, String> {
 /// pass; the second pass re-scans minute by minute.
 fn first_match_zone(
     fields: &CronFields,
-    tz: Tz,
-    mut cur: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    tz: &TimeZone,
+    mut cur: Timestamp,
+    end: Timestamp,
+) -> Option<Timestamp> {
+    let minute = SignedDuration::from_mins(1);
     loop {
         if cur > end {
             return None;
         }
-        let loc = cur.with_timezone(&tz);
-        let local_naive = loc.naive_local();
+        let loc_offset = tz.to_offset(cur);
+        let local_naive = loc_offset.to_datetime(cur);
         if fields.matches(local_naive) {
             return Some(cur);
         }
@@ -310,38 +331,38 @@ fn first_match_zone(
         // `replace(tzinfo=tz)`. A nonexistent target always fails the landing
         // check below in the Python reference, so skipping straight to the
         // minute step is equivalent.
-        let resolved = match tz.from_local_datetime(&target) {
-            LocalResult::Single(dt) => dt,
-            LocalResult::Ambiguous(earliest, _) => earliest,
-            LocalResult::None => {
-                cur += Duration::minutes(1);
+        let target_offset = match tz.to_ambiguous_timestamp(target).offset() {
+            AmbiguousOffset::Unambiguous { offset } => offset,
+            AmbiguousOffset::Fold { before, .. } => before,
+            AmbiguousOffset::Gap { .. } => {
+                cur += minute;
                 continue;
             }
         };
-        let cand = truncate_minute(resolved.with_timezone(&Utc));
-        let cand_loc = cand.with_timezone(&tz);
+        let Ok(resolved) = target_offset.to_timestamp(target) else {
+            cur += minute;
+            continue;
+        };
+        let cand = truncate_minute(resolved);
+        let cand_offset = tz.to_offset(cand);
         if cand <= cur
-            || cand - cur != target - local_naive
-            || cand_loc.naive_local() != target
-            || cand_loc.offset().fix() != loc.offset().fix()
+            || cand.duration_since(cur) != target.duration_since(local_naive)
+            || cand_offset.to_datetime(cand) != target
+            || cand_offset != loc_offset
         {
-            cur += Duration::minutes(1);
+            cur += minute;
             continue;
         }
         cur = cand;
     }
 }
 
-fn first_match(
-    schedule: &Schedule,
-    cur: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+fn first_match(schedule: &Schedule, cur: Timestamp, end: Timestamp) -> Option<Timestamp> {
     if cur > end {
         return None;
     }
     match schedule {
-        Schedule::Cron { fields, tz, .. } => first_match_zone(fields, *tz, cur, end),
+        Schedule::Cron { fields, tz, .. } => first_match_zone(fields, tz, cur, end),
         // Only cron schedules scan; interval/once have closed-form answers.
         _ => None,
     }
@@ -351,11 +372,11 @@ fn first_match(
 /// ascending), capped at `cap` with a truncation flag.
 pub fn iter_occurrences(
     schedule: &Schedule,
-    start_exclusive: DateTime<Utc>,
-    end_inclusive: DateTime<Utc>,
+    start_exclusive: Timestamp,
+    end_inclusive: Timestamp,
     cap: usize,
-) -> (Vec<DateTime<Utc>>, bool) {
-    let mut cur = truncate_minute(start_exclusive + Duration::minutes(1));
+) -> (Vec<Timestamp>, bool) {
+    let mut cur = truncate_minute(start_exclusive + SignedDuration::from_mins(1));
     let end = truncate_minute(end_inclusive);
     let mut out = Vec::new();
     let mut truncated = false;
@@ -365,25 +386,21 @@ pub fn iter_occurrences(
             break;
         }
         out.push(hit);
-        cur = hit + Duration::minutes(1);
+        cur = hit + SignedDuration::from_mins(1);
     }
     (out, truncated)
 }
 
 /// First phase-aligned interval occurrence strictly after `floor` (UTC).
-fn interval_next_after(
-    seconds: i64,
-    floor: DateTime<Utc>,
-    anchor: Option<DateTime<Utc>>,
-) -> DateTime<Utc> {
+fn interval_next_after(seconds: i64, floor: Timestamp, anchor: Option<Timestamp>) -> Timestamp {
     let Some(anchor) = anchor else {
-        return floor + Duration::seconds(seconds);
+        return floor + SignedDuration::from_secs(seconds);
     };
-    let delta = (floor - anchor).num_seconds();
+    let delta = floor.duration_since(anchor).as_secs();
     let k = if delta >= 0 { delta / seconds + 1 } else { 0 };
-    let mut candidate = anchor + Duration::seconds(k * seconds);
+    let mut candidate = anchor + SignedDuration::from_secs(k * seconds);
     while candidate <= floor {
-        candidate += Duration::seconds(seconds);
+        candidate += SignedDuration::from_secs(seconds);
     }
     candidate
 }
@@ -397,11 +414,11 @@ fn interval_next_after(
 /// - cron: minute-scan matched in the task timezone.
 pub fn schedule_occurrences(
     schedule: &Schedule,
-    last: Option<DateTime<Utc>>,
-    at: DateTime<Utc>,
-    anchor: Option<DateTime<Utc>>,
+    last: Option<Timestamp>,
+    at: Timestamp,
+    anchor: Option<Timestamp>,
     cap: usize,
-) -> (Vec<DateTime<Utc>>, bool) {
+) -> (Vec<Timestamp>, bool) {
     match schedule {
         Schedule::Once { run_at, .. } => {
             if *run_at <= at && last.is_none_or(|last| last < *run_at) {
@@ -420,7 +437,7 @@ pub fn schedule_occurrences(
                 (None, Some(last)) => last,
                 (None, None) => return (Vec::new(), false),
             };
-            let step = Duration::seconds(*seconds);
+            let step = SignedDuration::from_secs(*seconds);
             let mut cur = interval_next_after(*seconds, floor, anchor);
             let mut out = Vec::new();
             let mut truncated = false;
@@ -435,7 +452,7 @@ pub fn schedule_occurrences(
             (out, truncated)
         }
         Schedule::Cron { .. } => {
-            let horizon = last.unwrap_or(at - Duration::days(366));
+            let horizon = last.unwrap_or(at - SignedDuration::from_hours(366 * 24));
             iter_occurrences(schedule, horizon, at, cap)
         }
     }
@@ -445,15 +462,15 @@ pub fn schedule_occurrences(
 /// occurrence exists within the 366-day horizon.
 pub fn next_after(
     schedule: &Schedule,
-    at: DateTime<Utc>,
-    anchor: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+    at: Timestamp,
+    anchor: Option<Timestamp>,
+) -> Option<Timestamp> {
     match schedule {
         Schedule::Once { run_at, .. } => (*run_at > at).then_some(*run_at),
         Schedule::Interval { seconds, .. } => Some(interval_next_after(*seconds, at, anchor)),
         Schedule::Cron { .. } => {
-            let cur = truncate_minute(at + Duration::minutes(1));
-            let end = cur + Duration::minutes(366 * 24 * 60 - 1);
+            let cur = truncate_minute(at + SignedDuration::from_mins(1));
+            let end = cur + SignedDuration::from_mins(366 * 24 * 60 - 1);
             first_match(schedule, cur, end)
         }
     }

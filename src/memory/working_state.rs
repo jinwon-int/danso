@@ -8,7 +8,6 @@
 //! scanner; the session journal is never touched.
 
 use anyhow::{Result, ensure};
-use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use super::facts;
@@ -175,7 +174,7 @@ fn render(summary: &serde_json::Value, final_answer: Option<&str>) -> Result<Str
 
 /// Unique `working-state-YYYYMMDD_HHMMSS[.N].md` name for this second.
 fn unique_name(dir: &std::path::Path) -> Result<String> {
-    let stamp = Utc::now().format("%Y%m%d_%H%M%S");
+    let stamp = danso_ops::clock::now().strftime("%Y%m%d_%H%M%S");
     let mut candidate = format!("working-state-{stamp}.md");
     let mut sequence = 0u32;
     while dir.join(&candidate).exists() {

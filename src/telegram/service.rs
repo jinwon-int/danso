@@ -19,6 +19,7 @@ const CHANNEL_LABEL: &str = "Telegram";
 use crate::settings::Layered;
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
+use danso_ops::clock::Rfc3339;
 use danso_ops::{
     health::{
         HEALTH_SCHEMA_VERSION, HealthDocument, ProcessHealth, ServiceHealth, TelegramHealth,
@@ -235,7 +236,7 @@ impl HealthFile {
     fn new(data_dir: &std::path::Path) -> Self {
         Self {
             path: data_dir.join(HEALTH_FILE_NAME),
-            started_at: chrono::Utc::now().to_rfc3339(),
+            started_at: danso_ops::clock::now().to_rfc3339(),
             last_poll_at: Mutex::new(String::new()),
             poll: Mutex::new(PollOutcome::default()),
         }
@@ -312,7 +313,7 @@ impl HealthFile {
         };
         let reason = (consecutive_failures > 0)
             .then(|| format!("{consecutive_failures} consecutive polling failures"));
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = danso_ops::clock::now().to_rfc3339();
         let document = HealthDocument {
             schema_version: HEALTH_SCHEMA_VERSION,
             started_at: self.started_at.clone(),
@@ -544,7 +545,7 @@ impl TelegramService {
                 }
                 None => poller.next().await,
             };
-            let poll_time = chrono::Utc::now().to_rfc3339();
+            let poll_time = danso_ops::clock::now().to_rfc3339();
             // Record the outcome before publishing: `last_poll_at` advances on
             // failures too, so on its own it cannot distinguish a serving
             // service from one that has been failing every poll.
@@ -771,7 +772,7 @@ impl TelegramService {
             &route,
             &session_path,
             "explicit",
-            chrono::Utc::now(),
+            danso_ops::clock::now(),
         ) {
             Ok(crate::memory::distill::journal::EnqueueOutcome::Enqueued { job_id }) => {
                 format!("Distill enqueued: job_id={job_id}.")
@@ -794,7 +795,7 @@ impl TelegramService {
             route.root(),
             &self.inner.settings.memory_scope,
             fact_id,
-            chrono::Utc::now(),
+            danso_ops::clock::now(),
             crate::memory::paths::LOCK_TIMEOUT_DEFAULT_MS,
         );
         match result {

@@ -15,6 +15,7 @@
 //! is replaced at all. A replaced binary with no pending record is an update
 //! nobody can verify or roll back.
 
+use crate::clock::Rfc3339;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -80,7 +81,7 @@ impl InstalledGeneration {
             schema: INSTALLED_GENERATION_SCHEMA.to_string(),
             version,
             binary_sha256,
-            installed_at: chrono::Utc::now().to_rfc3339(),
+            installed_at: crate::clock::now().to_rfc3339(),
             source,
             artifact_name: None,
             artifact_sha256: None,
@@ -140,7 +141,7 @@ impl PendingActivation {
         services: Vec<String>,
         snapshot: Option<String>,
     ) -> Self {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::clock::now().to_rfc3339();
         Self {
             schema: ACTIVATION_SCHEMA.to_string(),
             target,

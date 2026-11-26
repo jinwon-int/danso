@@ -9,13 +9,13 @@
 // neither the module nor the binary subcommand these tests drive.
 #![cfg(feature = "ops")]
 
-use chrono::{DateTime, Utc};
 use danso::cron::retry::{RetryPolicy, retry_delay, retry_view};
 use danso::cron::schedule::{
     OCCURRENCE_SCAN_LIMIT, iter_occurrences, next_after, parse_schedule, schedule_occurrences,
 };
 use danso::cron::store::{RetryPolicySpec, RetryState};
 use danso::cron::time::{fmt_dt, parse_utc};
+use danso_ops::clock::Timestamp;
 use serde_json::Value;
 
 const GOLDEN: &str = include_str!("fixtures/cron_golden.json");
@@ -24,7 +24,7 @@ fn fixture() -> Value {
     serde_json::from_str(GOLDEN).expect("valid golden fixture")
 }
 
-fn utc(raw: &str) -> DateTime<Utc> {
+fn utc(raw: &str) -> Timestamp {
     parse_utc(Some(raw), "fixture")
         .expect("fixture timestamp")
         .expect("non-empty fixture timestamp")
@@ -257,4 +257,78 @@ fn golden_retry_delays_match_the_reference() {
             assert_eq!(delay, expected.as_i64().unwrap(), "delay {attempt}");
         }
     }
+}
+
+/// §6.5 (#33): IANA names resolve only through the tzdb embedded in the
+/// binary. jiff reads the system zoneinfo only with its `tzdb-zoneinfo` /
+/// `tzdb-concatenated` features; a dependency change that turns either on
+/// (e.g. jiff's default features) shows up here (#228).
+#[test]
+fn tz_names_resolve_through_the_embedded_tzdb_only() {
+    let db = format!("{:?}", jiff::tz::db());
+    assert!(db.contains("Bundled"), "{db}");
+    assert!(
+        !db.contains("ZoneInfo") && !db.contains("Concatenated"),
+        "{db}"
+    );
+}
+
+/// Names match exactly, as with chrono-tz and Python's `ZoneInfo` (#228):
+/// jiff's own lookup is case-insensitive, and accepting `asia/seoul` would
+/// write task files the ccc reference rejects.
+#[test]
+fn timezone_names_are_case_sensitive_except_utc() {
+    use danso::cron::schedule::resolve_timezone;
+    for ok in [
+        "Asia/Seoul",
+        " Asia/Seoul ",
+        "America/New_York",
+        "US/Eastern",
+        "UTC",
+        "utc",
+        "",
+    ] {
+        assert!(resolve_timezone(ok).is_ok(), "{ok:?}");
+    }
+    for bad in [
+        "asia/seoul",
+        "ASIA/SEOUL",
+        "Asia/Seoul/",
+        "Not/AZone",
+        "../etc/passwd",
+    ] {
+        let err = resolve_timezone(bad).unwrap_err();
+        assert!(err.starts_with("unknown timezone: "), "{bad:?}: {err}");
+    }
+}
+
+/// `YYYY-MM-DD` is four, two and two ASCII digits, as in Python
+/// `fromisoformat`. The chrono-based parser also accepted a signed year and
+/// a space-padded month or day; Python rejects those, and now so does danso
+/// (#228 differential test).
+#[test]
+fn iso_dates_need_plain_digits_like_python() {
+    for bad in [
+        "+026-11-26",
+        "-026-11-26T09:30Z",
+        "2026- 1-26T09:30Z",
+        "2026-11- 6T09:30Z",
+    ] {
+        let err = parse_utc(Some(bad), "fixture").unwrap_err();
+        assert_eq!(err, format!("fixture is not valid ISO8601: {bad}"));
+    }
+    assert_eq!(utc("2026-01-06T09:30Z"), utc("2026-01-06T09:30:59Z"));
+}
+
+/// The supported instant range ends at 9999-12-30T22:00Z (jiff). Python and
+/// the chrono parser accepted the last ~26 hours of year 9999; danso now
+/// refuses them instead of mis-scheduling (#228).
+#[test]
+fn instants_past_the_supported_range_fail_closed() {
+    assert!(
+        parse_utc(Some("9999-12-30T21:59Z"), "fixture")
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_utc(Some("9999-12-31T23:59Z"), "fixture").is_err());
 }

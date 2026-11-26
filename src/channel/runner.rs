@@ -12,6 +12,7 @@ use super::{
     settings::validate_model,
 };
 use anyhow::{Context, Result, bail, ensure};
+use danso_ops::clock::Rfc3339;
 use std::{
     fs::OpenOptions,
     io::{BufRead, BufReader},
@@ -318,12 +319,8 @@ struct JournalTimestamp<'a> {
 }
 
 fn safe_timestamp(raw: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|timestamp| {
-            timestamp
-                .with_timezone(&chrono::Utc)
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        })
+    danso_ops::clock::parse_rfc3339(raw)
+        .map(|timestamp| timestamp.to_rfc3339_opts(danso_ops::clock::SecondsFormat::Millis, true))
         .unwrap_or_else(|_| "unknown".to_string())
 }
 

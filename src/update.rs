@@ -345,7 +345,7 @@ pub fn apply(
         &danso_ops::update::state_dir(&home),
         health.as_deref(),
         force,
-        chrono::Utc::now(),
+        danso_ops::clock::now(),
     );
     // An attempt that never started still gets a log line. A node several
     // generations behind is diagnosed from this file, and a silent deferral
@@ -414,7 +414,7 @@ pub fn activate(data_dir: Option<PathBuf>, retry: bool) -> Result<danso_ops::Act
     let health = crate::service::resolve_data_dir(data_dir)
         .ok()
         .map(|dir| dir.join("health.json"));
-    let now = chrono::Utc::now();
+    let now = danso_ops::clock::now();
     match retry {
         true => danso_ops::activate::retry(&home, health.as_deref(), now),
         false => danso_ops::activate::activate(&home, health.as_deref(), now),

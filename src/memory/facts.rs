@@ -13,7 +13,7 @@
 //! auto-supersede → conflict review → dedup.
 
 use anyhow::{Result, ensure};
-use chrono::{DateTime, SecondsFormat, Utc};
+use danso_ops::clock::{Rfc3339, Timestamp};
 use regex::Regex;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -56,20 +56,20 @@ const MAX_QUOTE_CHARS: usize = 120;
 pub const QUOTE_MIN_CHARS: usize = 8;
 
 /// Canonical timestamp format: RFC 3339 UTC with second precision and `Z`.
-pub fn format_timestamp(moment: DateTime<Utc>) -> String {
-    moment.to_rfc3339_opts(SecondsFormat::Secs, true)
+pub fn format_timestamp(moment: Timestamp) -> String {
+    moment.to_rfc3339_opts(danso_ops::clock::SecondsFormat::Secs, true)
 }
 
 pub fn now_timestamp() -> String {
-    format_timestamp(Utc::now())
+    format_timestamp(danso_ops::clock::now())
 }
 
 /// Parse an RFC 3339 timestamp with timezone; naive timestamps are refused
 /// (configuration, not data).
-pub fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
-    let parsed = chrono::DateTime::parse_from_rfc3339(value.trim())
+pub fn parse_timestamp(value: &str) -> Result<Timestamp> {
+    let parsed = danso_ops::clock::parse_rfc3339(value.trim())
         .map_err(|_| anyhow::anyhow!("timestamp must be RFC 3339 with an offset"))?;
-    Ok(parsed.with_timezone(&Utc))
+    Ok(parsed)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -735,7 +735,7 @@ pub fn gate_and_render(
     existing: &FactsFile,
     candidates: Vec<Candidate>,
     audience: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
     max_facts: usize,
 ) -> Result<GateOutput> {
     let now_label = format_timestamp(now);
@@ -923,7 +923,7 @@ pub fn gate_and_render(
 pub fn close(
     route: &paths::Route,
     fact_id: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
     lock_timeout_ms: u64,
 ) -> Result<CloseOutcome> {
     route.require_writable()?;
@@ -1131,7 +1131,8 @@ mod tests {
             },
             candidate("스탠드업은 09:30 KST에 한다"),
         ];
-        let out = gate_and_render(&existing, batch, "private", Utc::now(), 100).unwrap();
+        let out =
+            gate_and_render(&existing, batch, "private", danso_ops::clock::now(), 100).unwrap();
         assert_eq!(out.report.skipped_mutable, 1);
         assert_eq!(out.report.skipped_missing_reason, 1);
         assert_eq!(out.report.saved, 1);
@@ -1147,7 +1148,8 @@ mod tests {
             transcript: Some("트랜스크립트 본문".into()),
             ..candidate("사용자가 스탠드업 시간을 정했다")
         }];
-        let out = gate_and_render(&existing, batch, "private", Utc::now(), 100).unwrap();
+        let out =
+            gate_and_render(&existing, batch, "private", danso_ops::clock::now(), 100).unwrap();
         assert_eq!(out.report.saved, 1);
         assert_eq!(out.report.needs_human, 1);
         let record = record_from(out.lines[0].trim_end());
@@ -1165,7 +1167,8 @@ mod tests {
             transcript: Some(format!("대화 중 그가 말했다: {quote} — 이후 진행")),
             ..candidate("에디터를 Helix로 바꿨다")
         }];
-        let out = gate_and_render(&existing, batch, "private", Utc::now(), 100).unwrap();
+        let out =
+            gate_and_render(&existing, batch, "private", danso_ops::clock::now(), 100).unwrap();
         assert_eq!(out.report.needs_human, 0);
         let record = record_from(out.lines[0].trim_end());
         assert_eq!(record.source_rank, 3);
@@ -1206,7 +1209,8 @@ mod tests {
             lines: vec![Line::Good(Box::new(record_from(existing_line)))],
         };
         let batch = vec![candidate("에디터는 Vim 대신 Helix를 쓴다")];
-        let out = gate_and_render(&existing, batch, "private", Utc::now(), 100).unwrap();
+        let out =
+            gate_and_render(&existing, batch, "private", danso_ops::clock::now(), 100).unwrap();
         assert_eq!(out.report.saved, 1);
         assert_eq!(out.report.needs_human, 1);
         let new_record = record_from(out.lines[1].trim_end());
@@ -1219,7 +1223,8 @@ mod tests {
     fn duplicates_are_skipped_batch_inclusively() {
         let existing = FactsFile::default();
         let batch = vec![candidate("같은 사실 반복"), candidate("같은 사실 반복!")];
-        let out = gate_and_render(&existing, batch, "private", Utc::now(), 100).unwrap();
+        let out =
+            gate_and_render(&existing, batch, "private", danso_ops::clock::now(), 100).unwrap();
         assert_eq!(out.report.saved, 1);
         assert_eq!(out.report.dedup_skipped, 1);
     }
@@ -1230,7 +1235,7 @@ mod tests {
             lines: vec![Line::Opaque("{broken line".to_string())],
         };
         let batch: Vec<Candidate> = (0..3).map(|i| candidate(&format!("사실 {i}"))).collect();
-        let out = gate_and_render(&opaque, batch, "private", Utc::now(), 2).unwrap();
+        let out = gate_and_render(&opaque, batch, "private", danso_ops::clock::now(), 2).unwrap();
         assert_eq!(out.lines.len(), 2);
         assert!(out.lines[0].contains("\"text\":\"사실 1\""));
     }
@@ -1239,17 +1244,25 @@ mod tests {
     fn unchanged_batches_never_touch_the_file() {
         let existing = FactsFile::default();
         let batch = vec![candidate("같은 사실 반복")];
-        let first = gate_and_render(&existing, batch.clone(), "private", Utc::now(), 100).unwrap();
+        let first = gate_and_render(
+            &existing,
+            batch.clone(),
+            "private",
+            danso_ops::clock::now(),
+            100,
+        )
+        .unwrap();
         assert!(first.changed);
         let after = FactsFile {
             lines: vec![Line::Good(Box::new(record_from(first.lines[0].trim_end())))],
         };
-        let second = gate_and_render(&after, batch, "private", Utc::now(), 100).unwrap();
+        let second =
+            gate_and_render(&after, batch, "private", danso_ops::clock::now(), 100).unwrap();
         assert!(!second.changed);
         assert!(second.lines.is_empty());
     }
 
-    fn parse_ts(value: &str) -> DateTime<Utc> {
+    fn parse_ts(value: &str) -> Timestamp {
         parse_timestamp(value).unwrap()
     }
 }

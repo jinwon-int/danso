@@ -14,7 +14,7 @@
 use crate::cron::retry::{RetryPolicy, retry_delay};
 use crate::cron::store::{RunHistoryItem, Store, Task, atomic_write_bytes, history_dir};
 use crate::cron::time::{fmt_dt, truncate_minute};
-use chrono::{DateTime, Utc};
+use danso_ops::clock::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -200,7 +200,7 @@ pub fn apply_retry_transition(
     attempt: i64,
     run_id: &str,
     status: &str,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> Value {
     let clear = |task: &mut Task| {
         let existed = task.retry_state.is_some();
@@ -243,7 +243,7 @@ pub fn apply_retry_transition(
         });
     }
     let delay = retry_delay(&policy, attempt);
-    let eligible = truncate_minute(at + chrono::Duration::seconds(delay));
+    let eligible = truncate_minute(at + SignedDuration::from_secs(delay));
     task.retry_state = Some(crate::cron::store::RetryState {
         scheduled_at: scheduled_at.to_string(),
         attempt,

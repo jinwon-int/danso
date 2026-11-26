@@ -20,7 +20,7 @@ use crate::cron::exec::HeadlessOutcome;
 use crate::cron::locks::acquire_for_run;
 use crate::cron::store::{NotifyMode, PayloadKind, PermissionMode, RunHistoryItem, Store, Task};
 use crate::cron::time::{fmt_dt, parse_utc, truncate_minute};
-use chrono::{DateTime, Utc};
+use danso_ops::clock::Timestamp;
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -117,7 +117,7 @@ pub fn dry_plan(
     store_display: &str,
     task_id: &str,
     at_raw: Option<&str>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> (Value, i32) {
     let Some(task) = store.tasks.iter().find(|task| task.id == task_id) else {
         return (
@@ -228,8 +228,8 @@ pub fn execute(
     store_display: &str,
     task_id: &str,
     at_raw: Option<&str>,
-    now: DateTime<Utc>,
-    plan_handoff: Option<(&Value, DateTime<Utc>)>,
+    now: Timestamp,
+    plan_handoff: Option<(&Value, Timestamp)>,
 ) -> (Value, i32) {
     let Some(task) = store.tasks.iter().find(|task| task.id == task_id) else {
         return (
@@ -309,7 +309,7 @@ pub fn execute(
         .map(str::to_string)
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| fmt_dt(Some(at)).unwrap_or_default());
-    let run_id = format!("{task_id}-{}-{}", at.timestamp(), std::process::id());
+    let run_id = format!("{task_id}-{}-{}", at.as_second(), std::process::id());
     let (acquired, lock) =
         match acquire_for_run(store_path, task_id, task, &run_id, &scheduled_at, at) {
             Ok((acquired, lock)) => (acquired, lock),

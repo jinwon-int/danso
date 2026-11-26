@@ -28,7 +28,6 @@ use crate::cron::due::{due_plan, normalize, read_only_mutations};
 use crate::cron::schedule::parse_schedule;
 use crate::cron::store::Store;
 use crate::cron::time::{parse_utc, truncate_minute};
-use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -335,7 +334,7 @@ pub fn run(args: CronArgs) -> i32 {
                 &store,
                 &store_display,
                 at.as_deref(),
-                truncate_minute(Utc::now()),
+                truncate_minute(danso_ops::clock::now()),
             );
             if json {
                 println!(
@@ -388,7 +387,7 @@ pub fn run(args: CronArgs) -> i32 {
                 return 1;
             };
             let at = match parse_utc(at.as_deref(), "--at") {
-                Ok(parsed) => parsed.unwrap_or_else(|| truncate_minute(Utc::now())),
+                Ok(parsed) => parsed.unwrap_or_else(|| truncate_minute(danso_ops::clock::now())),
                 Err(error) => {
                     eprintln!("cron lock failed: {error}");
                     return 1;
@@ -430,7 +429,7 @@ pub fn run(args: CronArgs) -> i32 {
                     &store,
                     &store_display,
                     at.as_deref(),
-                    truncate_minute(Utc::now()),
+                    truncate_minute(danso_ops::clock::now()),
                     max_runs.max(1) as usize,
                 );
                 if json {
@@ -444,7 +443,7 @@ pub fn run(args: CronArgs) -> i32 {
                 &store,
                 &store_display,
                 at.as_deref(),
-                truncate_minute(Utc::now()),
+                truncate_minute(danso_ops::clock::now()),
             );
             if json {
                 print_document(&plan);
@@ -470,7 +469,7 @@ pub fn run(args: CronArgs) -> i32 {
                     &store_display,
                     &id,
                     at.as_deref(),
-                    truncate_minute(Utc::now()),
+                    truncate_minute(danso_ops::clock::now()),
                     None,
                 );
                 if json {
@@ -485,7 +484,7 @@ pub fn run(args: CronArgs) -> i32 {
                 &store_display,
                 &id,
                 at.as_deref(),
-                truncate_minute(Utc::now()),
+                truncate_minute(danso_ops::clock::now()),
             );
             if json {
                 print_document(&document);
@@ -853,7 +852,7 @@ fn describe_document(task: &store::Task, store_display: &str) -> serde_json::Val
         },
         store_display,
         None,
-        truncate_minute(Utc::now()),
+        truncate_minute(danso_ops::clock::now()),
     );
     if let Some(row) = plan["tasks"].as_array().and_then(|rows| rows.first()) {
         for key in [

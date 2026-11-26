@@ -9,7 +9,7 @@ use crate::cron::schedule::{
 };
 use crate::cron::store::{Store, Task, locks_dir};
 use crate::cron::time::{boot_id, fmt_dt, parse_utc};
-use chrono::{DateTime, Duration, Utc};
+use danso_ops::clock::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -41,7 +41,7 @@ fn holder_process_gone(pid: i64) -> bool {
 }
 
 /// Lock state for one task at `at` (ccc `lock_status`).
-pub fn lock_status(task_id: &str, task: &Task, at: DateTime<Utc>, locks: &Path) -> Value {
+pub fn lock_status(task_id: &str, task: &Task, at: Timestamp, locks: &Path) -> Value {
     let lock_path = locks.join(format!("{task_id}.lock"));
     let mut base = json!({
         "lockPath": lock_path.display().to_string(),
@@ -58,7 +58,7 @@ pub fn lock_status(task_id: &str, task: &Task, at: DateTime<Utc>, locks: &Path) 
         Some(raw) => parse_utc(Some(raw), "acquiredAt")
             .ok()
             .flatten()
-            .map(|acquired| (at - acquired).num_seconds().max(0)),
+            .map(|acquired| (at - acquired).as_secs().max(0)),
     };
     let current_boot = boot_id();
     let lock_boot = string_field("bootId").unwrap_or_default();
@@ -113,7 +113,7 @@ fn status_from_lock(lock: &Value, current: &str) -> String {
 
 /// One due-plan row. Returns the row plus the error message on any
 /// schedule/field parse failure (row carries `status: invalid-schedule`).
-fn due_row(task: &Task, index: usize, at: DateTime<Utc>, locks: &Path) -> (Value, Option<String>) {
+fn due_row(task: &Task, index: usize, at: Timestamp, locks: &Path) -> (Value, Option<String>) {
     let task_id = task.id.as_str();
     let lock = lock_status(task_id, task, at, locks);
     let run_limit = run_limit_metadata(task);
@@ -185,7 +185,7 @@ fn due_row(task: &Task, index: usize, at: DateTime<Utc>, locks: &Path) -> (Value
             } else {
                 json!(fmt_dt(next_after(
                     &spec,
-                    not_before - Duration::seconds(1),
+                    not_before - SignedDuration::from_secs(1),
                     anchor
                 )))
             };
@@ -195,7 +195,7 @@ fn due_row(task: &Task, index: usize, at: DateTime<Utc>, locks: &Path) -> (Value
         let free_interval =
             matches!(spec, Schedule::Interval { .. }) && anchor.is_none() && last.is_none();
         if let (Some(not_before), false) = (not_before, free_interval) {
-            let activation_floor = not_before - Duration::seconds(1);
+            let activation_floor = not_before - SignedDuration::from_secs(1);
             if occurrence_floor.is_none_or(|floor| floor < activation_floor) {
                 occurrence_floor = Some(activation_floor);
             }
@@ -250,12 +250,7 @@ fn due_row(task: &Task, index: usize, at: DateTime<Utc>, locks: &Path) -> (Value
 
 /// The full due plan (ccc `due_plan`), including the §6.5 `mutations` object
 /// proving read-onlyness.
-pub fn due_plan(
-    store: &Store,
-    store_display: &str,
-    at_raw: Option<&str>,
-    now: DateTime<Utc>,
-) -> Value {
+pub fn due_plan(store: &Store, store_display: &str, at_raw: Option<&str>, now: Timestamp) -> Value {
     let at = match at_raw {
         None => Some(crate::cron::time::truncate_minute(now)),
         Some(raw) => match parse_utc(Some(raw), "--at") {

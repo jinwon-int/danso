@@ -8,17 +8,17 @@
 // neither the module nor the binary subcommand these tests drive.
 #![cfg(feature = "ops")]
 
-use chrono::{DateTime, Utc};
 use danso::cron::due::due_plan;
 use danso::cron::store::{self, store_path};
 use danso::cron::time::{boot_id, parse_utc};
+use danso_ops::clock::Timestamp;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const AT: &str = "2026-09-25T09:30:00Z";
 
-fn utc(raw: &str) -> DateTime<Utc> {
+fn utc(raw: &str) -> Timestamp {
     danso::cron::time::parse_utc(Some(raw), "test")
         .expect("parse")
         .expect("non-empty")

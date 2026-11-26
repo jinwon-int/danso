@@ -219,16 +219,14 @@ impl Gate {
 /// `None` covers both "idle" and "cannot tell"; they are the same instruction
 /// to the caller and distinguishing them would invite a future edit that
 /// treats one of them as a reason to stop.
-pub fn busy(health_path: Option<&Path>, now: chrono::DateTime<chrono::Utc>) -> Option<BusyReason> {
+pub fn busy(health_path: Option<&Path>, now: crate::clock::Timestamp) -> Option<BusyReason> {
     let raw = std::fs::read(health_path?).ok()?;
     let document: serde_json::Value = serde_json::from_slice(&raw).ok()?;
 
     // A missing `updated_at`, or one that will not parse, is not freshness.
     let updated_at = document.get("updated_at")?.as_str()?;
-    let updated_at = chrono::DateTime::parse_from_rfc3339(updated_at).ok()?;
-    let age = now
-        .signed_duration_since(updated_at.with_timezone(&chrono::Utc))
-        .num_seconds();
+    let updated_at = crate::clock::parse_rfc3339(updated_at).ok()?;
+    let age = now.duration_since(updated_at).as_secs();
     // Both directions: a document from the future is not evidence either, and
     // a clock step must not make a stale document look current.
     if !(0..=HEALTH_FRESH_SECONDS).contains(&age) {
@@ -297,7 +295,7 @@ pub fn check(
     state_dir: &Path,
     health_path: Option<&Path>,
     force: bool,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::clock::Timestamp,
 ) -> Gate {
     if force {
         let busy = busy(health_path, now);
@@ -310,7 +308,7 @@ pub fn check(
     };
 
     let marker = marker_path(state_dir);
-    let now_epoch = now.timestamp();
+    let now_epoch = now.as_second();
     // A marker that is empty, non-numeric, or dated in the future restarts the
     // clock rather than aborting: corruption must not become a way to make the
     // cap unreachable, in either direction.
@@ -383,9 +381,10 @@ pub fn deferred_since(state_dir: &Path) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Rfc3339;
 
-    fn at(seconds_ago: i64, now: chrono::DateTime<chrono::Utc>) -> String {
-        (now - chrono::Duration::seconds(seconds_ago)).to_rfc3339()
+    fn at(seconds_ago: i64, now: crate::clock::Timestamp) -> String {
+        (now - crate::clock::SignedDuration::from_secs(seconds_ago)).to_rfc3339()
     }
 
     /// Only the fields the gate actually reads, matching ccc's `mk_health`.
@@ -394,7 +393,7 @@ mod tests {
         updated_ago: i64,
         active: u64,
         oldest: u64,
-        now: chrono::DateTime<chrono::Utc>,
+        now: crate::clock::Timestamp,
     ) -> PathBuf {
         let path = dir.join("health.json");
         let document = serde_json::json!({
@@ -411,7 +410,7 @@ mod tests {
     #[test]
     fn a_serving_bridge_is_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let path = health(dir.path(), 5, 2, 30, now);
         assert_eq!(
             busy(Some(&path), now),
@@ -425,7 +424,7 @@ mod tests {
     #[test]
     fn an_idle_bridge_is_not_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let path = health(dir.path(), 5, 0, 0, now);
         assert_eq!(busy(Some(&path), now), None);
     }
@@ -433,7 +432,7 @@ mod tests {
     #[test]
     fn a_stale_document_is_not_evidence_of_work() {
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         // Busy numbers, but written by a process that may no longer exist.
         let path = health(dir.path(), HEALTH_FRESH_SECONDS + 1, 3, 10, now);
         assert_eq!(
@@ -447,7 +446,7 @@ mod tests {
     #[test]
     fn a_document_from_the_future_is_not_evidence_either() {
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let path = health(dir.path(), -600, 3, 10, now);
         assert_eq!(busy(Some(&path), now), None);
     }
@@ -455,7 +454,7 @@ mod tests {
     #[test]
     fn a_wedged_turn_stops_counting_as_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let path = health(dir.path(), 5, 1, BUSY_MAX_SECONDS, now);
         assert_eq!(
             busy(Some(&path), now),
@@ -470,7 +469,7 @@ mod tests {
     #[test]
     fn every_way_of_not_knowing_fails_open() {
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         assert_eq!(busy(None, now), None, "no service data directory");
         assert_eq!(
             busy(Some(&dir.path().join("absent.json")), now),
@@ -514,7 +513,7 @@ mod tests {
         // it is the *old* schema by construction. Strict parsing would fail
         // open here and kill the turn this gate exists to protect.
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let path = dir.path().join("health.json");
         let document = serde_json::json!({
             "schema_version": 99,
@@ -539,7 +538,7 @@ mod tests {
     #[test]
     fn active_turns_without_an_age_still_count_as_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let path = dir.path().join("health.json");
         let document = serde_json::json!({
             "updated_at": at(2, now),
@@ -560,7 +559,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let path = health(dir.path(), 5, 1, 3, now);
 
         let first = check(&state, Some(&path), false, now);
@@ -569,7 +568,7 @@ mod tests {
         let since = deferred_since(&state).expect("marker written");
 
         // A later run in the same busy period accumulates rather than resetting.
-        let later = now + chrono::Duration::seconds(600);
+        let later = now + crate::clock::SignedDuration::from_secs(600);
         let path = health(dir.path(), 5, 1, 3, later);
         match check(&state, Some(&path), false, later) {
             Gate::Deferred { waited_seconds, .. } => assert_eq!(waited_seconds, 600),
@@ -587,11 +586,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let path = health(dir.path(), 5, 1, 3, now);
         check(&state, Some(&path), false, now);
 
-        let past_cap = now + chrono::Duration::seconds(MAX_DEFER_SECONDS);
+        let past_cap = now + crate::clock::SignedDuration::from_secs(MAX_DEFER_SECONDS);
         let path = health(dir.path(), 5, 1, 3, past_cap);
         let gate = check(&state, Some(&path), false, past_cap);
         assert_eq!(
@@ -619,11 +618,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         check(&state, Some(&health(dir.path(), 5, 1, 3, now)), false, now);
         assert!(deferred_since(&state).is_some());
 
-        let idle = now + chrono::Duration::seconds(10);
+        let idle = now + crate::clock::SignedDuration::from_secs(10);
         let path = health(dir.path(), 5, 0, 0, idle);
         assert_eq!(
             check(&state, Some(&path), false, idle),
@@ -637,7 +636,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let path = health(dir.path(), 5, 9, 3, now);
         check(&state, Some(&path), false, now);
         assert!(deferred_since(&state).is_some());
@@ -663,7 +662,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let path = health(dir.path(), 5, 1, 3, now);
 
         for corrupt in ["", "   ", "not-a-number", "9999999999999"] {
@@ -676,7 +675,7 @@ mod tests {
                 ),
                 other => panic!("expected a deferral for {corrupt:?}, got {other:?}"),
             }
-            assert_eq!(deferred_since(&state), Some(now.timestamp()));
+            assert_eq!(deferred_since(&state), Some(now.as_second()));
         }
     }
 
@@ -701,7 +700,7 @@ mod tests {
         let state = dir.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
         unwritable_marker(&state);
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let busy_now = health(dir.path(), 5, 1, 3, now);
 
         let first = check(&state, Some(&busy_now), false, now);
@@ -720,7 +719,7 @@ mod tests {
 
         // And it stays that way: the failure is not transient, so a later run
         // must not quietly start deferring from zero either.
-        let later = now + chrono::Duration::seconds(MAX_DEFER_SECONDS * 2);
+        let later = now + crate::clock::SignedDuration::from_secs(MAX_DEFER_SECONDS * 2);
         let busy_later = health(dir.path(), 5, 1, 3, later);
         assert!(matches!(
             check(&state, Some(&busy_later), false, later),
@@ -735,7 +734,7 @@ mod tests {
         let blocker = dir.path().join("blocked");
         std::fs::write(&blocker, b"not a directory").unwrap();
         let state = blocker.join("state");
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         let path = health(dir.path(), 5, 2, 3, now);
         assert!(
             matches!(
@@ -750,7 +749,7 @@ mod tests {
     #[test]
     fn the_freshness_window_is_inclusive_at_both_ends() {
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         // Exactly at the window: still evidence. One second past: not.
         assert!(
             busy(
@@ -783,7 +782,7 @@ mod tests {
         // a wedged hour-long turn into a zero-second one and defeat the cap on
         // exactly the foreign documents this module parses loosely.
         let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
+        let now = crate::clock::now();
         for encoded in [
             serde_json::json!(3600.0),
             serde_json::json!("3600"),
