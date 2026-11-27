@@ -108,6 +108,9 @@ checkpoint; there is no automatic ACK, tool replay or journal repair. A bounded 
   28 × 40 KB synthetic session this cut summary requests at the glm-5.3-flash
   default threshold from 4 to 2, and one compaction's evidence from
   1,125,808 to 242,560 bytes (`tests/compaction.rs`).
+- A staged design (request-only soft elision with cache hysteresis, and a
+  verbatim tail after the summary) is planned but not implemented; see
+  [staged-context.md](staged-context.md).
 - That evidence is fed to the summarizer in consecutive UTF-8-safe fragments,
   each fitting the same wire budget; fragmenting itself never cuts evidence.
   Every fragment updates the previous checkpoint; at most 32 fragments are
